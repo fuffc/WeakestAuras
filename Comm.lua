@@ -312,10 +312,164 @@ local function onError(from, code)
 	end
 end
 
-local function dispatch(from, msg)
+-- ---------------------------------------------------------------------------
+-- The version beacon. There is no HTTP on this client, so the only thing that
+-- can know a newer release exists is another player running it: this is peer
+-- gossip, not a version check. A beacon is addressed to nobody, which is what
+-- lets a client that predates the op ignore one silently -- dispatch's recipient
+-- test drops it there, while here op "v" is handled before that test.
+-- ---------------------------------------------------------------------------
+
+-- Lua's generator starts from a fixed seed, so an unseeded math.random would
+-- hand every client in the guild the same "jitter" -- precisely the
+-- simultaneous burst the jitter exists to prevent. Seeded from the client's own
+-- uptime rather than the wall clock, since a server restart logs a guild in at
+-- the same second but not at the same uptime.
+math.randomseed(GetTime() * 1000)
+
+-- Speaking is what makes this expensive if got wrong, and a guild of 200 is the
+-- design case: the login broadcast is spread, and an answer is both spread and
+-- rate-limited per channel.
+local BEACON_LOGIN_MIN, BEACON_LOGIN_MAX = 5, 15
+local ANSWER_MIN, ANSWER_MAX = 1, 10
+local ANSWER_THROTTLE = 60
+
+-- What a beacon may ride. arg3 is a stranger's distribution string, and an
+-- unrecognised one would otherwise be handed straight back to SendAddonMessage.
+local BEACON_CHANNELS = { GUILD = true, RAID = true, PARTY = true }
+
+-- The highest claim heard this session, and never persisted: pfUI stores its
+-- equivalent in saved variables, so one lie poisons that install until somebody
+-- edits the file. Held in memory, a lie costs one chat line and is gone at
+-- /reload -- and a notice that comes back every login until you actually update
+-- is the behaviour we want anyway.
+C.latestSeen = nil
+C.latestSeenVersion = nil
+
+local answerPending = {}
+local answerLast = {}
+local loginBeaconDone = false
+local groupSize = 0
+
+-- Tenths of a second: a guild logging in together spreads across a hundred
+-- slots rather than the eleven whole ones math.random(5, 15) would give.
+local function jitter(lo, hi)
+	return math.random(lo * 10, hi * 10) / 10
+end
+
+local function groupChannel()
+	if (GetNumRaidMembers and GetNumRaidMembers() or 0) > 0 then return "RAID" end
+	if (GetNumPartyMembers and GetNumPartyMembers() or 0) > 0 then return "PARTY" end
+	return nil
+end
+
+local function currentGroupSize()
+	local n = GetNumRaidMembers and GetNumRaidMembers() or 0
+	if n > 0 then return n end
+	return GetNumPartyMembers and GetNumPartyMembers() or 0
+end
+
+local function beacon(channel)
+	if not WA.version or not channel then return end
+	send("v", "", 0, 1, 1, WA.version, channel)
+end
+
+-- Answering only a beacon older than ours is the design. pfUI never answers, so
+-- a newcomer to a settled guild learns nothing until somebody else happens to
+-- log in; DoiteAuras answers every beacon it hears, which in a large guild is a
+-- message per member per login. Downward-only, jittered and throttled means a
+-- peer on an old build hears exactly one reply and a room where everyone is
+-- current stays silent.
+local function scheduleAnswer(channel)
+	if not BEACON_CHANNELS[channel or ""] or answerPending[channel] then return end
+	local last = answerLast[channel]
+	if last and (GetTime() - last) < ANSWER_THROTTLE then return end
+	-- C_Timer.After hands back no handle on this client, so the pending slot's
+	-- identity is the cancel: clearing it turns the callback into a no-op. The
+	-- throttle is stamped when the message actually leaves, not here, or a
+	-- cancelled answer would suppress the next real one.
+	local slot = {}
+	answerPending[channel] = slot
+	C_Timer.After(jitter(ANSWER_MIN, ANSWER_MAX), function()
+		if answerPending[channel] ~= slot then return end
+		answerPending[channel] = nil
+		answerLast[channel] = GetTime()
+		WA.safecall("Comm.beacon", beacon, channel)
+	end)
+end
+
+local notified = false
+
+-- One line, once per session. The peer who told us is never named: it is noise,
+-- and attribution is what a false claim wants. Once per session rather than once
+-- ever is also the behaviour we want -- the line comes back every login until
+-- you actually update.
+local function notify(claimed)
+	if notified then return end
+	-- Silences the line, deliberately not the beacon: that is ~20 bytes at login,
+	-- and it is what makes the feature work for everyone else.
+	if WA.Options().updateNotify == false then return end
+	notified = true
+	log(claimed .. " is available -- you have " .. WA.version .. ".")
+	DEFAULT_CHAT_FRAME:AddMessage(
+		"|cff888888https://github.com/fuffc/WeakestAuras/releases"
+		.. "  (or: git pull in your AddOns folder)|r", 1, 1, 1)
+end
+
+local function onBeacon(channel, claimed)
+	local mine = WA.ParseVersion(WA.version)
+	local theirs = WA.ParseVersion(claimed)
+	if not mine or not theirs then return end
+
+	if theirs < mine then
+		scheduleAnswer(channel)
+		return
+	end
+	-- Someone at or above our version has spoken on this channel, so a pending
+	-- answer of ours would tell the room nothing it has not just heard.
+	answerPending[channel or ""] = nil
+	if theirs == mine then return end
+
+	-- A claim is unauthenticated, and more than one major ahead is refused rather
+	-- than believed: telling a whole guild it is years behind is otherwise the
+	-- cheapest lie available.
+	if math.floor(theirs / 1000000) > math.floor(mine / 1000000) + 1 then return end
+	if C.latestSeen and theirs <= C.latestSeen then return end
+	C.latestSeen, C.latestSeenVersion = theirs, claimed
+	notify(claimed)
+end
+
+-- PLAYER_ENTERING_WORLD fires on every loading screen, not only at login, so the
+-- once-per-session broadcast is guarded by a flag rather than by the event.
+local function onBeaconEvent(e)
+	if not WA.version then return end
+	if e == "PLAYER_ENTERING_WORLD" then
+		groupSize = currentGroupSize()
+		if loginBeaconDone then return end
+		loginBeaconDone = true
+		C_Timer.After(jitter(BEACON_LOGIN_MIN, BEACON_LOGIN_MAX), function()
+			if IsInGuild and IsInGuild() then WA.safecall("Comm.beacon", beacon, "GUILD") end
+			WA.safecall("Comm.beacon", beacon, groupChannel())
+		end)
+		return
+	end
+	-- Only a group that grew. Somebody leaving, or the roster merely changing,
+	-- tells nobody anything they have not already heard.
+	local n = currentGroupSize()
+	if n > groupSize then WA.safecall("Comm.beacon", beacon, groupChannel()) end
+	groupSize = n
+end
+
+local function dispatch(from, msg, channel)
 	local _, _, ver, op, to, sid, seq, total, payload =
 		string.find(msg, "^(%d+):(%a):([^:]*):(%d+):(%d+):(%d+):(.*)$")
 	if not ver or ver ~= WIRE_VERSION then return end
+
+	-- Before the recipient test, not after: a beacon carries an empty `to`, so
+	-- that test would drop every one of them. It is also what makes the op
+	-- invisible to a client that predates it -- no wire bump, no compat shim.
+	if op == "v" then return onBeacon(channel, payload) end
+
 	if to ~= me() then return end
 
 	if op == "r" then
@@ -327,13 +481,28 @@ local function dispatch(from, msg)
 	end
 end
 
+-- Behind /wa ver: feeds a beacon through the receive path exactly as a peer's
+-- would arrive. Without it, seeing the notice at all needs a second account
+-- running a build that does not exist yet.
+function C.FeedBeacon(version, channel)
+	dispatch("Peer", WIRE_VERSION .. ":v::0:1:1:" .. tostring(version), channel or "GUILD")
+end
+
 local frame = CreateFrame("Frame")
 frame:RegisterEvent("CHAT_MSG_ADDON")
+frame:RegisterEvent("PLAYER_ENTERING_WORLD")
+frame:RegisterEvent("PARTY_MEMBERS_CHANGED")
 frame:SetScript("OnEvent", function()
+	if event ~= "CHAT_MSG_ADDON" then
+		WA.safecall("Comm.beaconEvent", onBeaconEvent, event)
+		return
+	end
 	if arg1 ~= PREFIX then return end
 	local from = arg4
 	if not from or from == me() then return end
-	WA.safecall("Comm.recv", dispatch, from, arg2 or "")
+	-- The distribution rides along because an answer has to go back to the
+	-- channel the beacon came from, and RAID and PARTY are not the same one.
+	WA.safecall("Comm.recv", dispatch, from, arg2 or "", arg3)
 end)
 
 -- ---------------------------------------------------------------------------

@@ -15,7 +15,6 @@ if WeakestAuras.disabled then return end
 local WA = WeakestAuras
 
 local MAGIC = "!WA1!"
-local ADDON_VERSION = (GetAddOnMetadata and GetAddOnMetadata("WeakestAuras", "Version")) or "0.2.0"
 
 -- Present only if the whole CBOR chain this file needs is available.
 local E = C_EncodingUtil
@@ -74,7 +73,7 @@ function WA.ExportRaw(id)
 	local data = WeakestAurasDB.displays[id]
 	if not data then return nil, "no such display: " .. tostring(id) end
 
-	local payload = { m = "WeakestAuras", v = ADDON_VERSION, d = cleanForExport(data) }
+	local payload = { m = "WeakestAuras", v = WA.version, d = cleanForExport(data) }
 	if WA.IsGroup(data) and data.controlledChildren then
 		payload.c = {}
 		for i = 1, table.getn(data.controlledChildren) do

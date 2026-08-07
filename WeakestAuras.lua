@@ -41,6 +41,39 @@ WeakestAuras.hasClassicAPI = CLASSIC_API_VERSION ~= nil
 WeakestAuras.hasSuperWoW = (SUPERWOW_VERSION ~= nil) or (SUPERWOW_STRING ~= nil)
 WeakestAuras.hasNampower = type(GetNampowerVersion) == "function"
 
+-- The .toc's `## Version`, resolved once. Nil rather than a fallback string when
+-- the client cannot answer: everything version-facing reads this, and a
+-- made-up number put on the addon channel would tell an up-to-date guild it is
+-- behind. pfUI calls GetAddOnMetadata unguarded in its own load path
+-- (../pfUI/pfUI.lua), so it is present here.
+WeakestAuras.version = GetAddOnMetadata and GetAddOnMetadata("WeakestAuras", "Version") or nil
+
+-- `x.y` or `x.y.z`, each part at most 999, packed into one comparable number.
+-- Anything else is nil: a version string reaching this also arrives from
+-- strangers over the addon channel, where "99.0.0" and "9.9.9.9" are both things
+-- someone will send.
+function WeakestAuras.ParseVersion(s)
+	if type(s) ~= "string" then return nil end
+	local _, _, major, minor, patch = string.find(s, "^(%d+)%.(%d+)%.(%d+)$")
+	if not major then
+		_, _, major, minor = string.find(s, "^(%d+)%.(%d+)$")
+		patch = "0"
+	end
+	if not major then return nil end
+	major, minor, patch = tonumber(major), tonumber(minor), tonumber(patch)
+	if major > 999 or minor > 999 or patch > 999 then return nil end
+	return major * 1000000 + minor * 1000 + patch
+end
+
+-- True when `a` is a strictly newer release than `b`, nil when either side
+-- cannot be parsed -- which is not the same answer as false, and callers that
+-- act on a claim need to tell them apart.
+function WeakestAuras.VersionNewer(a, b)
+	local packedA, packedB = WeakestAuras.ParseVersion(a), WeakestAuras.ParseVersion(b)
+	if not packedA or not packedB then return nil end
+	return packedA > packedB
+end
+
 -- WeakAuras2's active-trigger sentinel (Private.trigger_modes.first_active):
 -- an activeTriggerMode of this value means "the display follows whichever
 -- trigger is the first one currently active" rather than a fixed trigger

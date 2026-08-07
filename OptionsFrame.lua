@@ -3053,6 +3053,21 @@ local function buildPanel()
 		magnetBtn.setToggled(WA.Mover.magnetism)
 	end)
 
+	-- Lit unless explicitly switched off, so an install that predates the setting
+	-- gets the notice. It silences only the chat line: the version we broadcast is
+	-- what tells everyone else, and withholding it helps nobody.
+	local notifyBtn = W.toolbarButton(toolbar, "Interface\\Icons\\INV_Misc_Note_01",
+		"Update notices", nil, "Update Notices")
+	notifyBtn:SetPoint("RIGHT", lockBtn, "LEFT", -4, 0)
+	notifyBtn.tipDesc = "Says once per session when someone in your guild or group is running a newer release."
+	notifyBtn.setToggled(WA.Options().updateNotify ~= false)
+	notifyBtn:SetScript("OnClick", function()
+		local opts = WA.Options()
+		if opts.updateNotify == false then opts.updateNotify = nil else opts.updateNotify = false end
+		notifyBtn.setToggled(opts.updateNotify ~= false)
+	end)
+	S.updateNotifyBtn = notifyBtn
+
 	newBtn:SetScript("OnClick", function()
 		searchBox:ClearFocus()
 		S.openNewPane()

@@ -1582,6 +1582,41 @@ function D.CommThrottle(rest)
 end
 
 -- ---------------------------------------------------------------------------
+-- /wa ver [version] -- what this client believes its own version is, and, with
+-- an argument, a beacon injected as though a peer had sent it. The update notice
+-- is otherwise unreachable without a second account running a build that does
+-- not exist yet. The outcome is reported because most claims are *meant* to be
+-- ignored -- equal, already beaten, unparseable, or too far ahead to believe.
+-- ---------------------------------------------------------------------------
+
+function D.Version(rest)
+	local C = WA.Comm
+	D.Log("--- version ---")
+	D.Log("  GetAddOnMetadata = " .. type(GetAddOnMetadata))
+	D.Log("  WA.version = " .. tostring(WA.version)
+		.. " (parses as " .. tostring(WA.ParseVersion(WA.version)) .. ")")
+	D.Log("  highest claim heard this session = " .. tostring(C.latestSeenVersion))
+	D.Log("  updateNotify = " .. tostring(WA.Options().updateNotify))
+	if not rest or rest == "" then
+		D.Log("  /wa ver <version> feeds a beacon as if a peer had sent it")
+		D.Log("--- end version ---")
+		return
+	end
+
+	local before = C.latestSeenVersion
+	C.FeedBeacon(rest)
+	if C.latestSeenVersion ~= before then
+		D.Log("  fed " .. rest .. " -- believed")
+	elseif not WA.ParseVersion(rest) then
+		D.Log("  fed " .. rest .. " -- dropped: not x.y or x.y.z with each part under 1000")
+	else
+		D.Log("  fed " .. rest .. " -- ignored: not newer than " .. tostring(WA.version)
+			.. ", not higher than " .. tostring(before) .. ", or more than one major ahead")
+	end
+	D.Log("--- end version ---")
+end
+
+-- ---------------------------------------------------------------------------
 -- Slash dispatch. Called from OptionsFrame.lua's /wa handler whenever the
 -- command has an argument; a bare /wa still opens the options window.
 -- ---------------------------------------------------------------------------
@@ -1621,6 +1656,8 @@ function D.HandleSlash(msg)
 		D.Load(rest)
 	elseif cmd == "probe" then
 		D.Probe()
+	elseif cmd == "ver" then
+		D.Version(rest)
 	elseif cmd == "codeprobe" then
 		D.CodeProbe()
 	elseif cmd == "codelive" then
@@ -1647,6 +1684,6 @@ function D.HandleSlash(msg)
 		ensureFrame()
 		frame:Hide()
 	else
-		D.Log("[debug] unknown command \"" .. cmd .. "\". Available: dump [unit] [filter], watch [unit], events [EVENT ...], timers, linkprobe, commprobe [charname|throttle [channel] [rate] [secs]], cdtest, swipetest [sizes/WxH...], swipenudge <k> [yflat], track <spellName>, states <id>, conditions <id>, gen <id>, load <id>, probe, codeprobe, codelive, codetab <1-8|tabs>, codefont <6-16>, rows, libs, addons, export <id>, import, clear, show, hide")
+		D.Log("[debug] unknown command \"" .. cmd .. "\". Available: dump [unit] [filter], watch [unit], events [EVENT ...], timers, linkprobe, commprobe [charname|throttle [channel] [rate] [secs]], cdtest, swipetest [sizes/WxH...], swipenudge <k> [yflat], track <spellName>, states <id>, conditions <id>, gen <id>, load <id>, probe, ver [version], codeprobe, codelive, codetab <1-8|tabs>, codefont <6-16>, rows, libs, addons, export <id>, import, clear, show, hide")
 	end
 end
