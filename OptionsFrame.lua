@@ -473,6 +473,9 @@ function S.showAuraMenu(id, anchor)
 		end,
 	})
 	table.insert(items, { text = "Export...", onClick = function() S.openExport(id) end })
+	-- Shift-clicking a row with the editbox already open is undiscoverable, and
+	-- from here the editbox can be opened for the user instead.
+	table.insert(items, { text = "Link to Chat", onClick = function() WA.Comm.LinkAura(id) end })
 	if data.parent then
 		table.insert(items, {
 			text = "Ungroup",
@@ -2102,7 +2105,10 @@ function S.ensureIEDialog()
 	close:SetPoint("TOPRIGHT", -4, -4)
 	close:SetScript("OnClick", function() f:Hide() end)
 
-	local box = LibWidgets.NewMultiLineEditBox(f, { width = 456, height = 250 })
+	local box = LibWidgets.NewMultiLineEditBox(f, {
+		width = 456, height = 250,
+		onChange = function(text) S.refreshImportNotice(f, text) end,
+	})
 	box:SetPoint("TOPLEFT", 12, -40)
 	f.box = box
 
@@ -2127,14 +2133,83 @@ function S.ensureIEDialog()
 	end)
 	f.loadBtn = loadBtn
 
+	local updateBtn = W.button(f, "Update", nil)
+	updateBtn:SetWidth(84)
+	updateBtn:SetPoint("RIGHT", loadBtn, "LEFT", -8, 0)
+	updateBtn:SetScript("OnClick", function()
+		local id, err = WA.ImportOverwrite(f.box.getText())
+		if id then
+			f:Hide()
+			S.refreshList()
+			S.setSelection(id)
+		else
+			f.status:SetText("Update failed: " .. (err or "unknown"))
+			f.status:SetTextColor(1, 0.4, 0.4)
+		end
+	end)
+	updateBtn:Hide()
+	f.updateBtn = updateBtn
+
 	S.ieDialog = f
 	return f
+end
+
+-- Says whether the pasted or received string is one we already hold, and
+-- renames the button to match. Only ever advice: importing adds a display and
+-- never touches the one it recognises. Memoised on the exact text because
+-- onChange fires per keystroke and the check has to decode the whole blob.
+-- A long aura name would otherwise push the notice under the buttons.
+local function shortId(id)
+	if string.len(id) > 26 then return string.sub(id, 1, 25) .. "..." end
+	return id
+end
+
+function S.refreshImportNotice(f, text)
+	if f.exporting then return end
+	text = text or f.box.getText() or ""
+	if f.noticeFor == text then return end
+	f.noticeFor = text
+
+	local existing, canUpdate
+	if text ~= "" then existing, canUpdate = WA.ImportInfo(text) end
+	f.duplicateOf = existing
+
+	if not existing then
+		f.updateBtn:Hide()
+		f.loadBtn.setText("Import")
+		f.loadBtn:SetWidth(84)
+		f.status:SetText(f.baseStatus or "")
+		f.status:SetTextColor(0.7, 0.7, 0.7)
+	else
+		f.loadBtn.setText("Import as Copy")
+		f.loadBtn:SetWidth(112)
+		f.status:SetTextColor(1, 0.82, 0)
+		-- The button labels say what each choice does; repeating it here is what
+		-- made this line long enough to run under them.
+		if canUpdate then
+			f.updateBtn:Show()
+			f.status:SetText("You already have this as \"" .. shortId(existing) .. "\".")
+		else
+			f.updateBtn:Hide()
+			f.status:SetText("You already have \"" .. shortId(existing)
+				.. "\". Groups can only be copied.")
+		end
+	end
+
+	-- Re-reserve the right edge from the buttons actually showing, rather than a
+	-- constant sized for the one button this dialog used to have.
+	local reserve = 24 + f.loadBtn:GetWidth()
+	if f.updateBtn:IsShown() then reserve = reserve + 8 + f.updateBtn:GetWidth() end
+	f.status:SetPoint("RIGHT", f, "RIGHT", -reserve, 0)
 end
 
 function S.openExport(id)
 	local f = S.ensureIEDialog()
 	f.title:SetText("Export Aura")
+	f.exporting = true
+	f.noticeFor = nil
 	f.loadBtn:Hide()
+	f.updateBtn:Hide()
 	local blob, err = WA.Export(id)
 	f.box.setText(blob or ("-- export failed: " .. (err or "unknown")))
 	f.status:SetText(blob and "Ctrl-C to copy this string." or (err or ""))
@@ -2146,17 +2221,41 @@ end
 function S.openImport()
 	local f = S.ensureIEDialog()
 	f.title:SetText("Import Aura")
+	f.exporting = nil
+	f.noticeFor = nil
 	f.loadBtn:Show()
 	f.box.setText("")
 	if WA.hasImportExport then
-		f.status:SetText("Paste an exported string, then Import.")
+		f.baseStatus = "Paste an exported string, then Import."
 	else
-		f.status:SetText("C_EncodingUtil unavailable -- import/export disabled on this client.")
+		f.baseStatus = "C_EncodingUtil unavailable -- import/export disabled on this client."
 	end
-	f.status:SetTextColor(0.7, 0.7, 0.7)
+	S.refreshImportNotice(f, "")
 	f:Show()
 	f.box.focusSelectAll()
 end
+
+-- A received aura lands in the ordinary import dialog rather than importing
+-- itself: the user still confirms, and the string stays inspectable and
+-- copyable if the import goes wrong.
+function S.openReceived(sender, name, blob)
+	local f = S.ensureIEDialog()
+	f.title:SetText(sender .. " sent you \"" .. name .. "\"")
+	f.exporting = nil
+	f.noticeFor = nil
+	-- Nothing to say: the title names the sender and the aura, and the box holds
+	-- an opaque blob there is no way to read. A duplicate notice may fill this.
+	f.baseStatus = ""
+	f.loadBtn:Show()
+	f.box.setText(blob)
+	-- setText fires onChange, but not on a client where it doesn't; ask directly
+	-- so the duplicate notice is up before the user reads the dialog.
+	S.refreshImportNotice(f, blob)
+	f:Show()
+	f.box.focusSelectAll()
+end
+
+WA.Comm.OnPayload = S.openReceived
 
 local function buildPanel()
 	local panel = CreateFrame("Frame", "WeakestAurasOptions", UIParent)
@@ -2876,6 +2975,11 @@ local function buildPanel()
 			local soleIsGroup = soleData and WA.IsGroup(soleData)
 			if IsControlKeyDown() and not soleIsGroup then
 				S.toggleSelection(row.id)
+			-- Shift means two things, and an open chat editbox is what tells them
+			-- apart: upstream's own rule, and the only signal available here since
+			-- this client has no GetCurrentKeyBoardFocus.
+			elseif IsShiftKeyDown() and ChatFrameEditBox and ChatFrameEditBox:IsVisible() then
+				WA.Comm.LinkAura(row.id)
 			elseif IsShiftKeyDown() and not isGroup and not soleIsGroup then
 				S.selectRange(row.id)
 			else

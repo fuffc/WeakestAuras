@@ -33,8 +33,8 @@ local function wrap(str, width)
 	return table.concat(out, "\n")
 end
 
-local function encode(payload)
-	return MAGIC .. wrap(E.EncodeBase64(E.CompressString(E.SerializeCBOR(payload))), 92)
+local function encodeBody(payload)
+	return E.EncodeBase64(E.CompressString(E.SerializeCBOR(payload)))
 end
 
 -- Reverses encode; nil on a foreign/garbage/truncated string. The !WA1! prefix
@@ -51,24 +51,25 @@ local function decode(text)
 end
 
 -- A deep copy with the non-transmissible fields stripped (WA2's
--- stripNonTransmissableFields): parent (re-derived on import), uid (regenerated),
+-- stripNonTransmissableFields): parent (re-derived on import),
 -- controlledChildren (children travel in payload.c and get fresh ids). `id`
 -- stays (the suggested name); internalVersion stays (the importer's
--- MergeDefaults migration reads it).
+-- MergeDefaults migration reads it). `uid` travels too, as it does upstream:
+-- it is the only thing that lets a later import be recognised as the same aura
+-- rather than an anonymous duplicate.
 local function cleanForExport(data)
 	local c = WA.DeepCopy(data)
 	c.parent = nil
-	c.uid = nil
 	c.controlledChildren = nil
 	return c
 end
 
--- A display's data as a transport string, or nil + reason. Groups bring their
--- direct children in payload.c. Nested-group export is deliberately shallow: a
--- child that is itself a group loses its own children (controlledChildren
--- stripped), the flat single-level group being the common case -- revisit with
--- recursion if nested groups become one.
-function WA.Export(id)
+-- A display's data as one unwrapped transport string, or nil + reason. Groups
+-- bring their direct children in payload.c. Nested-group export is deliberately
+-- shallow: a child that is itself a group loses its own children
+-- (controlledChildren stripped), the flat single-level group being the common
+-- case -- revisit with recursion if nested groups become one.
+function WA.ExportRaw(id)
 	if not WA.hasImportExport then return nil, "C_EncodingUtil is not available on this client" end
 	local data = WeakestAurasDB.displays[id]
 	if not data then return nil, "no such display: " .. tostring(id) end
@@ -82,12 +83,89 @@ function WA.Export(id)
 		end
 	end
 
-	local ok, blob = pcall(encode, payload)
-	if not ok then return nil, "serialization failed: " .. tostring(blob) end
-	return blob
+	local ok, body = pcall(encodeBody, payload)
+	if not ok then return nil, "serialization failed: " .. tostring(body) end
+	return MAGIC .. body
 end
 
--- Installs one imported display: fresh non-colliding id + new uid, stored, then
+-- The same string wrapped for an EditBox. The wrap belongs to the display of an
+-- export and not to the format -- newlines through the chat system are wasteful
+-- at best -- so anything transporting one uses WA.ExportRaw and this stays the
+-- only place that knows the column.
+function WA.Export(id)
+	local raw, err = WA.ExportRaw(id)
+	if not raw then return nil, err end
+	return MAGIC .. wrap(string.sub(raw, string.len(MAGIC) + 1), 92)
+end
+
+-- The id of the display holding this uid, if any. uids are unique inside the
+-- database because installDisplay regenerates any incoming one already taken.
+function WA.FindByUID(uid)
+	if not uid then return nil end
+	for id, d in pairs(WeakestAurasDB.displays) do
+		if d.uid == uid then return id end
+	end
+	return nil
+end
+
+-- The id of the display this string is another copy of, plus whether it can be
+-- updated in place. Lets the import dialog say so before anything is installed.
+-- Groups answer false: replacing one means reconciling its children against the
+-- incoming set, and a child held here but missing from the import has no safe
+-- default -- keeping it leaves a stale aura, deleting it is irreversible.
+function WA.ImportInfo(str)
+	if not WA.hasImportExport then return nil end
+	local payload = decode(str)
+	if not payload or type(payload.d) ~= "table" then return nil end
+	local id = WA.FindByUID(payload.d.uid)
+	if not id then return nil end
+	local target = WeakestAurasDB.displays[id]
+	local canUpdate = not (WA.IsGroup(target) or WA.IsGroup(payload.d)
+		or type(payload.c) == "table")
+	return id, canUpdate
+end
+
+-- Fields an update keeps from the display it replaces. Position and size are
+-- yours rather than the author's -- upstream defaults its "Size & Position"
+-- category off for the same reason -- and the id stays so an update never
+-- renames an aura out from under the list. Everything else is replaced.
+local UPDATE_PRESERVED = {
+	id = true, uid = true, parent = true, controlledChildren = true,
+	anchorFrameType = true, selfPoint = true, anchorPoint = true,
+	xOffset = true, yOffset = true, frameStrata = true,
+	scale = true, width = true, height = true,
+}
+
+-- Replaces the display this string is a copy of, in place. Destructive by
+-- design and only ever reached from its own button. The existing table is
+-- mutated rather than swapped out, because the region and trigger state are
+-- bound to it; WA.Add then recompiles it exactly as any options edit would.
+function WA.ImportOverwrite(str)
+	if not WA.hasImportExport then return nil, "C_EncodingUtil is not available on this client" end
+	local payload = decode(str)
+	if not payload then return nil, "not a WeakestAuras export string" end
+	if payload.m ~= "WeakestAuras" or type(payload.d) ~= "table" then
+		return nil, "unrecognized or wrong-format string"
+	end
+
+	local targetId, canUpdate = WA.ImportInfo(str)
+	if not targetId then return nil, "no aura here matches that one" end
+	if not canUpdate then return nil, "groups cannot be updated in place" end
+
+	local target = WeakestAurasDB.displays[targetId]
+	local incoming = payload.d
+	for k in pairs(target) do
+		if not UPDATE_PRESERVED[k] then target[k] = nil end
+	end
+	for k, v in pairs(incoming) do
+		if not UPDATE_PRESERVED[k] then target[k] = v end
+	end
+	WA.MergeDefaults(target)
+	WA.Add(target)
+	return targetId
+end
+
+-- Installs one imported display: fresh non-colliding id, stored, then
 -- MergeDefaults (fills fields the exporter's version lacked, runs trigger
 -- migrate; internalVersion-gated so a newer exporter's fields survive and an
 -- older one's get defaulted). Returns the new id. Importing "Foo" twice never
@@ -97,7 +175,13 @@ local function installDisplay(data, parentId)
 	if not base or base == "" then base = "Imported" end
 	local newId = WA.UniqueId(base)
 	data.id = newId
-	data.uid = WA.NewUID()
+	-- Identity survives the import, so a later one can be recognised as the same
+	-- aura. A uid already held here means this is a deliberate second copy and
+	-- gets a fresh one instead: Conditions.lua keys its compiled state by uid, so
+	-- two displays sharing one would overwrite each other's condition state.
+	if not data.uid or WA.FindByUID(data.uid) then
+		data.uid = WA.NewUID()
+	end
 	data.parent = parentId
 	WeakestAurasDB.displays[newId] = data
 	WA.MergeDefaults(data)

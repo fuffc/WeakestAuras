@@ -1319,6 +1319,269 @@ function D.CodeTab(rest)
 end
 
 -- ---------------------------------------------------------------------------
+-- /wa commprobe -- the server-side unknowns behind sharing auras through chat,
+-- none of which a type check can answer: whether SendAddonMessage's WHISPER
+-- channel delivers on this realm (every neighbouring addon only ever uses
+-- RAID/PARTY/GUILD), what the byte cap really is, what send rate survives, and
+-- whether a link type of our own renders, is clickable, and reaches SetItemRef.
+-- ---------------------------------------------------------------------------
+
+local COMM_PREFIX = "WKA"
+
+-- Ladder bodies are cut from the base64 alphabet a real payload is made of, so
+-- a byte this chat system mangles surfaces here rather than mid-transfer.
+local COMM_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+local commFrame, commRefHooked
+local commSent, commOrder = {}, {}
+
+local function commBody(n)
+	local out, alen = {}, string.len(COMM_ALPHABET)
+	for i = 1, n do
+		local k = math.mod(i - 1, alen) + 1
+		table.insert(out, string.sub(COMM_ALPHABET, k, k))
+	end
+	return table.concat(out)
+end
+
+-- Logs every arrival as it lands rather than only tallying at the end: if the
+-- realm reorders, delays or drops a chunk, the ordering is itself the finding.
+local function commOnEvent()
+	if event ~= "CHAT_MSG_ADDON" or arg1 ~= COMM_PREFIX then return end
+	local msg, channel, sender = arg2 or "", arg3, arg4
+	local _, _, tag, body = string.find(msg, "^([^:]+):(.*)$")
+	if not tag then
+		D.Log("  [recv] unparseable from " .. tostring(sender) .. " (" .. tostring(channel)
+			.. "), " .. string.len(msg) .. "B: " .. string.sub(msg, 1, 40))
+		return
+	end
+
+	local rec = commSent[tag]
+	local got = string.len(body)
+	local note
+	if not rec then
+		note = "no record of sending this tag"
+	elseif got ~= rec.bodyLen then
+		note = "TRUNCATED/PADDED -- sent " .. rec.bodyLen .. "B body, got " .. got .. "B"
+	elseif body ~= commBody(got) then
+		note = "CORRUPT -- length right, bytes differ"
+	else
+		note = "intact"
+		rec.ok = true
+	end
+	if rec then rec.arrived = true end
+
+	D.Log("  [recv] " .. tag .. " from " .. tostring(sender) .. " via " .. tostring(channel)
+		.. ", msg " .. string.len(msg) .. "B: " .. note)
+end
+
+local function commEnsureListener()
+	if commFrame then return end
+	commFrame = CreateFrame("Frame")
+	commFrame:RegisterEvent("CHAT_MSG_ADDON")
+	commFrame:SetScript("OnEvent", commOnEvent)
+	-- Some servers drop addon traffic on prefixes nobody registered. Absent on
+	-- vanilla, so its absence is a result and not a failure.
+	if type(RegisterAddonMessagePrefix) == "function" then
+		pcall(RegisterAddonMessagePrefix, COMM_PREFIX)
+	end
+end
+
+-- ChatThrottleLib's v13/v14 global hook is `Hook_SendAddonMessage(prefix, text,
+-- chattype)` -- three parameters, so it drops the whisper target and the client
+-- rejects the call as an unknown chat type. Several addons vendor a copy (aux,
+-- DPSMate), and whichever loads last owns the global, so a whisper here has to
+-- go to the function CTL saved rather than through the global. Its own v15
+-- rewrite neither hooks the global nor keeps that field, hence the fallback.
+local function commRawSender()
+	if ChatThrottleLib and type(ChatThrottleLib.ORIG_SendAddonMessage) == "function" then
+		return ChatThrottleLib.ORIG_SendAddonMessage, "CTL.ORIG_SendAddonMessage"
+	end
+	return SendAddonMessage, "global SendAddonMessage (no ORIG saved)"
+end
+
+local function commSend(tag, bodyLen, channel, target, raw)
+	local msg = tag .. ":" .. commBody(bodyLen)
+	local rec = { bodyLen = bodyLen, wire = string.len(msg), channel = channel }
+	commSent[tag] = rec
+	table.insert(commOrder, tag)
+	local fn = raw and commRawSender() or SendAddonMessage
+	local ok, err = pcall(fn, COMM_PREFIX, msg, channel, target)
+	if not ok then
+		rec.sendFailed = true
+		D.Log("  [send] " .. tag .. " (" .. channel .. (raw and ", raw" or ", hooked") .. ", "
+			.. rec.wire .. "B) ERRORED -- " .. tostring(err))
+	end
+	return ok
+end
+
+local function commReport(header)
+	D.Log(header)
+	for i = 1, table.getn(commOrder) do
+		local tag = commOrder[i]
+		local rec = commSent[tag]
+		local state
+		if rec.sendFailed then state = "send errored"
+		elseif rec.ok then state = "OK"
+		elseif rec.arrived then state = "arrived MANGLED"
+		else state = "NEVER ARRIVED" end
+		D.Log("    " .. tag .. " (" .. rec.channel .. ", " .. rec.wire .. "B on the wire): " .. state)
+	end
+end
+
+-- Our own link type, end to end: rendered into a chat frame, clicked by hand,
+-- caught here. Wrap-and-forward because this client's SetItemRef cannot be
+-- hooked securely, and because pfUI replaces the same global -- logging the
+-- function identity is how the composition question gets answered.
+local function commHookSetItemRef()
+	if commRefHooked then return end
+	commRefHooked = true
+	local orig = SetItemRef
+	SetItemRef = function(link, text, button)
+		local _, _, sender, name = string.find(link or "", "^weakestauras:([^:]+):(.*)$")
+		if sender then
+			D.Log("  [link] SetItemRef REACHED -- sender=\"" .. sender .. "\" name=\"" .. name
+				.. "\" button=" .. tostring(button))
+			return
+		end
+		if orig then return orig(link, text, button) end
+	end
+end
+
+function D.CommProbe(rest)
+	local _, _, sub, tail = string.find(rest or "", "^(%S*)%s*(.-)$")
+	if string.lower(sub or "") == "throttle" then return D.CommThrottle(tail) end
+
+	commSent, commOrder = {}, {}
+	commEnsureListener()
+	D.Log("--- comm probe ---")
+
+	local names = {
+		"SendAddonMessage", "RegisterAddonMessagePrefix", "SetItemRef",
+		"ChatFrame_AddMessageEventFilter", "GetCurrentKeyBoardFocus",
+	}
+	for i = 1, table.getn(names) do
+		D.Log("  [api] " .. names[i] .. " = " .. type(getglobal(names[i])))
+	end
+	D.Log("  [api] NUM_CHAT_WINDOWS = " .. tostring(NUM_CHAT_WINDOWS)
+		.. ", ChatFrameEditBox = " .. type(ChatFrameEditBox)
+		.. (ChatFrameEditBox and (" (Insert=" .. type(ChatFrameEditBox.Insert)
+			.. " IsVisible=" .. type(ChatFrameEditBox.IsVisible)
+			.. " Show=" .. type(ChatFrameEditBox.Show) .. ")") or ""))
+	D.Log("  [api] pfUI = " .. type(pfUI) .. ", pfUI chat module = "
+		.. ((pfUI and pfUI.chat) and "loaded" or "not loaded"))
+	D.Log("  [api] SetItemRef identity before our wrap: " .. tostring(SetItemRef))
+
+	-- Whether AddMessage is already someone else's wrapper decides whether the
+	-- incoming-rewrite hook composes or clobbers.
+	local shared = 0
+	for i = 1, (NUM_CHAT_WINDOWS or 0) do
+		local cf = getglobal("ChatFrame" .. i)
+		if cf and cf.AddMessage then
+			if cf.AddMessage ~= ChatFrame1.AddMessage then shared = shared + 1 end
+		end
+	end
+	D.Log("  [api] chat frames with an AddMessage differing from ChatFrame1's: " .. shared
+		.. " (nonzero means at least one is individually wrapped)")
+
+	commHookSetItemRef()
+	DEFAULT_CHAT_FRAME:AddMessage(
+		"|Hweakestauras:Probe:Test Aura|h|cff8800ff[Probe - Test Aura]|h|r"
+		.. " <- CLICK THIS. Coloured and clickable = the link type works.")
+	D.Log("  [link] wrapper installed, sample line printed to the default chat frame.")
+	D.Log("  ^^ CLICK IT, and shift-click it too. Then run this again with pfUI's chat module toggled.")
+
+	local _, rawWhich = commRawSender()
+	D.Log("  [ctl] ChatThrottleLib = " .. type(ChatThrottleLib)
+		.. (ChatThrottleLib and (" v" .. tostring(ChatThrottleLib.version)
+			.. ", ORIG_SendAddonMessage = " .. type(ChatThrottleLib.ORIG_SendAddonMessage)) or ""))
+	D.Log("  [ctl] raw whisper attempts go through " .. rawWhich)
+
+	-- Sent through the hooked global and through the saved original both, so a
+	-- refusal separates "this realm has no whisper channel" from "a third-party
+	-- hook ate the target argument".
+	local me = UnitName("player")
+	commSend("S001", 60, "WHISPER", me)
+	commSend("R001", 60, "WHISPER", me, true)
+	if tail and tail ~= "" then commSend("R002", 60, "WHISPER", tail, true) end
+
+	local inGuild = IsInGuild and IsInGuild()
+	local inParty = GetNumPartyMembers and GetNumPartyMembers() > 0
+	commSend("G001", 60, "GUILD")
+	if inParty then
+		commSend("P001", 60, "PARTY")
+	else
+		D.Log("  [send] PARTY skipped -- not in a party, so silence would prove nothing.")
+	end
+
+	-- The cap is nominally 255 for prefix\tmessage, but nominal is exactly what
+	-- this is here to check. Ridden over whichever channel is known to deliver,
+	-- so the answer doesn't depend on the whisper question resolving first.
+	local ladderChan, ladderTarget, ladderRaw
+	if inGuild then ladderChan = "GUILD"
+	elseif inParty then ladderChan = "PARTY"
+	else ladderChan, ladderTarget, ladderRaw = "WHISPER", me, true end
+	D.Log("  [send] byte ladder rides " .. ladderChan)
+	local ladder = { 180, 200, 220, 240, 250 }
+	for i = 1, table.getn(ladder) do
+		local n = ladder[i]
+		commSend("L" .. n, n - 5, ladderChan, ladderTarget, ladderRaw)
+	end
+
+	D.Log("  [send] " .. table.getn(commOrder) .. " messages away; tally in 10s.")
+	C_Timer.After(10, function()
+		commReport("  --- comm probe tally ---")
+		D.Log("  S001 dead but R001 alive = a hooked global ate the target, not the realm.")
+		D.Log("  Both dead = no whisper channel here, and sharing takes the group-channel fallback.")
+		D.Log("  Then: /wa commprobe throttle [channel] [rate] [seconds]")
+		D.Log("--- end comm probe ---")
+	end)
+end
+
+-- Deliberately opt-in and separate: this is the one probe that can get the
+-- character disconnected for addon spam, so it never runs as part of the sweep
+-- above and it starts gentle.
+function D.CommThrottle(rest)
+	local _, _, chan, rateStr, secsStr = string.find(rest or "", "^(%S*)%s*(%S*)%s*(%S*)$")
+	chan = string.upper(chan or "")
+	if chan == "" then chan = "WHISPER" end
+	local rate = tonumber(rateStr) or 4
+	local secs = tonumber(secsStr) or 5
+	if rate < 1 then rate = 1 elseif rate > 20 then rate = 20 end
+	if secs < 1 then secs = 1 elseif secs > 10 then secs = 10 end
+
+	local total = rate * secs
+	commSent, commOrder = {}, {}
+	commEnsureListener()
+	D.Log("--- comm throttle: " .. total .. " messages at " .. rate .. "/sec over "
+		.. secs .. "s on " .. chan .. " ---")
+	D.Log("  A disconnect here IS the answer. Step the rate up only after a clean run.")
+
+	local me = UnitName("player")
+	local sent = 0
+	local ticker
+	ticker = C_Timer.NewTicker(1 / rate, function()
+		sent = sent + 1
+		local isWhisper = (chan == "WHISPER")
+		commSend("T" .. sent, 95, chan, isWhisper and me or nil, isWhisper)
+		if sent >= total and ticker and ticker.Cancel then ticker:Cancel() end
+	end)
+
+	C_Timer.After(secs + 6, function()
+		local arrived = 0
+		for i = 1, table.getn(commOrder) do
+			if commSent[commOrder[i]].ok then arrived = arrived + 1 end
+		end
+		D.Log("  [throttle] " .. arrived .. " of " .. table.getn(commOrder)
+			.. " sent messages came back intact at " .. rate .. "/sec.")
+		if arrived < table.getn(commOrder) then
+			commReport("  --- which ones ---")
+		end
+		D.Log("--- end comm throttle ---")
+	end)
+end
+
+-- ---------------------------------------------------------------------------
 -- Slash dispatch. Called from OptionsFrame.lua's /wa handler whenever the
 -- command has an argument; a bare /wa still opens the options window.
 -- ---------------------------------------------------------------------------
@@ -1338,6 +1601,8 @@ function D.HandleSlash(msg)
 		D.Timers()
 	elseif cmd == "linkprobe" then
 		D.LinkProbe()
+	elseif cmd == "commprobe" then
+		D.CommProbe(rest)
 	elseif cmd == "cdtest" then
 		D.CooldownTest()
 	elseif cmd == "swipetest" then
@@ -1382,6 +1647,6 @@ function D.HandleSlash(msg)
 		ensureFrame()
 		frame:Hide()
 	else
-		D.Log("[debug] unknown command \"" .. cmd .. "\". Available: dump [unit] [filter], watch [unit], events [EVENT ...], timers, linkprobe, cdtest, swipetest [sizes/WxH...], swipenudge <k> [yflat], track <spellName>, states <id>, conditions <id>, gen <id>, load <id>, probe, codeprobe, codelive, codetab <1-8|tabs>, codefont <6-16>, rows, libs, addons, export <id>, import, clear, show, hide")
+		D.Log("[debug] unknown command \"" .. cmd .. "\". Available: dump [unit] [filter], watch [unit], events [EVENT ...], timers, linkprobe, commprobe [charname|throttle [channel] [rate] [secs]], cdtest, swipetest [sizes/WxH...], swipenudge <k> [yflat], track <spellName>, states <id>, conditions <id>, gen <id>, load <id>, probe, codeprobe, codelive, codetab <1-8|tabs>, codefont <6-16>, rows, libs, addons, export <id>, import, clear, show, hide")
 	end
 end
