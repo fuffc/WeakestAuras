@@ -106,15 +106,20 @@ end
 local function EnsureRegion(id, cloneId)
 	local data = WeakestAurasDB.displays[id]
 	if not data then return nil end
-	local rt = WA.regionTypes[data.regionType]
+	-- Not WA.regionTypes directly: an aura naming a type this addon lacks builds
+	-- through the `fallback` region, which says so on screen rather than leaving a
+	-- row in the list with nothing behind it.
+	local rt = WA.RegionSpecFor(data)
 	if not rt or not rt.create then return nil end
 
 	local entry = regions[id]
-	if not entry or entry.regionType ~= data.regionType then
+	-- The spec as well as the name, so an aura that was falling back and whose
+	-- real type has since been registered gets rebuilt rather than kept.
+	if not entry or entry.regionType ~= data.regionType or entry.spec ~= rt then
 		if entry then
 			for _, frame in pairs(entry.byClone) do frame:Hide() end
 		end
-		entry = { regionType = data.regionType, byClone = {} }
+		entry = { regionType = data.regionType, spec = rt, byClone = {} }
 		regions[id] = entry
 	end
 
@@ -131,7 +136,7 @@ end
 -- (Re)applies saved config to every existing clone of a display -- the single
 -- code path both "apply saved config" (WA.Add) and a regionType switch run.
 local function SetRegion(data)
-	local rt = WA.regionTypes[data.regionType]
+	local rt = WA.RegionSpecFor(data)
 	if not rt or not rt.create then return end
 	EnsureRegion(data.id, "")
 	local entry = regions[data.id]

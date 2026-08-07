@@ -393,6 +393,21 @@ local function poolLabel(page, text)
 	return fs
 end
 
+-- A wrapping explanatory line under a field. Pooled apart from `label` because
+-- it carries a wrap width, which a plain label reused from the same pool would
+-- inherit and then wrap inside its own row.
+local function poolDescription(page, text, width)
+	local fs = acquire(page, "desc", function()
+		local f = page:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+		f:SetJustifyH("LEFT")
+		f:SetTextColor(0.6, 0.6, 0.6)
+		return f
+	end)
+	fs:SetWidth(width)
+	fs:SetText(text or "")
+	return fs
+end
+
 local function poolHeaderLabel(page, text)
 	local fs = acquire(page, "headerlabel", function() return W.sectionHeader(page, "") end)
 	fs:SetText(text or "")
@@ -834,6 +849,14 @@ local function placeField(page, f, x, y, w)
 		local box = poolMultiline(page, mw, mh, f.get() or "", f.set)
 		box:SetPoint("TOPLEFT", x, y - 16)
 		return 16 + mh + 8
+	elseif f.type == "description" then
+		-- Text only, no control: `name` is the whole body. Sized to the page
+		-- rather than the capped column, since it is prose and wraps.
+		local dw = f.half and w or ((page:GetWidth() or 400) - x - 16)
+		if dw < 120 then dw = 120 end
+		local fs = poolDescription(page, f.name, dw)
+		fs:SetPoint("TOPLEFT", x, y)
+		return (fs:GetHeight() or 12) + 8
 	elseif f.type == "code" then
 		local label = poolLabel(page, f.name)
 		label:SetPoint("TOPLEFT", x, y)

@@ -19,7 +19,7 @@ local EDGE = "Interface\\Buttons\\WHITE8X8"
 WA.RegisterSubRegionType("subborder", {
 	displayName = "Border",
 	supports = function(regionType)
-		return regionType == "icon" or regionType == "progressbar"
+		return regionType == "icon" or regionType == "progressbar" or regionType == "text"
 	end,
 	default = {
 		type = "subborder",

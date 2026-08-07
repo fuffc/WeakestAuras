@@ -126,8 +126,8 @@ local function growChildren(data)
 		-- By time remaining; a child with no timer sorts last (ref the aura-bar
 		-- convention). expirationTime is the region's live value.
 		table.sort(list, function(a, b)
-			local ta = a.region.expirationTime or math.huge
-			local tb = b.region.expirationTime or math.huge
+			local ta = a.region.expirationTime or WA.INF
+			local tb = b.region.expirationTime or WA.INF
 			if sort == "ascending" then return ta < tb else return ta > tb end
 		end)
 	end
@@ -1761,5 +1761,556 @@ WA.RegisterRegionType("progressbar", {
 
 		WA.regionPrototype.ApplyProgressConfig(region, data)
 		WA.regionPrototype.modifyFinish(region, data)
+	end,
+})
+
+-- Follows WeakAuras2's Text.lua: a region that *is* its text, where icon and
+-- progressbar merely carry text as sub-regions. The font block -- face, size,
+-- outline, both justifications, spacing, shadow -- is TextCore.lua's, shared with
+-- subtext, so what lives here is the string, the frame around it, and the
+-- decision about when to re-resolve.
+--
+-- Per-symbol format settings sit under upstream's key layout for this region,
+-- displayText_format_<symbol>_<setting>, the region-side twin of subtext's
+-- text_text_format_*.
+local TEXT_FORMAT_PREFIX = "displayText_format_"
+
+local function textFormatGetter(data)
+	return function(key, default)
+		local v = data[TEXT_FORMAT_PREFIX .. key]
+		if v == nil then return default end
+		return v
+	end
+end
+
+-- Every string this region might end up showing: the configured one, plus any a
+-- condition can swap in through the displayText property. A condition-supplied
+-- string has to format identically to a typed one, so its symbols need formatters
+-- built alongside (WA2's Text.lua walks data.conditions for the same reason).
+-- The options rows stay one per symbol of the text being edited -- these are only
+-- for the formatter build.
+local function displayTexts(data)
+	local texts = { data.displayText or "" }
+	local conditions = data.conditions or {}
+	for i = 1, table.getn(conditions) do
+		local changes = conditions[i].changes or {}
+		for c = 1, table.getn(changes) do
+			local change = changes[c]
+			if change.property == "displayText" and type(change.value) == "string" then
+				table.insert(texts, change.value)
+			end
+		end
+	end
+	return texts
+end
+
+-- Where the string sits inside a region larger than it. SetJustifyH/V decide only
+-- how wrapped lines align against the string's *own* box, so without anchoring at
+-- the justify point a left-justified text still floats in the middle of a wide
+-- region -- WA2's Text.lua anchors at data.justify for exactly this. Our justify
+-- is the shared font block's pair, so both axes are honoured rather than
+-- upstream's horizontal one alone.
+local TEXT_ANCHORS_BY_JUSTIFY = {
+	TOP = { LEFT = "TOPLEFT", CENTER = "TOP", RIGHT = "TOPRIGHT" },
+	MIDDLE = { LEFT = "LEFT", CENTER = "CENTER", RIGHT = "RIGHT" },
+	BOTTOM = { LEFT = "BOTTOMLEFT", CENTER = "BOTTOM", RIGHT = "BOTTOMRIGHT" },
+}
+
+local function textAnchorPoint(data)
+	local D = WA.textCore.DEFAULTS
+	local row = TEXT_ANCHORS_BY_JUSTIFY[data.text_justifyV or D.justifyV]
+		or TEXT_ANCHORS_BY_JUSTIFY.MIDDLE
+	return row[data.text_justifyH or D.justifyH] or "CENTER"
+end
+
+-- The default custom text function, seeded into a fresh field and restored by the
+-- editor's Reset -- an emptied box is otherwise unrecoverable without remembering
+-- the signature. Arguments are WA.RunCustomTextFunc's, and every return is a
+-- %c: the first is %c or %c1, the second %c2, and so on.
+local CUSTOM_TEXT_DEFAULT = [[function(expirationTime, duration, progress, dur, name, icon, stacks)
+	return ""
+end]]
+
+-- Compiles a custom text function -- a whole `function(...) ... end` expression,
+-- loadstring'd behind a `return`, the idiom GenericTrigger already uses for a
+-- custom trigger and sharing that file's sandbox environment. A source that will
+-- not compile reports and yields nil, so the rest of the text still renders.
+local function compileCustomText(source, id)
+	local function refuse(err)
+		DEFAULT_CHAT_FRAME:AddMessage("|cffff0000WeakestAuras|r [" .. tostring(id)
+			.. "] custom text: " .. tostring(err), 1, 0.3, 0.3)
+		return nil
+	end
+	local chunk, err = loadstring("return " .. source)
+	if not chunk then return refuse(err) end
+	if WA.customEnv then setfenv(chunk, WA.customEnv) end
+	local ok, fn = pcall(chunk)
+	if not ok then return refuse(fn) end
+	if type(fn) ~= "function" then return refuse("must be a function") end
+	return fn
+end
+
+-- Auto mode: size the region to whatever the string just rendered as. Both
+-- dimensions are measured, since GetStringHeight is absent here and GetHeight
+-- stands in for it -- a FontString with no explicit height reports its own text's,
+-- wrapping included.
+--
+-- The result is written back to `data`, not merely onto the frame: group layout
+-- (childRect) computes a child's box from data.width/height and returns a
+-- degenerate point for a child that has neither, so a size living only on the
+-- frame would let a dynamic group stack its siblings straight through this one.
+-- The equality check is what keeps that affordable -- writing and relaying out
+-- unconditionally would be a group relayout on every frame of a ticking %p.
+--
+-- The floor is the same recoverability argument as the " " substitution above: a
+-- measurement can legitimately come back 0 (a font the client refused renders
+-- nothing and measures nothing), and a region of no size cannot be clicked, which
+-- is how one is dragged or resized back into existence.
+local MIN_TEXT_DIM = 8
+
+local function textAutoSize(region, data)
+	local fs = region.text
+	-- Measured detached, so an enclosing group's scale doesn't inflate the
+	-- reading, then put back (WA2 Text.lua).
+	local host = fs:GetParent()
+	fs:SetParent(UIParent)
+	local w = fs:GetStringWidth() or 0
+	local h = fs:GetHeight() or 0
+	fs:SetParent(host)
+	if w < MIN_TEXT_DIM then w = MIN_TEXT_DIM end
+	if h < MIN_TEXT_DIM then h = MIN_TEXT_DIM end
+
+	if w == data.width and h == data.height then return end
+	data.width, data.height = w, h
+	region:SetWidth(w)
+	region:SetHeight(h)
+	if data.parent then WA.RelayoutGroup(data.parent) end
+end
+
+local function textCreate(parent, data)
+	local region = CreateFrame("Frame", nil, parent)
+
+	-- The FontString sits on a child frame rather than on the region, the trap
+	-- SubText.lua documents: a child frame's draw layers all sit above its
+	-- parent's, so a border sub-region built as a child frame would paint over
+	-- text created directly on the region. The level is asserted in modify, since
+	-- SetParent resets it.
+	local textFrame = CreateFrame("Frame", nil, region)
+	textFrame:SetAllPoints(region)
+	region.textFrame = textFrame
+	region.text = textFrame:CreateFontString(nil, "OVERLAY")
+
+	WA.regionPrototype.create(region)
+
+	-- One stable function object, so ConfigureSubscribers can take it back off the
+	-- bus -- a closure built per call could only ever be added.
+	region.frameTick = function()
+		if region.customTextMode == "update" then region:RefreshCustomText() end
+		region:UpdateText()
+	end
+
+	-- The two custom-text update modes are different *call counts*, not "throttled
+	-- or not" (WA2 Text.lua). `event` runs the function once per state update and
+	-- ignores the throttle entirely -- that is what `force` means here. `update`
+	-- runs it on FrameTick, and there the throttle is the difference between a
+	-- feature and a frame-rate bug.
+	function region:RefreshCustomText(force)
+		if not self.customTextFunc then return end
+		if not force then
+			local last = self.lastCustomTextUpdate
+			if last and last + (self.customTextThrottle or 0) >= GetTime() then return end
+		end
+		self.customValues = WA.RunCustomTextFunc(self, self.customTextFunc)
+		self.lastCustomTextUpdate = GetTime()
+	end
+
+	function region:UpdateText()
+		local str = WA.ReplacePlaceHolders(self.displayText or "", self, self.formatters)
+		-- An empty resolved string is substituted rather than shown: a zero-width
+		-- region can't be clicked, and clicking it is how one is dragged or resized
+		-- back into existence (WA2 Text.lua).
+		if str == "" then str = " " end
+		self:SetDisplayString(str)
+	end
+
+	function region:Update()
+		self:RefreshCustomText(true)
+		self:UpdateText()
+	end
+
+	region:Hide()
+	return region
+end
+
+local function textModify(region, data)
+	function region:Color(r, g, b, a) self.text:SetTextColor(r, g, b, a or 1) end
+
+	-- Not merely SetTextHeight: upstream re-calls SetFont at the new size first
+	-- (Text.lua), so a condition-driven size change re-enters the read-back that
+	-- keeps a face the client refuses from leaving the string unrendered. Routed
+	-- through textCore rather than opening a second SetFont call site.
+	function region:SetTextHeight(size)
+		WA.textCore.Apply(self.text, data, "text_", size)
+		self.text:SetTextHeight(size)
+	end
+
+	-- A condition can replace the whole string, and that changes two answers, not
+	-- one: what the resolved text is, and whether this region belongs on the
+	-- per-frame bus at all. WA2 keeps them as ConfigureTextUpdate and
+	-- ConfigureSubscribers; without the second, a condition swapping in a %p
+	-- renders a countdown once and then freezes.
+	function region:ChangeText(msg)
+		self.displayText = msg or ""
+		self:ConfigureTextUpdate()
+		self:ConfigureSubscribers()
+	end
+
+	function region:ConfigureTextUpdate()
+		self.needsFrameTick = WA.TextNeedsFrameTick(self.displayText, self.everyFrameFormatters)
+			or (self.customTextFunc ~= nil and self.customTextMode == "update"
+				and WA.ContainsCustomPlaceHolder(self.displayText))
+			or false
+	end
+
+	function region:ConfigureSubscribers()
+		self.subRegionEvents:RemoveSubscriber("FrameTick", self.frameTick)
+		if self.needsFrameTick then
+			self.subRegionEvents:AddSubscriber("FrameTick", self.frameTick)
+		end
+		WA.regionPrototype.RefreshFrameTick(self)
+		self:RefreshCustomText(true)
+		self:UpdateText()
+	end
+
+	local texts = displayTexts(data)
+	region.formatters, region.everyFrameFormatters =
+		WA.CreateFormatters(texts, textFormatGetter(data), data)
+
+	-- Compiled only when something actually references %c -- including a string
+	-- only a condition supplies, which is why the whole set is asked rather than
+	-- data.displayText alone. Nothing recompiles per frame: this is modify.
+	region.customTextFunc = nil
+	region.customValues = nil
+	region.lastCustomTextUpdate = nil
+	region.customTextMode = data.customTextUpdate or "event"
+	region.customTextThrottle = data.customTextUpdateThrottle or 0
+	if data.customText and data.customText ~= "" and WA.ContainsCustomPlaceHolder(texts) then
+		region.customTextFunc = compileCustomText(data.customText, data.id)
+	end
+
+	WA.textCore.Apply(region.text, data, "text_")
+	local point = textAnchorPoint(data)
+	region.text:ClearAllPoints()
+	region.text:SetPoint(point, region, point)
+
+	-- Two sizing modes, and they differ in who owns the box. Fixed is a region
+	-- like any other -- its width and height are settings, the string wraps inside
+	-- them, and the mover resizes it. Auto has no size of its own: the string is
+	-- measured after every SetText and the region follows it, so the setters are
+	-- deliberately *absent*, which is what turns the mover's resize handles off
+	-- (MoverSizer gates on region.SetRegionWidth). They are cleared rather than
+	-- left alone, since one modify can follow another in the other mode.
+	if data.automaticWidth == "Fixed" then
+		function region:SetRegionWidth(w) self:SetWidth(w); self.text:SetWidth(w) end
+		function region:SetRegionHeight(h) self:SetHeight(h) end
+		function region:SetDisplayString(str) WA.textCore.SetText(self.text, str) end
+		region:SetRegionWidth(data.width)
+		region:SetRegionHeight(data.height)
+	else
+		region.SetRegionWidth = nil
+		region.SetRegionHeight = nil
+		function region:SetDisplayString(str)
+			WA.textCore.SetText(self.text, str)
+			textAutoSize(self, data)
+		end
+		-- Unbinds a width a previous Fixed pass left on the string, or it would
+		-- keep wrapping at that column and measure short.
+		region.text:SetWidth(0)
+	end
+
+	region:SetRegionAlpha(data.alpha)
+	local col = data.text_color or { 1, 1, 1, 1 }
+	region:Color(col[1], col[2], col[3], col[4])
+
+	-- ApplyPosition may SetParent, which resets child frame levels, so the text
+	-- frame's is asserted after it -- below SUB_LEVEL, where region internals live.
+	WA.regionPrototype.ApplyPosition(region, data)
+	WA.regionPrototype.ApplyFrameStrata(region, data)
+	region.textFrame:SetFrameLevel(region:GetFrameLevel() + 1)
+
+	-- The region's own FrameTick subscription is installed *after* modifyFinish,
+	-- which drops every subscriber before rebuilding the sub-regions'.
+	WA.regionPrototype.modifyFinish(region, data)
+	region.displayText = data.displayText or ""
+	region:ConfigureTextUpdate()
+	region:ConfigureSubscribers()
+end
+
+WA.RegisterRegionType("text", {
+	displayName = "Text",
+	description = "A line of text on its own, driven by the same placeholders.",
+	icon = "Interface\\Icons\\INV_Misc_Note_01",
+	defaults = {
+		displayText = "%p",
+		-- Auto is upstream's default and the reason the region type is worth
+		-- having: a box that hugs its own glyphs. width/height are still seeded
+		-- because Auto writes its measurements back into them and group layout
+		-- reads them from there.
+		automaticWidth = "Auto",
+		width = 200,
+		height = 20,
+		alpha = 1,
+		-- The rest of the font block is deliberately absent: TextCore reads every
+		-- one of its keys through a default, so a saved aura needs no migration to
+		-- pick up a key added later. Size and colour are here because a condition
+		-- restores a property's base from data, and a nil base is not a size.
+		text_size = 12,
+		text_color = { 1, 1, 1, 1 },
+		customText = "",
+		customTextUpdate = "event",
+		-- Upstream defaults this to 0, which in `update` mode is the custom
+		-- function running on every frame. A default that costs frame rate is not
+		-- a default.
+		customTextUpdateThrottle = 0.2,
+		anchorFrameType = "SCREEN",
+		selfPoint = "CENTER",
+		anchorPoint = "CENTER",
+		xOffset = 0,
+		yOffset = 0,
+		frameStrata = 1,
+	},
+	-- No width/height here, unlike the other leaf types and matching upstream: in
+	-- Auto mode the box is a measurement rather than a setting, and a condition
+	-- offering to change it would silently do nothing.
+	properties = WA.regionPrototype.AddProperties({
+		text_color = { display = "Color", setter = "Color", type = "color" },
+		text_size = { display = "Font Size", setter = "SetTextHeight", type = "number", min = 6, max = 72, step = 1 },
+		displayText = { display = "Text", setter = "ChangeText", type = "string" },
+	}),
+	-- List-row preview: the configured string, not a resolved one -- there is no
+	-- state behind a list row, and showing "%p" is what tells the reader what the
+	-- aura will say. A FontString isn't clipped by the frame it sits on, so the
+	-- box's width is imposed on it and the string is cut rather than left to run
+	-- out across the row. Upstream masks a live preview with a self-scrolling
+	-- ScrollFrame; that is a lot of machinery for a 32px square.
+	createThumbnail = function(parent)
+		local frame = CreateFrame("Frame", nil, parent)
+		local fs = frame:CreateFontString(nil, "ARTWORK")
+		fs:SetPoint("CENTER", frame, "CENTER")
+		frame.fs = fs
+		return frame
+	end,
+	modifyThumbnail = function(frame, data)
+		local box = frame:GetHeight() or 32
+		local fs = frame.fs
+		local size = math.floor(box / 3)
+		if size < 6 then size = 6 end
+		WA.textCore.Apply(fs, data, "text_", size)
+		fs:SetJustifyH("CENTER")
+		fs:SetJustifyV("MIDDLE")
+		fs:SetWidth(box)
+		WA.textCore.SetText(fs, WA.Utf8Sub(data.displayText or "", 12))
+	end,
+	create = textCreate,
+	modify = textModify,
+	options = function(data)
+		local fields = {
+			{ type = "header", name = "Text" },
+			{
+				-- %i is absent from the label deliberately: it resolves to nothing
+				-- here, this client's FontString having no inline texture escape.
+				type = "multiline", name = "Display text (%p %t %n %s %c)", key = "displayText", height = 60,
+				get = function() return data.displayText end,
+				-- Re-renders the tab: the Format rows below are one per symbol in
+				-- this string, so editing it changes which rows exist.
+				set = function(v)
+					data.displayText = v
+					WA.SetDefaultFormatters(v, textFormatGetter(data),
+						function(key, value) data[TEXT_FORMAT_PREFIX .. key] = value end, data)
+					WA.Add(data, true)
+					WA.RefreshOptions()
+				end,
+			},
+			{
+				type = "range", name = "Size", key = "text_size", min = 6, max = 72, step = 1, half = true,
+				get = function() return data.text_size end,
+				set = function(v) data.text_size = v; WA.Add(data, true) end,
+			},
+			{
+				type = "range", name = "Alpha", key = "alpha", min = 0, max = 1, step = 0.05, half = true,
+				get = function() return data.alpha end,
+				set = function(v) data.alpha = v; WA.Add(data, true) end,
+			},
+			{
+				type = "color", name = "Color", key = "text_color",
+				get = function() return data.text_color end,
+				set = function(v) data.text_color = v; WA.Add(data, true) end,
+			},
+		}
+
+		-- Directly under the text field, whose label can only name the built-in
+		-- symbols.
+		local hint = WA.TextSymbolHint(data)
+		if hint then table.insert(fields, 2, { type = "description", name = hint }) end
+
+		local fontFields = WA.textCore.OptionFields(data, "region:textfont",
+			function(key) return data["text_" .. key] end,
+			function(key, v) data["text_" .. key] = v; WA.Add(data, true) end)
+		for i = 1, table.getn(fontFields) do table.insert(fields, fontFields[i]) end
+
+		local get = textFormatGetter(data)
+		local formatFields = WA.FormatOptionFields(data.displayText, get,
+			function(key, v) data[TEXT_FORMAT_PREFIX .. key] = v; WA.Add(data, true) end,
+			data, TEXT_FORMAT_PREFIX)
+		if table.getn(formatFields) > 0 then
+			-- Folded for the reason subtext folds its own: every %symbol grows a
+			-- row, and with two or three symbols those rows bury the text field
+			-- being edited under settings that get chosen once.
+			local S = WA.OptionsState
+			local key = "region:textformat"
+			local collapsed = S.isCollapsed(data, key, true)
+			table.insert(fields, {
+				type = "disclosure", name = "Format Options",
+				summary = WA.FormatSummary(data.displayText, get, data),
+				collapsed = collapsed,
+				onToggle = function()
+					S.setCollapsed(data, key, not collapsed)
+					WA.RefreshOptions()
+				end,
+			})
+			if not collapsed then
+				for i = 1, table.getn(formatFields) do table.insert(fields, formatFields[i]) end
+			end
+		end
+
+		-- The custom-text editor appears once something in the text asks for it,
+		-- which is also how the connection between %c and this block is taught.
+		if WA.ContainsCustomPlaceHolder(data.displayText) then
+			table.insert(fields, { type = "header", name = "Custom Text" })
+			table.insert(fields, {
+				type = "code", name = "Custom Text Function", key = "customText", height = 160,
+				get = function() return data.customText or "" end,
+				set = function(v) data.customText = v; WA.Add(data, true) end,
+				default = CUSTOM_TEXT_DEFAULT,
+				-- The same wrapper compileCustomText uses, so the reported line
+				-- numbers match what the user is looking at ("return " carries no
+				-- newline).
+				validate = function(txt)
+					return WA.Widgets.LuaSyntaxError("return " .. (txt or ""), "custom text")
+				end,
+			})
+			table.insert(fields, {
+				type = "select", name = "Update on", key = "customTextUpdate",
+				values = { "event", "update" },
+				labels = { event = "Every state change", update = "Every frame" },
+				get = function() return data.customTextUpdate or "event" end,
+				set = function(v)
+					data.customTextUpdate = v
+					WA.Add(data, true)
+					-- Repaints the tab: the throttle below decides nothing outside
+					-- the per-frame mode.
+					WA.RefreshOptions()
+				end,
+			})
+			if data.customTextUpdate == "update" then
+				table.insert(fields, {
+					type = "range", name = "Throttle (seconds)", key = "customTextUpdateThrottle",
+					min = 0, max = 2, step = 0.05,
+					get = function() return data.customTextUpdateThrottle end,
+					set = function(v) data.customTextUpdateThrottle = v; WA.Add(data, true) end,
+				})
+			end
+		end
+
+		table.insert(fields, { type = "header", name = "Size" })
+		table.insert(fields, {
+			type = "select", name = "Sizing", key = "automaticWidth",
+			values = { "Auto", "Fixed" },
+			labels = { Auto = "Fit to the text", Fixed = "Fixed, text wraps inside" },
+			get = function() return data.automaticWidth or "Auto" end,
+			set = function(v)
+				data.automaticWidth = v
+				WA.Add(data, true)
+				-- Repaints the tab: the two sliders below exist only in Fixed mode,
+				-- Auto's box being a measurement rather than a setting.
+				WA.RefreshOptions()
+			end,
+		})
+		if data.automaticWidth == "Fixed" then
+			table.insert(fields, {
+				type = "range", name = "Width", key = "width", min = 8, max = 400, step = 1, half = true,
+				get = function() return data.width end,
+				set = function(v) data.width = v; WA.Add(data, true) end,
+			})
+			table.insert(fields, {
+				type = "range", name = "Height", key = "height", min = 8, max = 400, step = 1, half = true,
+				get = function() return data.height end,
+				set = function(v) data.height = v; WA.Add(data, true) end,
+			})
+		end
+
+		for _, f in ipairs(WA.regionPrototype.PositionOptions(data)) do
+			table.insert(fields, f)
+		end
+		return fields
+	end,
+})
+
+-- Upstream registers a second region type out of the same file (Text.lua L393):
+-- a text region that renders "Region type %s not supported" and nothing else.
+-- WA.RegionSpecFor routes an aura naming a type this addon lacks here, at the
+-- point a region is built -- so an imported progresstexture is a box on screen
+-- saying what is wrong, rather than a row in the list that is silently never
+-- drawn.
+--
+-- `internal`, so nothing offers to create one or convert to it: it stands in for
+-- an absence, and an absence is not a thing to pick.
+--
+-- Nothing here may read the type's own defaults. MergeDefaults resolves them
+-- through WA.regionTypes and finds none for an unknown type, so every field this
+-- modify touches carries its own fallback.
+WA.RegisterRegionType("fallback", {
+	displayName = "Unsupported",
+	description = "Stands in for a region type this addon does not have.",
+	internal = true,
+	icon = "Interface\\Icons\\INV_Misc_QuestionMark",
+	create = textCreate,
+	modify = function(region, data)
+		function region:SetDisplayString(str) WA.textCore.SetText(self.text, str) end
+		-- One static string with no state behind it, so the region never resolves
+		-- a placeholder and never joins the per-frame bus.
+		function region:Update() end
+		region.displayText = ""
+		region.formatters, region.everyFrameFormatters = nil, nil
+		region.customTextFunc = nil
+
+		WA.textCore.Apply(region.text, data, "text_")
+		region.text:SetWidth(0)
+		region.text:ClearAllPoints()
+		region.text:SetPoint("CENTER", region, "CENTER")
+
+		region:SetRegionAlpha(data.alpha or 1)
+		WA.regionPrototype.ApplyPosition(region, data)
+		WA.regionPrototype.ApplyFrameStrata(region, data)
+		region.textFrame:SetFrameLevel(region:GetFrameLevel() + 1)
+		WA.regionPrototype.modifyFinish(region, data)
+
+		WA.textCore.SetText(region.text,
+			"Region type " .. tostring(data.regionType) .. " not supported")
+		region:SetWidth(math.max(region.text:GetStringWidth() or 0, MIN_TEXT_DIM))
+		region:SetHeight(math.max(region.text:GetHeight() or 0, MIN_TEXT_DIM))
+	end,
+	options = function(data)
+		local fields = {
+			{ type = "header", name = "Unsupported region" },
+			{ type = "description", name = "This aura asks for a \"" .. tostring(data.regionType)
+				.. "\" display, which WeakestAuras does not have. Its triggers, conditions and load "
+				.. "settings are intact -- pick another Region type on the Info tab to show it as "
+				.. "something this addon can draw." },
+		}
+		for _, f in ipairs(WA.regionPrototype.PositionOptions(data)) do
+			table.insert(fields, f)
+		end
+		return fields
 	end,
 })

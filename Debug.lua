@@ -1,6 +1,6 @@
 -- WeakestAuras -- in-game probes and verification commands for the runtime
 -- engine. Registers /wa probe, states, libs, addons, gen, load, conditions,
--- codeprobe, and cdtest.
+-- codeprobe, textprobe, and cdtest.
 
 if WeakestAuras.disabled then return end
 
@@ -1051,6 +1051,202 @@ end
 -- clicking, and only the machine-checkable parts go to the log.
 -- ---------------------------------------------------------------------------
 
+-- ---------------------------------------------------------------------------
+-- /wa textprobe -- the FontString questions no headless harness can answer.
+--
+-- Every answer this reports is already recorded in design/client/gotchas.md; it
+-- stays a command so a client patch can be re-tested in one keystroke rather
+-- than re-argued.
+--
+-- The inline texture escape is the one that decided a feature. An engine that
+-- does not honour |T...|t prints the texture path as text instead, which is
+-- machine-checkable without an eye because the two outcomes have wildly
+-- different string widths -- an icon is about one line wide, the literal path is
+-- thirty-odd characters. Four escape forms are measured, since a client could
+-- honour the sized form and not the auto-sized one; this one honours none. The
+-- SimpleHTML and message-frame sections then ask whether any *other* text widget
+-- has an inline-image path. None does.
+--
+-- Then the two Text-region unknowns (does GetHeight track wrapped text -- it
+-- does, wrapping included) and the font list's own read-backs.
+-- ---------------------------------------------------------------------------
+
+local textProbeFrame
+local TEXTPROBE_ICON = "Interface\\Icons\\INV_Misc_QuestionMark"
+
+function D.TextProbe()
+	D.Log("--- textprobe ---")
+
+	if not textProbeFrame then
+		textProbeFrame = CreateFrame("Frame", nil, UIParent)
+		textProbeFrame:SetWidth(320); textProbeFrame:SetHeight(90)
+		textProbeFrame:SetPoint("CENTER", UIParent, "CENTER", 0, -160)
+		textProbeFrame:SetBackdrop({ bgFile = "Interface\\Buttons\\WHITE8X8" })
+		textProbeFrame:SetBackdropColor(0, 0, 0, 0.7)
+		textProbeFrame.lines = {}
+		for i = 1, 4 do
+			local fs = textProbeFrame:CreateFontString(nil, "OVERLAY")
+			fs:SetFont("Fonts\\FRIZQT__.TTF", 12, "")
+			fs:SetJustifyH("LEFT")
+			fs:SetPoint("TOPLEFT", 8, -6 - (i - 1) * 20)
+			textProbeFrame.lines[i] = fs
+		end
+	end
+	textProbeFrame:Show()
+
+	-- A scratch string with no size of its own, so GetStringWidth reports what
+	-- the engine actually laid out rather than a width we imposed.
+	local scratch = textProbeFrame:CreateFontString(nil, "OVERLAY")
+	scratch:SetFont("Fonts\\FRIZQT__.TTF", 12, "")
+
+	scratch:SetText("M")
+	local emWidth = scratch:GetStringWidth() or 0
+	D.Log(string.format("  reference: one 12px 'M' is %.1fpx wide", emWidth))
+
+	local forms = {
+		{ name = "auto  |T<path>:0|t", text = "|T" .. TEXTPROBE_ICON .. ":0|t" },
+		{ name = "sized |T<path>:14|t", text = "|T" .. TEXTPROBE_ICON .. ":14|t" },
+		{ name = "h:w   |T<path>:14:14|t", text = "|T" .. TEXTPROBE_ICON .. ":14:14|t" },
+		{ name = "offs  |T<path>:14:14:0:0|t", text = "|T" .. TEXTPROBE_ICON .. ":14:14:0:0|t" },
+	}
+	local anyRendered = false
+	for i = 1, table.getn(forms) do
+		scratch:SetText(forms[i].text)
+		local w = scratch:GetStringWidth() or 0
+		-- An icon occupies roughly one line; the literal path is 35+ characters,
+		-- so the gap between the two outcomes is an order of magnitude.
+		local rendered = w > 0 and w < emWidth * 4
+		if rendered then anyRendered = true end
+		D.Log(string.format("  escape %s -> %.1fpx  %s", forms[i].name, w,
+			rendered and "RENDERS AS ICON" or "printed as text"))
+		if textProbeFrame.lines[i] then
+			textProbeFrame.lines[i]:SetText(forms[i].name .. "  " .. forms[i].text)
+		end
+	end
+	D.Log("  verdict: inline texture escapes " ..
+		(anyRendered and "WORK in a FontString here -- which contradicts the recorded answer"
+		 or "do not work in a FontString here (the recorded answer)"))
+	D.Log("  ICON_LIST = " .. type(ICON_LIST) .. ", ICON_TAG_LIST = " .. type(ICON_TAG_LIST))
+
+	-- Height. Upstream's auto-width text region measures GetStringHeight, which
+	-- this client does not have; whether GetHeight stands in for it decides
+	-- whether an auto-sized text region is possible at all.
+	scratch:SetText("one line")
+	local h1 = scratch:GetHeight() or 0
+	scratch:SetText("a\nb\nc")
+	local h3 = scratch:GetHeight() or 0
+	D.Log(string.format("  GetHeight: 1 line = %.1f, 3 lines = %.1f -- %s", h1, h3,
+		(h3 > h1 * 2) and "tracks the rendered text" or "does NOT track line count"))
+
+	scratch:SetWidth(120)
+	scratch:SetText("a long enough string that it has to wrap across several lines at this width")
+	local hWrap = scratch:GetHeight() or 0
+	D.Log(string.format("  GetHeight at width 120 with wrapping text = %.1f -- %s", hWrap,
+		(hWrap > h1 * 1.5) and "sees the wrap" or "does NOT see the wrap"))
+	scratch:SetWidth(0)
+
+	-- The font list and the flag combinations, read back the way textCore does.
+	local core = WA.textCore
+	if core then
+		for i = 1, table.getn(core.FONTS) do
+			local f = core.FONTS[i]
+			scratch:SetFont(f.path, 12, "")
+			D.Log("  font " .. f.name .. " -> " .. (scratch:GetFont() and "loads" or "REFUSED"))
+		end
+		scratch:SetFont("Fonts\\FRIZQT__.TTF", 12, "")
+		for i = 1, table.getn(core.FLAGS) do
+			local flags = core.FLAGS[i]
+			local applied = (flags == "None") and "" or flags
+			scratch:SetFont("Fonts\\FRIZQT__.TTF", 12, applied)
+			D.Log("  flags " .. flags .. " -> " .. (scratch:GetFont() and "accepted" or "REFUSED"))
+		end
+		scratch:SetFont("Fonts\\FRIZQT__.TTF", 12, "")
+	end
+
+	-- The two text widgets nothing in this addon uses. A FontString having no
+	-- escape parser does not prove the engine has none, and these are the only
+	-- other places an icon could sit inside a run of text.
+	--
+	-- SimpleHTML is the interesting one: on later clients it takes <img src=...>,
+	-- which is a real inline-image path rather than an escape. It builds its
+	-- content out of child regions, so whether the tag was honoured is readable
+	-- without an eye -- an honoured <img> has to produce a Texture region.
+	local function regionKinds(f)
+		local counts = {}
+		if not f or not f.GetNumRegions then return counts end
+		local n = f:GetNumRegions() or 0
+		local regions = { f:GetRegions() }
+		for i = 1, n do
+			local r = regions[i]
+			if r and r.GetObjectType then
+				local t = r:GetObjectType()
+				counts[t] = (counts[t] or 0) + 1
+			end
+		end
+		return counts
+	end
+	local function describe(counts)
+		local parts = {}
+		for kind, n in pairs(counts) do table.insert(parts, kind .. "x" .. n) end
+		if table.getn(parts) == 0 then return "no regions" end
+		table.sort(parts)
+		return table.concat(parts, " ")
+	end
+
+	local madeHtml, html = pcall(CreateFrame, "SimpleHTML", nil, UIParent)
+	if not madeHtml or not html then
+		D.Log("  SimpleHTML: CreateFrame refused the type -- not available here")
+	else
+		html:SetWidth(300); html:SetHeight(40)
+		html:SetPoint("TOP", textProbeFrame, "BOTTOM", 0, -8)
+		-- SimpleHTML draws nothing until its element fonts are set, and the
+		-- per-element signature is not confirmed here, so try both shapes.
+		pcall(html.SetFontObject, html, "p", GameFontHighlight)
+		pcall(html.SetFontObject, html, GameFontHighlight)
+		pcall(html.SetFont, html, "p", "Fonts\\FRIZQT__.TTF", 12, "")
+
+		local okPlain = pcall(html.SetText, html, "<html><body><p>plain text</p></body></html>")
+		local before = regionKinds(html)
+		local okImg = pcall(html.SetText, html,
+			"<html><body><p><img src=\"" .. TEXTPROBE_ICON .. "\" width=\"16\" height=\"16\"/>after</p></body></html>")
+		local after = regionKinds(html)
+		D.Log("  SimpleHTML SetText: plain=" .. tostring(okPlain) .. " img=" .. tostring(okImg))
+		D.Log("  SimpleHTML regions plain    -> " .. describe(before))
+		D.Log("  SimpleHTML regions with img -> " .. describe(after))
+		D.Log("  verdict: <img> " ..
+			(((after.Texture or 0) > (before.Texture or 0)) and "CREATES A TEXTURE -- inline images are possible"
+			 or "adds no texture -- the tag is not honoured"))
+	end
+
+	local madeMsg, msg = pcall(CreateFrame, "MessageFrame", nil, UIParent)
+	if not madeMsg or not msg then
+		D.Log("  MessageFrame: CreateFrame refused the type")
+	else
+		msg:SetWidth(300); msg:SetHeight(20)
+		msg:SetPoint("TOP", textProbeFrame, "BOTTOM", 0, -56)
+		pcall(msg.SetFontObject, msg, GameFontHighlight)
+		local plainKinds, escKinds
+		pcall(msg.AddMessage, msg, "plain")
+		plainKinds = regionKinds(msg)
+		pcall(msg.AddMessage, msg, "|T" .. TEXTPROBE_ICON .. ":0|t")
+		escKinds = regionKinds(msg)
+		D.Log("  MessageFrame regions plain  -> " .. describe(plainKinds))
+		D.Log("  MessageFrame regions escape -> " .. describe(escKinds))
+	end
+
+	-- The chat frame is a ScrollingMessageFrame and is the one widget Blizzard
+	-- would have needed an escape parser for. Straight to the user's own chat,
+	-- since that is the honest test of it.
+	DEFAULT_CHAT_FRAME:AddMessage("WA textprobe -- chat escape test: [|T" .. TEXTPROBE_ICON
+		.. ":0|t] <- an icon between the brackets, or a path?")
+
+	D.Log("  a chat line was printed: if it shows an icon between the brackets, a")
+	D.Log("  ScrollingMessageFrame honours escapes even though a FontString does not.")
+	D.Log("  panels are up under CENTER,0,-160: the escape forms, then SimpleHTML, then")
+	D.Log("  the MessageFrame. Report what each one reads as.")
+	D.Log("--- end textprobe ---")
+end
+
 -- pfUI's copy, used only as a test subject: it is a vendored monospace TTF
 -- already on this client, so it answers "can SetFont load one at all" without
 -- committing to vendoring our own before the answer is known.
@@ -1660,6 +1856,8 @@ function D.HandleSlash(msg)
 		D.Version(rest)
 	elseif cmd == "codeprobe" then
 		D.CodeProbe()
+	elseif cmd == "textprobe" then
+		D.TextProbe()
 	elseif cmd == "codelive" then
 		D.CodeLive()
 	elseif cmd == "codetab" then
@@ -1684,6 +1882,6 @@ function D.HandleSlash(msg)
 		ensureFrame()
 		frame:Hide()
 	else
-		D.Log("[debug] unknown command \"" .. cmd .. "\". Available: dump [unit] [filter], watch [unit], events [EVENT ...], timers, linkprobe, commprobe [charname|throttle [channel] [rate] [secs]], cdtest, swipetest [sizes/WxH...], swipenudge <k> [yflat], track <spellName>, states <id>, conditions <id>, gen <id>, load <id>, probe, ver [version], codeprobe, codelive, codetab <1-8|tabs>, codefont <6-16>, rows, libs, addons, export <id>, import, clear, show, hide")
+		D.Log("[debug] unknown command \"" .. cmd .. "\". Available: dump [unit] [filter], watch [unit], events [EVENT ...], timers, linkprobe, commprobe [charname|throttle [channel] [rate] [secs]], cdtest, swipetest [sizes/WxH...], swipenudge <k> [yflat], track <spellName>, states <id>, conditions <id>, gen <id>, load <id>, probe, ver [version], codeprobe, textprobe, codelive, codetab <1-8|tabs>, codefont <6-16>, rows, libs, addons, export <id>, import, clear, show, hide")
 	end
 end

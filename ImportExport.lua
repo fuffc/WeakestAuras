@@ -2,9 +2,15 @@
 -- C_EncodingUtil (SerializeCBOR -> CompressString(zlib) -> EncodeBase64 and the
 -- three inverses), the exact chain pfUI's share.lua uses live on this client --
 -- so WA2's Transmission.lua (LibSerialize + LibDeflate + custom base64) is
--- unnecessary. Because CBOR deserializes to plain data that the engine consumes
--- (never loadstring'd), a pasted string can carry data but never code -- the
--- security property to preserve: do NOT add a Lua-source import path.
+-- unnecessary. CBOR deserializes to plain data, so nothing here executes what it
+-- decodes; what it must also not do is *hand* the engine a field the engine will
+-- loadstring, which is what dropCode below enforces in both directions. Do NOT
+-- add a Lua-source import path.
+--
+-- One field is knowingly outside that guard: a generic trigger's `customTrigger`
+-- still travels, because sharing a custom trigger is the point of having one.
+-- Receiving an aura is therefore a data-trust question for everything except
+-- that -- see design/plans/SHARING_PLAN.md and drift.md §D2.
 --
 -- C_EncodingUtil is undocumented in ClassicAPI's API.md (present at runtime,
 -- pfUI depends on it), so its presence is probed at load and import/export
@@ -36,8 +42,18 @@ local function encodeBody(payload)
 	return E.EncodeBase64(E.CompressString(E.SerializeCBOR(payload)))
 end
 
+-- Fields the engine would loadstring, removed from a display. The text region's
+-- customText is one, and it never travels: the receiving side would compile a
+-- stranger's Lua. Enforced on the way in as well as stripped on the way out,
+-- since a transport string can be assembled by hand.
+local function dropCode(display)
+	if type(display) ~= "table" then return end
+	display.customText = nil
+end
+
 -- Reverses encode; nil on a foreign/garbage/truncated string. The !WA1! prefix
 -- both identifies our format and lets this reject pfUI/WA2 strings cleanly.
+-- Every import path decodes here, which is why the code strip lives here too.
 local function decode(text)
 	if not text then return nil end
 	text = string.gsub(text, "%s", "")
@@ -45,8 +61,12 @@ local function decode(text)
 	local ok, result = pcall(function()
 		return E.DeserializeCBOR(E.DecompressString(E.DecodeBase64(string.sub(text, string.len(MAGIC) + 1))))
 	end)
-	if ok and type(result) == "table" then return result end
-	return nil
+	if not ok or type(result) ~= "table" then return nil end
+	dropCode(result.d)
+	if type(result.c) == "table" then
+		for i = 1, table.getn(result.c) do dropCode(result.c[i]) end
+	end
+	return result
 end
 
 -- A deep copy with the non-transmissible fields stripped (WA2's
@@ -60,6 +80,7 @@ local function cleanForExport(data)
 	local c = WA.DeepCopy(data)
 	c.parent = nil
 	c.controlledChildren = nil
+	dropCode(c)
 	return c
 end
 

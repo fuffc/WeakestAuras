@@ -14,8 +14,6 @@ if WeakestAuras.disabled then return end
 
 local WA = WeakestAuras
 
-local FONT = "Fonts\\FRIZQT__.TTF"
-
 -- The nine standard frame anchor points offered by the Anchor dropdown.
 local TEXT_ANCHORS = {
 	"TOPLEFT", "TOP", "TOPRIGHT",
@@ -93,7 +91,7 @@ WA.RegisterSubRegionType("subtext", {
 		region.fontString = fs
 
 		function region:Update()
-			self.fontString:SetText(
+			WA.textCore.SetText(self.fontString,
 				WA.ReplacePlaceHolders(self.text or "", self.parent, self.formatters))
 		end
 		function region:Show() if self.visible ~= false then self.fontString:Show() end end
@@ -110,12 +108,11 @@ WA.RegisterSubRegionType("subtext", {
 	modify = function(parent, region, parentData, subData)
 		region.text = subData.text_text or ""
 		region.visible = subData.text_visible ~= false
-		region.formatters = WA.CreateFormatters(region.text, formatGetter(subData))
+		region.formatters, region.everyFrameFormatters =
+			WA.CreateFormatters(region.text, formatGetter(subData), parentData)
 
 		local fs = region.fontString
-		fs:SetFont(FONT, subData.text_size or 12, "OUTLINE")
-		local c = subData.text_color or { 1, 1, 1, 1 }
-		fs:SetTextColor(c[1] or 1, c[2] or 1, c[3] or 1, c[4] or 1)
+		WA.textCore.Apply(fs, subData, "text_")
 
 		region.frame:SetFrameLevel(parent:GetFrameLevel() + WA.regionPrototype.SUB_LEVEL)
 
@@ -134,7 +131,7 @@ WA.RegisterSubRegionType("subtext", {
 		parent.subRegionEvents:AddSubscriber("PreShow", function()
 			if region.visible then fs:Show() end
 		end)
-		if WA.TextNeedsFrameTick(region.text) then
+		if WA.TextNeedsFrameTick(region.text, region.everyFrameFormatters) then
 			parent.subRegionEvents:AddSubscriber("FrameTick", function() region:Update() end)
 		end
 
@@ -144,12 +141,17 @@ WA.RegisterSubRegionType("subtext", {
 	options = function(parentData, subData, index)
 		local fields = {
 			{
-				type = "input", name = "Text (%p %t %n %i %s)", key = "text_text",
+				-- %i is absent from the label deliberately: it resolves to nothing
+				-- here, this client's FontString having no inline texture escape.
+				type = "input", name = "Text (%p %t %n %s)", key = "text_text",
 				get = function() return subData.text_text end,
 				-- Re-renders the tab: Format Options below is one row per symbol
 				-- in this string, so editing it changes which rows exist.
 				set = function(v)
 					subData.text_text = v
+					WA.SetDefaultFormatters(subData.text_text, formatGetter(subData),
+						function(key, value) subData["text_text_format_" .. key] = value end,
+						parentData)
 					WA.Add(parentData, true)
 					WA.RefreshOptions()
 				end,
@@ -181,12 +183,28 @@ WA.RegisterSubRegionType("subtext", {
 			},
 		}
 
+		-- Directly under the Text field, whose label can only name the five
+		-- built-in symbols.
+		local hint = WA.TextSymbolHint(parentData)
+		if hint then table.insert(fields, 2, { type = "description", name = hint }) end
+
+		-- Keyed inside the "sub:" namespace for the same reason the Format fold
+		-- below is: removing a sub-region renumbers the rest, and clearCollapsed
+		-- drops the whole namespace with it.
+		local fontFields = WA.textCore.OptionFields(parentData, "sub:" .. index .. ":font",
+			function(key) return subData["text_" .. key] end,
+			function(key, v)
+				subData["text_" .. key] = v
+				WA.Add(parentData, true)
+			end)
+		for i = 1, table.getn(fontFields) do table.insert(fields, fontFields[i]) end
+
 		local get = formatGetter(subData)
 		local formatFields = WA.FormatOptionFields(subData.text_text, get,
 			function(key, v)
 				subData["text_text_format_" .. key] = v
 				WA.Add(parentData, true)
-			end)
+			end, parentData)
 		if table.getn(formatFields) > 0 then
 			-- Folded away by default: every %symbol in the text grows a Format row,
 			-- and with two or three symbols those rows bury the ones actually being
@@ -202,7 +220,7 @@ WA.RegisterSubRegionType("subtext", {
 			local collapsed = S.isCollapsed(parentData, key, true)
 			table.insert(fields, {
 				type = "disclosure", name = "Format Options",
-				summary = WA.FormatSummary(subData.text_text, get),
+				summary = WA.FormatSummary(subData.text_text, get, parentData),
 				collapsed = collapsed,
 				onToggle = function()
 					S.setCollapsed(parentData, key, not collapsed)

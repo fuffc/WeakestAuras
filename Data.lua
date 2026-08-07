@@ -162,15 +162,33 @@ end
 -- leaf, rather than handling the conversion's fallout. Omitted (nil), lists
 -- every registered type regardless of category (e.g. the "+ New" picker,
 -- which is free to create either kind from scratch).
+-- `internal` types are never listed: `fallback` exists to stand in for a region
+-- this addon does not have, so offering it as something to create or convert to
+-- would be offering the absence itself.
 function WA.RegionTypeList(onlyGroups)
 	local list = {}
 	for name, spec in pairs(WA.regionTypes) do
-		if onlyGroups == nil or (spec.isGroup == true) == onlyGroups then
+		if not spec.internal and (onlyGroups == nil or (spec.isGroup == true) == onlyGroups) then
 			table.insert(list, name)
 		end
 	end
 	table.sort(list)
 	return list
+end
+
+-- The region spec that will actually build this display: its own type's, or the
+-- `fallback` type's when the addon has no such region. An aura can name a
+-- regionType we do not have -- upstream ships progresstexture, model and
+-- stopmotion, all of which exist in the wild -- and nothing rejects one on
+-- import, so without this it gets a row in the list and is then simply never
+-- drawn, with nothing on screen to say why.
+--
+-- Resolved wherever a region is built rather than rewritten at import, so an aura
+-- whose type we later gain starts working on its own, with no second migration.
+function WA.RegionSpecFor(data)
+	local spec = data and WA.regionTypes[data.regionType]
+	if spec then return spec end
+	return WA.regionTypes["fallback"]
 end
 
 -- True if this aura's regionType is a container (group/dynamicgroup) rather
@@ -639,7 +657,8 @@ end
 
 function WA.NewAura(regionType, targetId)
 	regionType = regionType or "icon"
-	if not WA.regionTypes[regionType] then return nil end
+	local spec = WA.regionTypes[regionType]
+	if not spec or spec.internal then return nil end
 	if not WA.CanPlaceAura(regionType, targetId) then return nil end
 
 	local id = WA.UniqueId("New Aura")

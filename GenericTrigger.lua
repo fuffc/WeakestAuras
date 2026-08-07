@@ -218,6 +218,9 @@ end
 -- at run time (runTriggerFunc), so a runtime error names the aura and can't take
 -- down ScanEvents. Same __index-passthrough idiom pfUI uses for its module env.
 local customEnv = setmetatable({}, { __index = getfenv(0) })
+-- Published so the text region's custom text function compiles into the same
+-- sandbox rather than a second copy of it.
+WA.customEnv = customEnv
 
 -- Compiles a custom *status* trigger's user text into f(state, event) -> show.
 -- The text is a whole function expression ("function(state, event) ... end"),

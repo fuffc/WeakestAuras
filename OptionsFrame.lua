@@ -1612,7 +1612,9 @@ function S.refreshTabContent()
 		return
 	end
 	if S.activeTab == "display" then
-		local region = WA.regionTypes[data.regionType]
+		-- Resolved rather than looked up, so an aura naming a type this addon
+		-- lacks gets the fallback's tab (which says so) instead of a blank one.
+		local region = WA.RegionSpecFor(data)
 		-- The region's own sections (Icon/Size/Position) fold too; done here
 		-- rather than in each region generator so a new region type gets it for
 		-- free. Applied before the effects are appended, which bring their own

@@ -37,6 +37,16 @@ local function CreateSubscribers()
 		if not list then return end
 		for i = 1, table.getn(list) do list[i](a, b, c) end
 	end
+	-- Takes the same function object AddSubscriber was given. A region whose text
+	-- a condition can replace has to be able to leave the FrameTick bus again, not
+	-- only join it.
+	function obj:RemoveSubscriber(event, fn)
+		local list = self.subs[event]
+		if not list or not fn then return end
+		for i = table.getn(list), 1, -1 do
+			if list[i] == fn then table.remove(list, i) end
+		end
+	end
 	-- Dropped and rebuilt on every modifyFinish so a re-config's stale closures
 	-- (pointing at replaced sub-region instances) never keep firing.
 	function obj:Clear() self.subs = {} end
@@ -192,6 +202,14 @@ function proto.modifyFinish(region, data)
 		if inst and inst.Hide then inst:Hide() end
 	end
 
+	proto.RefreshFrameTick(region)
+end
+
+-- Re-derives whether anything on this region wants a per-frame repaint and moves
+-- it in or out of the shared tick set. Separate from modifyFinish because a
+-- condition can swap a region's whole text after the fact: a string that gains a
+-- %p has to start ticking without a re-modify, and one that loses it has to stop.
+function proto.RefreshFrameTick(region)
 	local ft = region.subRegionEvents.subs["FrameTick"]
 	region._hasFrameTick = (ft and table.getn(ft) > 0) or false
 	if region:IsShown() then
