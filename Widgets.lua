@@ -1,0 +1,1330 @@
+-- WeakestAuras -- shared widget factories and the declarative options-table
+-- renderer. Widget look/feel (flat dark backdrop buttons, tooltip-style edit
+-- boxes) follows the sibling Quartermaster config.
+--
+-- WA.Widgets.BuildOptions(page, fields) paints a whole tab's controls from a
+-- plain array of field descriptors instead of hand-building a frame per field:
+--   { type = "header"|"disclosure"|"toggle"|"input"|"multiline"|"range"|"select"
+--            |"color"|"spell"|"item"|"icon"|"namelist"|"opnumber"|"button"|"menu",
+--     name = "...",
+--     key = "...",         -- stable field id, see below; omitted for header/button
+--     get = function() end, set = function(value) end,   -- color: get/set a {r,g,b,a}
+--     half = true,         -- pack two-per-row (any non-header type); default full row
+--     min, max, step,      -- range only
+--     values, labels,      -- select only: ordered values + optional value->label
+--     swatches,            -- select only: value -> texture path; each entry (and
+--                          -- the button face) previews it as a filled bar
+--     getOp, setOp, getVal, setVal,   -- opnumber only: operator select + number
+--     onClick, width }     -- button only: name is its label, width its pixel size
+-- A `header` additionally takes `collapsed` (a bool -- present at all makes the
+-- section collapsible: draws an up/down arrow, and the title line itself
+-- toggles) with `onToggle`, and `onDelete` (draws a two-click-confirm delete
+-- button on the right).
+-- Collapsing is the *generator's* job: BuildOptions only paints the affordance,
+-- so a collapsed section simply omits its body fields from the array it returns.
+-- A `disclosure` folds the same way but is a control rather than a divider: a
+-- gear leading a clickable one-line label, for settings that get set once and
+-- then only get in the way. It takes the same `collapsed`/`onToggle`, plus
+-- `summary` -- appended to `name` in grey, so the folded state still says what
+-- the hidden rows hold.
+-- A `range` is a spin box (LibWidgets.NewSpinBox), not a bare slider: `min`/
+-- `max`/`step` drive the track, and the value is typeable inside it.
+-- `code` is a `multiline` for user-authored Lua: syntax-coloured on blur, with
+-- `height`, `validate(text) -> errOrNil` (a red line under the box, re-run on
+-- every keystroke -- W.LuaSyntaxError is what both call sites pass) and
+-- `default` (string or function; adds a two-click-confirm Reset button that
+-- seeds the box back to it). The error line and Reset belong to the widget
+-- (LibWidgets.NewCodeEditBox), not to this renderer.
+-- `spell` renders a spell-name/ID box with a live icon preview (numeric -> its
+-- spell icon); `item` is the same idea keyed by WA.ResolveItemID/GetItemInfo
+-- instead. `icon` is the same box but stores a resolved texture path (a
+-- spellID resolves to its icon; a raw path is kept as-is) -- the manual-icon
+-- picker's stopgap input until a browsing widget lands. `opnumber` is an
+-- operator dropdown + number box on one line, for
+-- "stacks >= N" style filters. `menu` is a drop button whose face stays fixed
+-- at `name` (it labels an action, e.g. "+ Add Display Effect") and whose entries
+-- are `values`/`labels`, calling `onSelect(value)` -- one control in place of a
+-- row of near-identical add buttons. `namelist` is an add/remove/reorder list of
+-- plain strings (LibWidgets.NewListEditor) -- `get` returns the live backing
+-- array (mutated in place), `onChange` fires after any add/remove/reorder.
+-- `half` lays a field in a two-column grid: the
+-- first half goes left, the next right; a full-width field or header closes the
+-- row. Columns size to the page's current width.
+-- Region/trigger type option generators (Regions.lua, Triggers.lua) return one
+-- of these arrays per aura; OptionsFrame.lua just hands it to BuildOptions.
+--
+-- Repaints reuse the widgets already on the page rather than minting new ones
+-- (frames can't be destroyed on this client, so the old approach leaked a page
+-- of controls per tab switch) -- see the widget pool below.
+--
+-- `key` is redundant with get/set today (BuildOptions never reads it) but is
+-- deliberately kept in sync with the property each field actually reads/
+-- writes (data.<key> for region fields, data.triggers[n].trigger.<key> for
+-- trigger fields). get/set are closures bound to one
+-- specific `data` table, so nothing outside that closure can tell which
+-- property a field maps to; a future mass-edit-N-auras-at-once feature needs
+-- that identity to wrap get/set as "read/write across every selected aura"
+-- instead of one, without having to revisit every field definition in
+-- Regions.lua/Triggers.lua a second time. Keep setting it on every new field.
+
+if WeakestAuras.disabled then return end
+
+local WA = WeakestAuras
+WA.Widgets = {}
+local W = WA.Widgets
+
+-- Absolute path to the vendored LibWidgets textures. The library can't discover
+-- its own path (no debug library here), so callers pass it in. Handed to widgets
+-- that need their own art, e.g. the drop button's menu-affordance arrow.
+W.LIBWIDGETS_TEXTURES = "Interface\\AddOns\\WeakestAuras\\libs\\LibWidgets\\textures\\"
+
+-- Status bar art. The names are LibWidgets' (so every consumer offers the same
+-- set); the files are this addon's, for the same no-self-path reason as above.
+W.BAR_TEXTURE_DIR = "Interface\\AddOns\\WeakestAuras\\textures\\bars\\"
+
+-- Three-state eye for the aura list's forced-visibility toggle: full / partial /
+-- empty. These are the frames WA2 reads out of Interface\LFGFrame, which this
+-- client does not ship -- AshenBannerLFG had to vendor its own copies for its
+-- minimap eye, which is why ours are vendored too rather than pathed at the
+-- stock location. Referencing that addon's copies directly would blank the
+-- indicator if it were ever uninstalled, and blank is indistinguishable from
+-- the empty state.
+W.EYE_TEXTURES = "Interface\\AddOns\\WeakestAuras\\textures\\eye\\"
+
+-- The code editor's fixed-width face. Same no-self-path reason as above: the
+-- library can't discover its own path, so the consumer supplies it. Vendored
+-- under fonts\ (not a .toc entry -- see pack.ps1's $fontsDir block).
+W.CODE_FONT = "Interface\\AddOns\\WeakestAuras\\fonts\\RobotoMono.ttf"
+-- RobotoMono runs large for its nominal size, so the code boxes sit well below
+-- the UI's usual body size. Only the default: WeakestAurasDB.codeEditorFontSize
+-- overrides it (/wa codefont <6-16>), and the widget takes it per paint.
+W.CODE_FONT_SIZE = 9
+
+-- Falls back to the client's own bar art rather than erroring, so an older
+-- LibWidgets copy winning the version race degrades a bar's *look* instead of
+-- taking down the whole options paint (LibWidgetsProblem reports the real cause).
+function W.BarTexturePath(name)
+	if not LibWidgets.BarTexturePath then return "Interface\\TargetingFrame\\UI-StatusBar" end
+	return LibWidgets.BarTexturePath(W.BAR_TEXTURE_DIR, name)
+end
+
+-- value -> path map for a `select` field's `swatches`, built once.
+function W.BarTextureSwatches()
+	if not W.barSwatches then
+		W.barSwatches = {}
+		local list = LibWidgets.BAR_TEXTURES or {}
+		for i = 1, table.getn(list) do
+			W.barSwatches[list[i]] = W.BarTexturePath(list[i])
+		end
+	end
+	return W.barSwatches
+end
+
+-- The LibWidgets surface this file is written against. Every addon vendoring
+-- the library shares one global instance and the highest MINOR wins, so another
+-- addon's older copy can be the one actually running here -- in which case the
+-- first symptom is a nil call in the middle of a repaint, naming a function
+-- rather than the version problem behind it. Check it once at load and record
+-- what's missing; the options window reports it on open and `/wa libs` dumps
+-- it (chat output at file-load time is unreliable on this client, so nothing is
+-- printed from here). libs\LibWidgetsDev.lua is the escape hatch.
+W.LIBWIDGETS_REQUIRED = {
+	"NewButton", "NewIconButton", "NewCheckBox", "NewColorSwatch", "NewTextBox",
+	"NewMultiLineEditBox", "NewScrollFrame", "NewScrollBar", "NewSpinBox", "NewDropButton",
+	"NewListEditor", "NewIconPicker", "GetIconDatabase", "CloseAllMenus",
+	"FormatNumber", "BarTexturePath",
+	"LuaColorize", "LuaEncode", "LuaDecode", "LuaStripColors",
+	"LuaPadWithLinebreaks", "LuaNextToken", "NewCodeEditBox",
+}
+W.libWidgetsMissing = {}
+for i = 1, table.getn(W.LIBWIDGETS_REQUIRED) do
+	local name = W.LIBWIDGETS_REQUIRED[i]
+	if not LibWidgets[name] then table.insert(W.libWidgetsMissing, name) end
+end
+
+-- One line describing which LibWidgets copy is live, or nil when it's fine.
+function W.LibWidgetsProblem()
+	if table.getn(W.libWidgetsMissing) == 0 then return nil end
+	return "LibWidgets in use is MINOR " .. tostring(LibWidgets.MINOR or "?")
+		.. " and is missing " .. table.concat(W.libWidgetsMissing, ", ")
+		.. " -- another addon's older copy won the LibStub version race."
+end
+
+W.PANEL_BACKDROP = {
+	bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+	edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+	tile = true, tileSize = 32, edgeSize = 16,
+	insets = { left = 5, right = 5, top = 5, bottom = 5 },
+}
+W.EDITBOX_BACKDROP = {
+	bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+	edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+	tile = true, tileSize = 16, edgeSize = 9,
+	insets = { left = 3, right = 3, top = 3, bottom = 3 },
+}
+
+-- ---------------------------------------------------------------------------
+-- Base controls
+--
+-- Thin adapters over LibWidgets.New* (libs\LibWidgets) for the panel's own
+-- chrome -- the controls that are built once and live for the session (search
+-- box, tab strip, the buttons around the aura list). Everything inside the
+-- options page itself goes through the pooled builders further down instead.
+-- New *generic* controls belong in LibWidgets, not here.
+-- ---------------------------------------------------------------------------
+
+-- A live-filter edit box: fires onChange(text) on every keystroke and shows a
+-- greyed "Search" hint while empty. Escape clears the text (not just focus),
+-- which the shared NewTextBox leaves to the caller.
+function W.searchbox(parent, width, onChange)
+	local e = LibWidgets.NewTextBox(parent, { width = width, height = 20, hint = "Search", onChange = onChange })
+	e:SetScript("OnEscapePressed", function() this:SetText(""); this:ClearFocus() end)
+	return e
+end
+
+function W.sectionHeader(parent, text)
+	local fs = parent:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+	fs:SetJustifyH("LEFT")
+	fs:SetText(text)
+	fs:SetTextColor(1, 0.82, 0)
+	return fs
+end
+
+function W.fieldLabel(parent, text)
+	local fs = parent:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+	fs:SetJustifyH("LEFT")
+	fs:SetText(text)
+	return fs
+end
+
+function W.button(parent, text, onClick)
+	return LibWidgets.NewButton(parent, { text = text, onClick = onClick })
+end
+
+-- A selectable button (tab strip): b.setSelected(on) shows the lit/gold-border
+-- active look; the selected button ignores hover so the active tab stays lit.
+function W.toggleButton(parent, text, onClick)
+	local b = W.button(parent, text, onClick)
+	b.label:SetTextColor(0.7, 0.7, 0.7)
+	function b.setSelected(on)
+		b.selected = on and true or false
+		if b.selected then
+			b:SetBackdropColor(0.22, 0.20, 0.05, 0.95)
+			b:SetBackdropBorderColor(0.9, 0.8, 0.2, 1)
+			b.label:SetTextColor(1, 1, 1)
+		else
+			b:SetBackdropColor(0, 0, 0, 0.7)
+			b:SetBackdropBorderColor(0.4, 0.4, 0.4, 0.8)
+			b.label:SetTextColor(0.7, 0.7, 0.7)
+		end
+	end
+	b:SetScript("OnEnter", function() if not this.selected then this:SetBackdropBorderColor(0.9, 0.8, 0.2, 1) end end)
+	b:SetScript("OnLeave", function() if not this.selected then this:SetBackdropBorderColor(0.4, 0.4, 0.4, 0.8) end end)
+	return b
+end
+
+-- Icon-only toolbar button. Mirrors WA2's WeakAurasToolbarButton, minus the
+-- text label: its toolbar sits over a left column that grows with the window
+-- (~290px at that addon's default size), ours over one fixed at 200, which has
+-- room for icons and tooltips only.
+--
+-- setToggled marks the buttons standing for a persistent mode rather than a
+-- one-shot action, matching the strong-highlight state upstream gives Lock
+-- Positions and Magnetically Align.
+-- `label`, when given, puts the caption beside the icon and widens the button to
+-- fit it; without one the button stays the 22px square the icon fills. The
+-- tooltip is kept either way -- it carries the second explanatory line a caption
+-- has no room for.
+function W.toolbarButton(parent, icon, tooltip, onClick, label)
+	local b = CreateFrame("Button", nil, parent)
+	b:SetWidth(22); b:SetHeight(22)
+
+	local on = b:CreateTexture(nil, "BACKGROUND")
+	on:SetAllPoints(b)
+	on:SetTexture(0.9, 0.8, 0.2, 0.25)
+	on:Hide()
+
+	-- 16px hard-sized and pinned left rather than inset from both corners: the
+	-- two agree exactly on an unlabelled 22px button, and only this form survives
+	-- the button growing to fit a caption.
+	local tex = b:CreateTexture(nil, "ARTWORK")
+	tex:SetWidth(16); tex:SetHeight(16)
+	tex:SetPoint("LEFT", b, "LEFT", 3, 0)
+	tex:SetTexture(icon)
+	b.icon = tex
+
+	if label then
+		local fs = b:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+		fs:SetPoint("LEFT", tex, "RIGHT", 4, 0)
+		fs:SetJustifyH("LEFT")
+		fs:SetText(label)
+		b.label = fs
+		b:SetWidth(3 + 16 + 4 + (fs:GetStringWidth() or 0) + 6)
+	end
+
+	local hl = b:CreateTexture(nil, "HIGHLIGHT")
+	hl:SetAllPoints(b)
+	hl:SetTexture(1, 1, 1, 0.15)
+
+	function b.setToggled(v)
+		b.toggled = v and true or false
+		if b.toggled then on:Show() else on:Hide() end
+	end
+
+	b:SetScript("OnEnter", function()
+		GameTooltip:SetOwner(this, "ANCHOR_NONE")
+		GameTooltip:SetPoint("BOTTOMLEFT", this, "TOPLEFT", 0, 4)
+		GameTooltip:SetText(this.tipTitle or "", 1, 1, 1)
+		if this.tipDesc then GameTooltip:AddLine(this.tipDesc, 0.8, 0.8, 0.8, true) end
+		GameTooltip:Show()
+	end)
+	b:SetScript("OnLeave", function() GameTooltip:Hide() end)
+	b.tipTitle = tooltip
+	if onClick then b:SetScript("OnClick", onClick) end
+	return b
+end
+
+local QUESTION_ICON = "Interface\\Icons\\INV_Misc_QuestionMark"
+
+-- The `disclosure` field's glyph. A stock item icon rather than vendored art:
+-- 1.12 ships no gear in Interface\Buttons, and this one (Charged Gear, from
+-- Gnomeregan) is a single cog that stays legible shrunk to a 9px button face.
+local GEAR_ICON = "Interface\\Icons\\INV_Misc_Gear_01"
+
+-- One shared icon-browser dialog behind every `icon` field's Browse button.
+-- Built on first use, not at load: LibWidgets.GetIconDatabase's first call walks
+-- the client's whole icon set, which is not worth paying for unless the user
+-- actually opens the picker. The pick is routed through a stored callback rather
+-- than rebuilding the dialog per field.
+function W.OpenIconPicker(current, onPick)
+	if not LibWidgets.NewIconPicker then
+		DEFAULT_CHAT_FRAME:AddMessage("|cffff4040WeakestAuras:|r "
+			.. (W.LibWidgetsProblem() or "the loaded LibWidgets has no NewIconPicker."))
+		return
+	end
+	if not W.iconPicker then
+		W.iconPicker = LibWidgets.NewIconPicker(UIParent, {
+			nameFrame = "WeakestAurasIconPicker",
+			title = "Select Icon",
+			onAccept = function(path)
+				if W.onIconPicked then W.onIconPicked(path) end
+			end,
+		})
+	end
+	W.onIconPicked = onPick
+	W.iconPicker.Open(current)
+end
+
+function W.CloseIconPicker()
+	if W.iconPicker then W.iconPicker.Close() end
+end
+-- Comparison operators offered by opnumber fields; the same set the runtime
+-- cmp() in TriggerAura understands.
+W.OPERATORS = { "==", "~=", "<", "<=", ">", ">=" }
+
+-- Compiles `source` and returns "line N: message", or nil when it parses --
+-- the `validate` hook a user-authored-Lua field hands to BuildOptions.
+--
+-- `chunkName` is what Lua puts inside the error's `[string "..."]:LINE:`
+-- prefix, so keeping it short and caller-supplied makes stripping that prefix a
+-- plain (non-pattern) find instead of a pattern that would have to survive
+-- whatever the user typed. Callers that wrap the body ("return " .. body) must
+-- use a prefix containing **no newline**, or every reported line is off by one.
+function W.LuaSyntaxError(source, chunkName)
+	local chunk, err = loadstring(source or "", chunkName or "code")
+	if chunk then return nil end
+	if not err then return "syntax error" end
+	-- Lua 5.0 error strings are `[string "name"]:LINE: message`. Take the last
+	-- "]:" so a chunk name containing one can't cut the prefix short.
+	local last, from = nil, 1
+	while true do
+		local s, e = string.find(err, "]:", from, true)
+		if not s then break end
+		last = e
+		from = s + 1
+	end
+	if not last then return err end
+	local rest = string.sub(err, last + 1)
+	if string.find(rest, "^%d+") then return "line " .. rest end
+	return rest
+end
+
+local EMPTY = {}
+
+-- ---------------------------------------------------------------------------
+-- Widget pool
+--
+-- Frames can't be destroyed on this client, so a repaint that minted a fresh
+-- widget per field and merely hid the previous set leaked a full page of
+-- controls on every tab/aura switch -- and not cheaply: a single dropdown
+-- brings a popup frame, a scroll frame and one button per menu entry with it,
+-- and the slider and list editor each burn a unique *global* frame name per
+-- instance (their Blizzard templates address child frames by name).
+--
+-- Widgets are therefore acquired from a per-kind free list kept on the page and
+-- rebound to whatever field is being painted. Each pooled widget is built once
+-- around a `bind` table this file owns, and every callback handed to LibWidgets
+-- is an indirection that reads the current binding out of it -- so rebinding is
+-- just overwriting `bind` fields, with no library-side support needed.
+--
+-- `kind` folds in any parameter a widget can only take at construction (a
+-- dropdown's width, a list editor's visible row count), so an instance is only
+-- ever reused where those still hold.
+-- ---------------------------------------------------------------------------
+
+local function acquire(page, kind, create)
+	local pool = page.widgetPools[kind]
+	if not pool then pool = {}; page.widgetPools[kind] = pool end
+	local n = (page.widgetUsed[kind] or 0) + 1
+	page.widgetUsed[kind] = n
+	local w = pool[n]
+	if not w then
+		w = create()
+		pool[n] = w
+	end
+	w:ClearAllPoints()
+	w:Show()
+	return w
+end
+
+local function poolLabel(page, text)
+	local fs = acquire(page, "label", function() return W.fieldLabel(page, "") end)
+	fs:SetText(text or "")
+	return fs
+end
+
+local function poolHeaderLabel(page, text)
+	local fs = acquire(page, "headerlabel", function() return W.sectionHeader(page, "") end)
+	fs:SetText(text or "")
+	return fs
+end
+
+local function poolRule(page)
+	return acquire(page, "rule", function()
+		local t = page:CreateTexture(nil, "ARTWORK")
+		t:SetHeight(1)
+		t:SetTexture(0.9, 0.75, 0.2, 0.45)
+		return t
+	end)
+end
+
+-- The 18px spell/item/icon preview swatch beside a text field.
+local function poolPreviewIcon(page)
+	return acquire(page, "previewicon", function()
+		local t = page:CreateTexture(nil, "OVERLAY")
+		t:SetWidth(18); t:SetHeight(18)
+		t:SetTexCoord(0.07, 0.93, 0.07, 0.93)
+		return t
+	end)
+end
+
+local function poolCheck(page, text, onClick, get)
+	local cb = acquire(page, "check", function()
+		local bind = {}
+		local w = LibWidgets.NewCheckBox(page, {
+			onClick = function(v) if bind.onClick then bind.onClick(v) end end,
+		})
+		w.bind = bind
+		return w
+	end)
+	cb.bind.onClick = onClick
+	cb.label:SetText(text or "")
+	cb.setChecked(get and get())
+	return cb
+end
+
+-- Shift-clicking an item drops its link into whichever field is focused and has
+-- asked for links (the item fields). `HandleModifiedItemClick` is the real entry
+-- point on this client -- it forwards to `ChatEdit_InsertLink` only while the
+-- *chat* edit box is visible, so wrapping `ChatEdit_InsertLink` alone never sees
+-- a link bound for one of ours. Both are wrapped: the second still carries a
+-- link clicked in chat, which arrives there directly. Quartermaster's config
+-- intercepts the same pair for the same reason.
+local linkSink
+
+-- The itemID is stored rather than the link or the name: an id always resolves,
+-- where a name has to be found in the player's bags first. The readable name
+-- comes back through the trigger's own nameFunc, so nothing is lost on screen.
+local function routeLink(text)
+	if not text or not linkSink or not linkSink:IsVisible() then return false end
+	local _, _, id = string.find(text, "item:(%d+)")
+	if not id then return false end
+	linkSink:SetText(id)
+	linkSink:SetFocus()
+	if linkSink.bind and linkSink.bind.onCommit then linkSink.bind.onCommit(id) end
+	return true
+end
+
+local origModifiedClick = HandleModifiedItemClick
+function HandleModifiedItemClick(link)
+	if link and IsModifiedClick("CHATLINK") and routeLink(link) then return true end
+	if origModifiedClick then return origModifiedClick(link) end
+end
+
+local origInsertLink = ChatEdit_InsertLink
+function ChatEdit_InsertLink(text)
+	if routeLink(text) then return true end
+	if origInsertLink then return origInsertLink(text) end
+	return false
+end
+
+local function poolEditBox(page, width, onCommit)
+	local e = acquire(page, "editbox", function()
+		local bind = {}
+		local w = LibWidgets.NewTextBox(page, {
+			height = 20,
+			onCommit = function(t) if bind.onCommit then bind.onCommit(t) end end,
+		})
+		w.bind = bind
+		-- Chained, not replaced: the library's own handler closes open menus.
+		local origFocus = w:GetScript("OnEditFocusGained")
+		w:SetScript("OnEditFocusGained", function()
+			if origFocus then origFocus() end
+			linkSink = this.acceptsLinks and this or nil
+		end)
+		w:SetScript("OnEditFocusLost", function()
+			if linkSink == this then linkSink = nil end
+		end)
+		return w
+	end)
+	e.bind.onCommit = onCommit
+	-- One pool serves every field, so a box that last served an item field must
+	-- not keep accepting links on behalf of the next one.
+	e.acceptsLinks = false
+	e:SetWidth(width)
+	-- A reused box may still hold focus from the edit that triggered this
+	-- repaint; its text is about to be replaced under the cursor either way.
+	e:ClearFocus()
+	return e
+end
+
+local function poolButton(page, text, width, onClick)
+	local b = acquire(page, "button", function() return LibWidgets.NewButton(page, {}) end)
+	b.setText(text)
+	b:SetWidth(width or 80)
+	-- NewButton's own OnMouseDown already closes any open menu, so rebinding
+	-- only OnClick here loses nothing.
+	b:SetScript("OnClick", onClick or function() end)
+	return b
+end
+
+-- The small texture-faced buttons on a collapsible header (arrow, delete) and on
+-- a disclosure line (gear). The tint is reset on every acquisition, since one
+-- pool serves all of them and a dimmed disclosure gear would otherwise carry
+-- over onto whatever header arrow lands on that instance next.
+local function poolIconButton(page, icon, onClick)
+	local b = acquire(page, "iconbutton", function()
+		return LibWidgets.NewIconButton(page, { width = 16, height = 16, iconSize = 9 })
+	end)
+	b.icon:SetTexture(icon)
+	b.icon:SetVertexColor(1, 1, 1)
+	b:SetScript("OnClick", function() LibWidgets.CloseAllMenus(); onClick() end)
+	return b
+end
+
+-- A section header's delete button, armed by a first click and committed by a
+-- second within 3s -- the same two-click confirm the aura list's own Delete
+-- uses, since deleting a trigger/effect/condition is just as unrecoverable. A
+-- 16px icon button has no label to morph into "Confirm?" and a tinted 9px glyph
+-- is too small to read as a state change, so an armed button goes solid red --
+-- backdrop, border and glyph together -- which is legible at a glance and can't
+-- be mistaken for the hover highlight.
+local function poolDeleteButton(page, onDelete)
+	local b = acquire(page, "delbutton", function()
+		local bind = {}
+		local w = LibWidgets.NewIconButton(page, { width = 16, height = 16, iconSize = 9 })
+		w.icon:SetTexture(LibWidgets.ICON_DELETE)
+		w.bind = bind
+		w.arm = function()
+			w.armed = true
+			w:SetBackdropColor(0.65, 0.06, 0.06, 1)
+			w:SetBackdropBorderColor(1, 0.3, 0.3, 1)
+			w.icon:SetVertexColor(1, 0.9, 0.9)
+		end
+		w.disarm = function()
+			w.armed = nil
+			w:SetBackdropColor(0, 0, 0, 0.7)
+			w:SetBackdropBorderColor(0.4, 0.4, 0.4, 0.8)
+			w.icon:SetVertexColor(1, 1, 1)
+		end
+		w:SetScript("OnClick", function()
+			LibWidgets.CloseAllMenus()
+			if w.armed then
+				w.disarm()
+				if bind.onDelete then bind.onDelete() end
+			else
+				w.arm()
+				C_Timer.After(3, function() if w.armed then w.disarm() end end)
+			end
+		end)
+		-- Hover must not repaint an armed button back to the neutral border, or
+		-- moving the mouse would silently undo the only cue that it's primed.
+		w:SetScript("OnEnter", function()
+			if not w.armed then this:SetBackdropBorderColor(0.9, 0.8, 0.2, 1) end
+			GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
+			GameTooltip:AddLine(w.armed and "Click again to confirm" or "Delete")
+			GameTooltip:Show()
+		end)
+		w:SetScript("OnLeave", function()
+			if not w.armed then this:SetBackdropBorderColor(0.4, 0.4, 0.4, 0.8) end
+			GameTooltip:Hide()
+		end)
+		return w
+	end)
+	b.bind.onDelete = onDelete
+	-- Disarm on reuse: a pooled button armed for the section it served in the
+	-- last paint must never commit that click against whatever section it lands
+	-- on in this one.
+	b.disarm()
+	return b
+end
+
+-- A bare click target laid over a collapsible header's title line.
+local function poolHitArea(page, onClick)
+	local b = acquire(page, "hitarea", function() return CreateFrame("Button", nil, page) end)
+	b:SetHeight(16)
+	b:SetScript("OnClick", onClick)
+	return b
+end
+
+-- `swatches` (value -> texture path) turns this into a previewing picker; a
+-- swatch button can't be un-swatched after construction, so it pools separately.
+local function poolDropdown(page, width, values, labels, onSelect, get, swatches)
+	local d = acquire(page, (swatches and "dropsw" or "drop") .. width, function()
+		local bind = {}
+		-- NewDropButton captures `labels` once; a proxy that forwards misses to
+		-- the live binding is what lets one pooled button serve every field.
+		-- `values` needs no such trick -- passed as a function it already means
+		-- "rebuild the menu from this on every open".
+		local labelProxy = setmetatable({}, { __index = function(t, k)
+			if k == nil then return nil end
+			return bind.labels and bind.labels[k]
+		end })
+		local swatchProxy = swatches and setmetatable({}, { __index = function(t, k)
+			if k == nil then return nil end
+			return bind.swatches and bind.swatches[k]
+		end })
+		local w = LibWidgets.NewDropButton(page, {
+			width = width,
+			values = function() return bind.values or EMPTY end,
+			labels = labelProxy,
+			swatches = swatchProxy,
+			onSelect = function(v) if bind.onSelect then bind.onSelect(v) end end,
+			get = function() return bind.get and bind.get() end,
+			textureDir = W.LIBWIDGETS_TEXTURES,
+			-- The library's default of 8 rows scrolls the longest lists here (the
+			-- trigger-type picker, a condition's property list) far more than they
+			-- need. Read once at construction, so it applies to every field this
+			-- pooled button is later rebound to.
+			maxVisibleItems = 14,
+		})
+		w.bind = bind
+		return w
+	end)
+	d.bind.values = values
+	d.bind.labels = labels
+	d.bind.swatches = swatches
+	d.bind.onSelect = onSelect
+	d.bind.get = get
+	d.setValue(get and get())
+	return d
+end
+
+-- A drop button whose face never changes: it names an action and its entries
+-- are the choices. NewDropButton repaints the face from the picked value only
+-- when given a `get`, so omitting one leaves the face entirely to setValue --
+-- which this calls with the caption on every paint.
+local function poolMenuButton(page, width, caption, values, labels, onSelect)
+	local d = acquire(page, "menu" .. width, function()
+		local bind = {}
+		local labelProxy = setmetatable({}, { __index = function(t, k)
+			if k == nil then return nil end
+			return bind.labels and bind.labels[k]
+		end })
+		local w = LibWidgets.NewDropButton(page, {
+			width = width,
+			values = function() return bind.values or EMPTY end,
+			labels = labelProxy,
+			onSelect = function(v) if bind.onSelect then bind.onSelect(v) end end,
+			textureDir = W.LIBWIDGETS_TEXTURES,
+		})
+		w.bind = bind
+		return w
+	end)
+	d.bind.values = values
+	d.bind.labels = labels
+	d.bind.onSelect = onSelect
+	-- No label maps the caption, so setValue falls through to the caption itself.
+	d.setValue(caption)
+	return d
+end
+
+local function poolColor(page, get, set)
+	local sw = acquire(page, "color", function()
+		local bind = {}
+		local w = LibWidgets.NewColorSwatch(page, {
+			get = function() return bind.get and bind.get() end,
+			set = function(v) if bind.set then bind.set(v) end end,
+		})
+		w.bind = bind
+		return w
+	end)
+	sw.bind.get = get
+	sw.bind.set = set
+	sw.repaint()
+	return sw
+end
+
+-- A syntax-coloured Lua editor. The error line and the Reset button are the
+-- widget's own (see LibWidgets.NewCodeEditBox), so nothing here pools them
+-- separately -- which is also what keeps them from being stranded by a repaint.
+-- Height is a construction-time parameter, so it folds into the pool key.
+local function poolCode(page, f, width, height)
+	local box = acquire(page, "code" .. height, function()
+		local bind = {}
+		local w = LibWidgets.NewCodeEditBox(page, {
+			width = width, height = height,
+			font = { path = W.CODE_FONT, size = W.CODE_FONT_SIZE },
+			onChange = function(t) if bind.onChange then bind.onChange(t) end end,
+			onCommit = function(t) if bind.onCommit then bind.onCommit(t) end end,
+			validate = function(t) return bind.validate and bind.validate(t) end,
+		})
+		w.bind = bind
+		return w
+	end)
+	-- Unbound across the seed: setText re-validates and would otherwise run the
+	-- previous field's validator against this field's text.
+	box.bind.onChange, box.bind.onCommit, box.bind.validate = nil, nil, nil
+	box.setSize(width, height)
+	-- Live colouring is opt-in and off by default.
+	-- Read per paint rather than at construction, so /wa codelive takes effect
+	-- on the next repaint instead of needing a reload.
+	if box.setLive then
+		box.setLive(WeakestAurasDB and WeakestAurasDB.codeEditorLive)
+	end
+	if box.setFontSize then
+		box.setFontSize((WeakestAurasDB and WeakestAurasDB.codeEditorFontSize) or W.CODE_FONT_SIZE)
+	end
+	if box.setTabWidth then
+		-- `false` means hard tabs, so this can't collapse to `or 2` -- only an
+		-- unset (nil) value falls back to the default.
+		local tw = WeakestAurasDB and WeakestAurasDB.codeEditorTabWidth
+		if tw == nil then tw = 2 end
+		box.setTabWidth(tw)
+	end
+	-- setDefault also disarms, so a Reset primed for the field this box served
+	-- in the last paint can never commit against the one it lands on now.
+	box.setDefault(f.default)
+	box.setText(f.get() or "")
+	box.bind.validate = f.validate
+	box.bind.onCommit = f.set
+	box.bind.onChange = f.onChange
+	-- The seed above ran with no validator bound; drive the error line now that
+	-- the real one is in place.
+	box.revalidate()
+	return box
+end
+
+local function poolMultiline(page, width, height, text, onCommit, onChange)
+	local box = acquire(page, "multiline", function()
+		local bind = {}
+		local w = LibWidgets.NewMultiLineEditBox(page, {
+			onChange = function(t) if bind.onChange then bind.onChange(t) end end,
+		})
+		w.bind = bind
+		w.edit:SetScript("OnEditFocusLost", function()
+			if bind.onCommit then bind.onCommit(w.getText()) end
+		end)
+		return w
+	end)
+	-- Unbound across the seed: SetText fires OnTextChanged, and the field being
+	-- painted validates its own starting text below -- an echo here would only
+	-- run the same check a second time (and, before the rebind, against the
+	-- previous field's).
+	box.bind.onChange = nil
+	box.bind.onCommit = nil
+	-- setSize, not SetWidth/SetHeight: the widget has to re-wrap and re-measure
+	-- its text to keep the scroll range right.
+	box.setSize(width, height)
+	box.setText(text or "")
+	box.bind.onChange = onChange
+	box.bind.onCommit = onCommit
+	return box
+end
+
+-- Boundary-move splice shared by the list editor's arrow buttons and its
+-- drag-drop (see LibWidgets.lua's NewListEditor doc comment): `before` names an
+-- original index the moved entry should land just ahead of.
+local function spliceReorder(list, fromIndex, before)
+	local v = table.remove(list, fromIndex)
+	local insertAt = (fromIndex < before) and (before - 1) or before
+	table.insert(list, insertAt, v)
+end
+
+local function poolListEditor(page, f, x, y, rightInset, visibleRows)
+	local frame = acquire(page, "list" .. visibleRows, function()
+		W._listSeq = (W._listSeq or 0) + 1
+		local bind = {}
+		local function list() return (bind.list and bind.list()) or EMPTY end
+		local function changed() if bind.onChange then bind.onChange() end end
+		local editor = LibWidgets.NewListEditor(page, {
+			nameFrame = "WeakestAurasOptList" .. W._listSeq,
+			textureDir = W.LIBWIDGETS_TEXTURES,
+			rowHeight = 20, visibleRows = visibleRows,
+			list = list,
+			reorder = function(fromIndex, before)
+				spliceReorder(list(), fromIndex, before)
+				changed()
+			end,
+			remove = function(index)
+				table.remove(list(), index)
+				changed()
+			end,
+			add = { onAdd = function(text)
+				if text and text ~= "" then
+					table.insert(list(), text)
+					changed()
+				end
+			end },
+			nameGet = function(entry) return entry end,
+		})
+		editor.frame.editor = editor
+		editor.frame.bind = bind
+		return editor.frame
+	end)
+	frame.bind.list = f.get
+	frame.bind.onChange = f.onChange
+	frame:SetPoint("TOPLEFT", page, "TOPLEFT", x, y)
+	frame:SetPoint("RIGHT", page, "RIGHT", -rightInset, 0)
+	frame.editor.refresh()
+	return frame
+end
+
+-- ---------------------------------------------------------------------------
+-- Declarative options-table renderer
+-- ---------------------------------------------------------------------------
+
+-- Places one field at (x, y) with widget width `w` and returns the vertical
+-- space it consumed. Headers are handled by the caller (they're always
+-- full-width). Shared by the single-column and two-column paths so both stay
+-- identical per field type.
+local function placeField(page, f, x, y, w)
+	if f.type == "toggle" then
+		local cb = poolCheck(page, f.name, f.set, f.get)
+		cb:SetPoint("TOPLEFT", x, y)
+		return 24
+	elseif f.type == "input" then
+		local label = poolLabel(page, f.name)
+		label:SetPoint("TOPLEFT", x, y)
+		local e = poolEditBox(page, w, f.set)
+		local v = f.get()
+		e:SetText(v ~= nil and tostring(v) or "")
+		e:SetPoint("TOPLEFT", x, y - 16)
+		return 44
+	elseif f.type == "multiline" then
+		local label = poolLabel(page, f.name)
+		label:SetPoint("TOPLEFT", x, y)
+		-- Wants far more width than a normal field's capped column; size to the
+		-- page rather than the passed `w`. Commits on focus lost, not per
+		-- keystroke -- a custom-trigger `set` recompiles the aura, and Enter is a
+		-- newline in a multi-line box, so mid-typing commits are wrong here.
+		local mw = (page:GetWidth() or 400) - x - 16
+		if mw < 120 then mw = 120 end
+		local mh = f.height or 150
+		local box = poolMultiline(page, mw, mh, f.get() or "", f.set)
+		box:SetPoint("TOPLEFT", x, y - 16)
+		return 16 + mh + 8
+	elseif f.type == "code" then
+		local label = poolLabel(page, f.name)
+		label:SetPoint("TOPLEFT", x, y)
+		-- Same page-width sizing as `multiline`: code wants far more room than a
+		-- normal field's capped column.
+		local mw = (page:GetWidth() or 400) - x - 16
+		if mw < 120 then mw = 120 end
+		local mh = f.height or 150
+		local box = poolCode(page, f, mw, mh)
+		-- The label row leaves room for the widget's own Reset button, which
+		-- sits above the box's top-right corner.
+		box:SetPoint("TOPLEFT", x, y - 20)
+		-- 20 for the label/Reset row, then the box, then the widget's own error
+		-- line (14) -- which is always allotted, so the layout below doesn't
+		-- shift as errors come and go while typing.
+		return 20 + mh + 8 + 14
+	elseif f.type == "spell" or f.type == "item" or f.type == "icon" then
+		local label = poolLabel(page, f.name)
+		label:SetPoint("TOPLEFT", x, y)
+		local icon = poolPreviewIcon(page)
+		icon:SetPoint("TOPLEFT", x, y - 16)
+		-- `spell`/`item` store what the user typed and preview whatever it
+		-- resolves to; `icon` resolves at commit instead and stores the texture
+		-- path itself, so the region can SetTexture it blindly.
+		local function resolve(v)
+			if f.type == "spell" then
+				local id = WA.ResolveSpellID(v)
+				if not id then return nil end
+				local _, _, ic = GetSpellInfo(id)
+				return ic
+			elseif f.type == "item" then
+				local id = WA.ResolveItemID(v)
+				if not id then return nil end
+				-- C_Item.GetItemInfo's 18-value tuple, not the stock global's short
+				-- one: only the modern shape has the texture in slot 10.
+				if not (C_Item and C_Item.GetItemInfo) then return nil end
+				local _, _, _, _, _, _, _, _, _, ic = C_Item.GetItemInfo(id)
+				return ic
+			end
+			local id = WA.ResolveSpellID(v)
+			if id then local _, _, ic = GetSpellInfo(id); return ic end
+			if v and v ~= "" then return v end
+			return nil
+		end
+		-- An `icon` field additionally gets a Browse button opening the picker;
+		-- typing a path by hand still works, it just stops being the only way.
+		local browseW = (f.type == "icon") and 62 or 0
+		local e = poolEditBox(page, w - 24 - browseW, function(v)
+			local path = resolve(v)
+			if f.type == "icon" then f.set(path or "") else f.set(v) end
+			icon:SetTexture(path or QUESTION_ICON)
+			if WA.RefreshList then WA.RefreshList() end
+		end)
+		-- Only an item field takes a shift-clicked link; a spell or icon field has
+		-- nothing to do with one.
+		e.acceptsLinks = (f.type == "item")
+		local v = f.get()
+		e:SetText(v ~= nil and tostring(v) or "")
+		e:SetPoint("TOPLEFT", x + 24, y - 16)
+		if f.type == "icon" then
+			icon:SetTexture((v and v ~= "" and v) or QUESTION_ICON)
+			local b = poolButton(page, "Browse", browseW - 4, function()
+				W.OpenIconPicker(f.get(), function(path)
+					f.set(path or "")
+					if WA.RefreshList then WA.RefreshList() end
+					if WA.RefreshOptions then WA.RefreshOptions() end
+				end)
+			end)
+			b:SetPoint("TOPLEFT", x + 24 + (w - 24 - browseW) + 4, y - 16)
+		else
+			icon:SetTexture(resolve(v) or QUESTION_ICON)
+		end
+		return 44
+	elseif f.type == "namelist" then
+		local label = poolLabel(page, f.name)
+		label:SetPoint("TOPLEFT", x, y)
+		local n = table.getn(f.get())
+		local visibleRows = n < 2 and 2 or (n > 5 and 5 or n)
+		local rightInset = (page:GetWidth() or 400) - (x + w)
+		local frame = poolListEditor(page, f, x, y - 16, rightInset, visibleRows)
+		return 16 + frame.editor.height + 6
+	elseif f.type == "range" then
+		local s = acquire(page, "spin", function()
+			-- The bind table *is* the widget's spec: NewSpinBox reads label/min/
+			-- max/step/onChange out of it at call time, so rebinding is assignment.
+			local bind
+			bind = {
+				min = 0, max = 1, step = 1, width = 220,
+				textureDir = W.LIBWIDGETS_TEXTURES,
+				onChange = function(v) if bind.set then bind.set(v) end end,
+			}
+			local sp = LibWidgets.NewSpinBox(page, bind)
+			sp.bind = bind
+			return sp
+		end)
+		-- Unbound across the rebind, because two things here can move the value:
+		-- clearing a box that still holds focus from the edit which caused this
+		-- repaint commits it, and a narrowed range clamps the carried-over number.
+		-- Either would write into the field being painted rather than the one the
+		-- user was actually editing.
+		s.bind.set = nil
+		s.edit:ClearFocus()
+		s.bind.label, s.bind.fmt, s.bind.decimals = f.name, f.fmt, f.decimals
+		s.bind.min, s.bind.max, s.bind.step = f.min, f.max, f.step
+		s.setWidth(w)
+		s.setValue(f.get())
+		s.bind.set = f.set
+		s:SetPoint("TOPLEFT", x, y)
+		return 38
+	elseif f.type == "disclosure" then
+		-- A settings fold: a gear plus a one-line label, the whole line clickable.
+		-- Deliberately not a `header` -- a header titles a region of the tab, this
+		-- hides settings that get set once and then only get in the way, so it
+		-- reads as a control rather than as a divider.
+		local btn = poolIconButton(page, GEAR_ICON, f.onToggle or function() end)
+		btn:SetPoint("TOPLEFT", x, y)
+		if f.collapsed then btn.icon:SetVertexColor(0.6, 0.6, 0.6) end
+		-- The summary says what the folded rows hold, so the closed state still
+		-- carries the settings rather than merely naming them.
+		local text = f.name or ""
+		if f.summary and f.summary ~= "" then text = text .. "|cff9d9d9d: " .. f.summary .. "|r" end
+		local label = poolLabel(page, text)
+		label:SetPoint("TOPLEFT", x + 20, y - 2)
+		local hit = poolHitArea(page, f.onToggle or function() end)
+		hit:SetPoint("TOPLEFT", x + 20, y)
+		hit:SetPoint("TOPRIGHT", page, "TOPLEFT", x + 24 + (label:GetStringWidth() or 0), y)
+		return 22
+	elseif f.type == "select" then
+		local label = poolLabel(page, f.name)
+		label:SetPoint("TOPLEFT", x, y)
+		local dw = w < 160 and w or 160
+		local d = poolDropdown(page, dw, f.values, f.labels, f.set, f.get, f.swatches)
+		d:SetPoint("TOPLEFT", x, y - 16)
+		return 44
+	elseif f.type == "opnumber" then
+		local label = poolLabel(page, f.name)
+		label:SetPoint("TOPLEFT", x, y)
+		local op = poolDropdown(page, 52, W.OPERATORS, nil, f.setOp, f.getOp)
+		op:SetPoint("TOPLEFT", x, y - 16)
+		local e = poolEditBox(page, 60, function(v) f.setVal(tonumber(v)) end)
+		local v = f.getVal()
+		e:SetText(v ~= nil and tostring(v) or "")
+		e:SetPoint("TOPLEFT", x + 58, y - 16)
+		return 44
+	elseif f.type == "color" then
+		local label = poolLabel(page, f.name)
+		label:SetPoint("TOPLEFT", x, y - 3)
+		local sw = poolColor(page, f.get, f.set)
+		sw:SetPoint("TOPLEFT", x + 100, y)
+		return 26
+	elseif f.type == "button" then
+		local b = poolButton(page, f.name, f.width or w, f.onClick)
+		b:SetPoint("TOPLEFT", x, y)
+		return 28
+	elseif f.type == "menu" then
+		local d = poolMenuButton(page, f.width or w, f.name, f.values, f.labels, f.onSelect)
+		d:SetPoint("TOPLEFT", x, y)
+		return 28
+	end
+	return 0
+end
+
+-- (Re)paints `page` from `fields`, reusing the widgets already on it (see the
+-- widget pool above). Fields flagged `half` pack two-per-row; columns size to
+-- the page's current width so the layout follows a resized options window.
+function W.BuildOptions(page, fields)
+	page.widgetPools = page.widgetPools or {}
+	page.widgetUsed = page.widgetUsed or {}
+	-- A NewDropButton popup is parented to the window, not to its button or this
+	-- page, so the sweep below can't take it down: an open menu would survive the
+	-- repaint and float over the new controls. Closing it here rather than
+	-- relying on the caller is what lets the invariant below hold for *every*
+	-- widget this page owns.
+	LibWidgets.CloseAllMenus()
+	-- Everything on the page goes down before anything comes back up, and
+	-- `acquire` re-Shows only what this paint actually uses. Hiding up front
+	-- rather than sweeping the unused tail at the end is what makes "a control
+	-- from the previous tab is still on screen" structurally impossible: the
+	-- sweep only holds if the paint runs to completion, so any error partway
+	-- through (or an early return added later) stranded whatever the previous
+	-- paint had put there. This ordering has no such precondition.
+	for kind, pool in pairs(page.widgetPools) do
+		page.widgetUsed[kind] = 0
+		for i = 1, table.getn(pool) do pool[i]:Hide() end
+	end
+
+	local avail = page:GetWidth()
+	if not avail or avail < 120 then avail = 400 end
+	local gap = 12
+	local colW = math.floor((avail - 16 - gap) / 2)
+	if colW < 90 then colW = 90 end
+	local leftX, rightX = 8, 8 + colW + gap
+	local fullW = avail - 16
+	if fullW > 240 then fullW = 240 end
+
+	local y = -8
+	local col = 0          -- 0 = next half goes left, 1 = right slot pending
+	local rowTopY, leftH = y, 0
+
+	for i = 1, table.getn(fields) do
+		local f = fields[i]
+		if f.type == "header" then
+			if col == 1 then y = rowTopY - leftH; col = 0 end
+			y = y - 10
+			-- Centered gold label flanked by horizontal rules (the WeakAuras
+			-- section-divider look) -- plain size-differentiated text wasn't
+			-- separating areas clearly enough.
+			local h = poolHeaderLabel(page, f.name)
+			h:SetPoint("TOP", page, "TOPLEFT", avail / 2, y)
+
+			-- A collapsible/deletable section puts its own controls where the
+			-- flanking rules would otherwise run, so the rules stop short of
+			-- them (see leftEdge/rightEdge below).
+			local leftEdge, rightEdge = 8, avail - 8
+			if f.collapsed ~= nil then
+				-- The arrow points the way the section will move on click: down to
+				-- unfold a collapsed one, up to fold an open one.
+				local arrow = poolIconButton(page,
+					W.LIBWIDGETS_TEXTURES .. (f.collapsed and "down" or "up"),
+					f.onToggle or function() end)
+				arrow:SetPoint("TOPLEFT", 8, y + 2)
+				leftEdge = 8 + 16 + 6
+			end
+			if f.onDelete then
+				local del = poolDeleteButton(page, f.onDelete)
+				del:SetPoint("TOPRIGHT", page, "TOPLEFT", avail - 8, y + 2)
+				rightEdge = avail - 8 - 16 - 6
+			end
+			-- The whole title line toggles too, not just the small arrow. It's a
+			-- bare mouse-enabled frame (no textures of its own) laid over the
+			-- label, and it stops at rightEdge so it can never sit on top of the
+			-- delete button and swallow its clicks.
+			if f.collapsed ~= nil then
+				local hit = poolHitArea(page, f.onToggle or function() end)
+				hit:SetPoint("TOPLEFT", leftEdge, y + 2)
+				hit:SetPoint("TOPRIGHT", page, "TOPLEFT", rightEdge, y + 2)
+			end
+
+			local tw = h:GetStringWidth() or 0
+			local midY, cx, pad = y - 6, avail / 2, 8
+			-- Only draw the flanking rules when the label leaves room for them;
+			-- otherwise the texture ends would cross and render inverted.
+			if cx - tw / 2 - pad > leftEdge + 4 then
+				local ll = poolRule(page)
+				ll:SetPoint("LEFT", page, "TOPLEFT", leftEdge, midY)
+				ll:SetPoint("RIGHT", page, "TOPLEFT", cx - tw / 2 - pad, midY)
+				local rl = poolRule(page)
+				rl:SetPoint("LEFT", page, "TOPLEFT", cx + tw / 2 + pad, midY)
+				rl:SetPoint("RIGHT", page, "TOPLEFT", rightEdge, midY)
+			end
+			y = y - 18
+		elseif f.half then
+			if col == 0 then
+				rowTopY = y
+				leftH = placeField(page, f, leftX, y, colW - 8)
+				col = 1
+			else
+				local rh = placeField(page, f, rightX, rowTopY, colW - 8)
+				y = rowTopY - (leftH > rh and leftH or rh)
+				col = 0
+			end
+		else
+			if col == 1 then y = rowTopY - leftH; col = 0 end
+			y = y - placeField(page, f, 8, y, fullW)
+		end
+	end
+	if col == 1 then y = rowTopY - leftH end
+
+	-- Total laid-out height (y runs negative from the top), so a scroll-child
+	-- container can size itself to the content -- see OptionsFrame.lua's content
+	-- scroll frame.
+	page.contentHeight = -y + 8
+end
+
+-- ---------------------------------------------------------------------------
+-- Context menu
+--
+-- W.ContextMenu(parent) -> a frame with Open(items, anchor) and Close(). The
+-- item list is passed to every Open, so one menu instance serves any number of
+-- differently-shaped menus:
+--   { text = "Duplicate", onClick = function() end }
+--   { text = "Copy settings", submenu = { ...items... } }  -- one level only
+--   { separator = true }
+--   { text = "Delete", disabled = true }                   -- greyed, inert
+--   { text = "Delete", confirm = true, onClick = ... }      -- two-click morph
+-- Item buttons come from the same per-kind pool BuildOptions uses, so contents
+-- that change per opening cost no new frames after the first paint.
+-- ---------------------------------------------------------------------------
+
+local MENU_ITEM_H = 16
+local MENU_PAD = 3
+local MENU_MIN_W, MENU_MAX_W = 120, 260
+
+local paintMenu
+
+local function menuItemClicked(b)
+	local item = b.item
+	if not item or item.disabled then return end
+	-- A confirm item stays open across its first click: a menu that closed on
+	-- every click could not show an armed state at all.
+	if item.confirm and not b.confirming then
+		b.confirming = true
+		b.label:SetText("Confirm?")
+		C_Timer.After(3, function()
+			-- Buttons are pooled and rebound: only revert one still holding the
+			-- item that armed it.
+			if b.confirming and b.item == item then
+				b.confirming = nil
+				b.label:SetText(item.text or "")
+			end
+		end)
+		return
+	end
+	b.confirming = nil
+	b.menu.Root().Close()
+	if item.onClick then item.onClick() end
+end
+
+local function menuItemEntered(b)
+	local sub = b.menu.sub
+	if not sub then return end
+	-- Entering any item takes down whatever submenu the previous one opened, so
+	-- at most one is ever up.
+	sub:Hide()
+	local item = b.item
+	if not item or item.disabled or not item.submenu then return end
+	paintMenu(sub, item.submenu)
+	sub:ClearAllPoints()
+	local right = b:GetRight()
+	local screenW = UIParent:GetWidth()
+	if not screenW or screenW <= 0 then screenW = GetScreenWidth() end
+	if right and right + (sub:GetWidth() or 0) > screenW then
+		sub:SetPoint("TOPRIGHT", b, "TOPLEFT", -2, MENU_PAD)
+	else
+		sub:SetPoint("TOPLEFT", b, "TOPRIGHT", 2, MENU_PAD)
+	end
+	sub:Show()
+end
+
+local function newMenuItem(f)
+	local b = CreateFrame("Button", nil, f)
+	b:SetHeight(MENU_ITEM_H)
+	b.menu = f
+
+	local fs = b:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+	fs:SetPoint("LEFT", 4, 0)
+	fs:SetJustifyH("LEFT")
+	b.label = fs
+
+	local arrow = b:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+	arrow:SetPoint("RIGHT", -4, 0)
+	arrow:SetText(">")
+	arrow:Hide()
+	b.arrow = arrow
+
+	local hl = b:CreateTexture(nil, "HIGHLIGHT")
+	hl:SetAllPoints(b)
+	hl:SetTexture(0.3, 0.3, 0.8, 0.4)
+	b.hl = hl
+
+	b:SetScript("OnClick", function() menuItemClicked(b) end)
+	b:SetScript("OnEnter", function() menuItemEntered(b) end)
+	return b
+end
+
+function paintMenu(f, items)
+	-- Same hide-first ordering BuildOptions uses: everything goes down before
+	-- anything comes back up, so a paint that errors partway cannot leave an
+	-- item from the previous opening on screen.
+	for kind, pool in pairs(f.widgetPools) do
+		f.widgetUsed[kind] = 0
+		for i = 1, table.getn(pool) do pool[i]:Hide() end
+	end
+
+	local width = MENU_MIN_W
+	local y = -MENU_PAD
+	for i = 1, table.getn(items) do
+		local item = items[i]
+		if item.separator then
+			local t = acquire(f, "menusep", function()
+				local tex = f:CreateTexture(nil, "ARTWORK")
+				tex:SetHeight(1)
+				tex:SetTexture(0.4, 0.4, 0.4, 0.8)
+				return tex
+			end)
+			t:SetPoint("TOPLEFT", f, "TOPLEFT", MENU_PAD + 2, y - 3)
+			t:SetPoint("TOPRIGHT", f, "TOPRIGHT", -(MENU_PAD + 2), y - 3)
+			y = y - 7
+		else
+			local b = acquire(f, "menuitem", function() return newMenuItem(f) end)
+			b:SetPoint("TOPLEFT", f, "TOPLEFT", MENU_PAD, y)
+			b:SetPoint("TOPRIGHT", f, "TOPRIGHT", -MENU_PAD, y)
+			b.item = item
+			-- Disarm on reuse, or a pooled button armed by the last opening would
+			-- commit that click against whatever item it holds in this one.
+			b.confirming = nil
+			b.label:SetText(item.text or "")
+			if item.disabled then
+				b.label:SetTextColor(0.5, 0.5, 0.5)
+				b.hl:SetTexture(0, 0, 0, 0)
+			else
+				b.label:SetTextColor(1, 1, 1)
+				b.hl:SetTexture(0.3, 0.3, 0.8, 0.4)
+			end
+			if item.submenu then b.arrow:Show() else b.arrow:Hide() end
+			local w = (b.label:GetStringWidth() or 0) + 2 * MENU_PAD + 12
+			if item.submenu then w = w + 14 end
+			if w > width then width = w end
+			y = y - MENU_ITEM_H
+		end
+	end
+	if width > MENU_MAX_W then width = MENU_MAX_W end
+	f:SetWidth(width)
+	f:SetHeight(-y + MENU_PAD)
+end
+
+local function newMenuFrame(parent)
+	local f = CreateFrame("Frame", nil, parent)
+	f:SetBackdrop(W.EDITBOX_BACKDROP)
+	f:SetBackdropColor(0, 0, 0, 0.95)
+	f:SetBackdropBorderColor(0.4, 0.4, 0.4, 0.9)
+	f:SetFrameStrata("FULLSCREEN_DIALOG")
+	f:SetToplevel(true)
+	-- Mouse-enabled so a click on the menu's own padding is swallowed here
+	-- rather than falling through to the click-away catcher underneath.
+	f:EnableMouse(true)
+	f:Hide()
+	f.widgetPools, f.widgetUsed = {}, {}
+	return f
+end
+
+-- Places the menu at the cursor, flipping left/up against whichever screen edge
+-- it would otherwise cross. `anchor` is the fallback for a client that gives no
+-- cursor position, opening to the right of the frame that was clicked.
+local function placeMenu(f, anchor)
+	local x, y = GetCursorPosition()
+	local scale = UIParent:GetEffectiveScale()
+	f:ClearAllPoints()
+	if not x or not scale or scale == 0 then
+		f:SetPoint("TOPLEFT", anchor or UIParent, "TOPRIGHT", 4, 0)
+		return
+	end
+	x, y = x / scale, y / scale
+	local screenW = UIParent:GetWidth()
+	if not screenW or screenW <= 0 then screenW = GetScreenWidth() end
+	local horiz = (x + (f:GetWidth() or 0) > screenW) and "RIGHT" or "LEFT"
+	local vert = (y - (f:GetHeight() or 0) < 0) and "BOTTOM" or "TOP"
+	f:SetPoint(vert .. horiz, UIParent, "BOTTOMLEFT", x, y)
+end
+
+function W.ContextMenu(parent)
+	local f = newMenuFrame(parent)
+	f.sub = newMenuFrame(f)
+	f.sub:SetFrameLevel(f:GetFrameLevel() + 5)
+	f.Root = function() return f end
+	f.sub.Root = f.Root
+
+	-- Click-outside dismissal. LibWidgets.CloseAllMenus only reaches clicks that
+	-- land on a LibWidgets control, so this needs its own full-screen catcher one
+	-- strata below the menu to also close on a click into the aura list, the tab
+	-- pane or the world.
+	local catcher = CreateFrame("Frame", nil, UIParent)
+	catcher:SetAllPoints(UIParent)
+	catcher:EnableMouse(true)
+	catcher:SetFrameStrata("FULLSCREEN")
+	catcher:Hide()
+	catcher:SetScript("OnMouseDown", function() f.Close() end)
+	f.catcher = catcher
+
+	f.Close = function()
+		f.sub:Hide()
+		f:Hide()
+		catcher:Hide()
+	end
+
+	f.Open = function(items, anchor)
+		-- A drop-button popup and a context menu must never be up at once.
+		LibWidgets.CloseAllMenus()
+		f.sub:Hide()
+		paintMenu(f, items)
+		placeMenu(f, anchor)
+		catcher:Show()
+		f:Show()
+	end
+
+	-- The catcher is a UIParent child, so nothing takes it down when the menu's
+	-- own parent hides -- and a stranded catcher is a full-screen invisible
+	-- mouse blocker over the whole UI.
+	f:SetScript("OnHide", function()
+		f.sub:Hide()
+		catcher:Hide()
+	end)
+	return f
+end
