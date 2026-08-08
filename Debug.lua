@@ -1461,16 +1461,18 @@ function D.CodeProbe()
 	D.Log("  [Q-ARROW] OPEN: click at the very END of the box, press Left 4 times, then TAB.")
 	D.Log("  live colorizing: WeakestAurasDB.codeEditorLive = "
 		.. tostring(WeakestAurasDB and WeakestAurasDB.codeEditorLive)
-		.. " (toggle with /wa codelive)")
+		.. " (nil = on, the default; toggle with /wa codelive)")
 	D.Log("--- end code probe ---")
 end
 
--- Live colouring is off by default: it recolours the box under the caret while
--- typing, which is the part of the code editor that leans hardest on engine
--- behaviour, so it stays opt-in until it has real use behind it.
+-- Live colouring is on unless turned off here. Unset means on, so the toggle
+-- resolves the default before negating it -- `not nil` would read as "it was
+-- off" and leave the setting where it started.
 function D.CodeLive()
 	if not WeakestAurasDB then D.Log("no saved variables yet"); return end
-	WeakestAurasDB.codeEditorLive = not WeakestAurasDB.codeEditorLive
+	local on = WeakestAurasDB.codeEditorLive
+	if on == nil then on = true end
+	WeakestAurasDB.codeEditorLive = not on
 	D.Log("live code colouring: " .. (WeakestAurasDB.codeEditorLive and "ON" or "OFF")
 		.. " -- reopen the options tab to apply.")
 	if WA.RefreshOptions then WA.RefreshOptions() end

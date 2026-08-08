@@ -126,6 +126,11 @@ local function EnsureRegion(id, cloneId)
 	local frame = entry.byClone[cloneId]
 	if not frame then
 		frame = rt.create(UIParent, data)
+		-- Its own identity, upstream's region.id/region.cloneId pair: anything
+		-- reached *through* a region and needing to know which aura it belongs to
+		-- (the aura environment, an error message naming the aura) has only the
+		-- frame to ask. WA.Rename re-stamps it.
+		frame.id = id
 		frame.cloneId = cloneId
 		entry.byClone[cloneId] = frame
 		if rt.modify then rt.modify(frame, data) end
@@ -306,7 +311,7 @@ function WA.UpdatedTriggerState(id)
 	if ts.disjunctive == "any" then
 		newShow = triggerCount > 0
 	elseif ts.disjunctive == "custom" and ts.triggerLogicFunc then
-		local ok, res = WA.safecall(id, ts.triggerLogicFunc, ts.triggers)
+		local ok, res = WA.RunAuraFunc(id, id .. ": custom logic", ts.triggerLogicFunc, ts.triggers)
 		newShow = (ok and res) and true or false
 	else -- "all"
 		newShow = numTriggers > 0 and triggerCount == numTriggers
@@ -483,17 +488,12 @@ function WA.DisplayLoadState(id)
 end
 
 -- Compiles a customTriggerLogic string ("function(t) return t[1] and not t[2]
--- end") into a callable. loadstring works on this client; disjunctive="custom"
--- has no UI yet, but wiring it now costs nothing and keeps §3 faithful.
-local function compileTriggerLogic(str)
+-- end") into a callable (§3). User-authored, so it goes through WA.LoadFunction
+-- like every other custom-code site -- which is also where it picks up the
+-- sandbox: writes from it used to land in the real global namespace.
+local function compileTriggerLogic(str, id)
 	if not str or str == "" then return nil end
-	local fn, err = loadstring("return " .. str)
-	if not fn then
-		DEFAULT_CHAT_FRAME:AddMessage("|cffff0000WeakestAuras|r bad customTriggerLogic: " .. tostring(err), 1, 0.3, 0.3)
-		return nil
-	end
-	local ok, result = pcall(fn)
-	return ok and result or nil
+	return WA.LoadFunction(str, id .. ": custom logic")
 end
 
 -- Renders/repositions a group's container frame (no triggers/state -- see
@@ -586,6 +586,7 @@ function WA.Add(data, simpleChange)
 		numTriggers = numTriggers,
 		activeTriggerMode = triggers.activeTriggerMode or WA.trigger_modes.first_active,
 		triggerLogicFunc = nil,
+		triggerLogicSource = nil,
 		triggers = {},
 		triggerCount = 0,
 		activationTime = {},
@@ -594,7 +595,12 @@ function WA.Add(data, simpleChange)
 		activeStates = nil,
 	}
 	if ts.disjunctive == "custom" then
-		ts.triggerLogicFunc = compileTriggerLogic(triggers.customTriggerLogic)
+		ts.triggerLogicSource = triggers.customTriggerLogic
+		-- Edited code, so whatever the old code cached in aura_env is stale.
+		if not prev or prev.triggerLogicSource ~= ts.triggerLogicSource then
+			WA.ClearAuraEnv(id)
+		end
+		ts.triggerLogicFunc = compileTriggerLogic(triggers.customTriggerLogic, id)
 	end
 	for i = 1, numTriggers do ts[i] = {} end
 	triggerState[id] = ts
@@ -656,6 +662,7 @@ function WA.Remove(data)
 	triggerState[id] = nil
 	loaded[id] = nil
 	standby[id] = nil
+	WA.ClearAuraEnv(id)
 	WA.UnloadConditions(data)
 	eachSystem(function(system) if system.Delete then system.Delete(id) end end)
 	-- Its group's box no longer needs to cover this child.
@@ -670,6 +677,7 @@ function WA.Rename(oldId, newId)
 	if regions[oldId] then
 		regions[newId] = regions[oldId]
 		regions[oldId] = nil
+		for _, frame in pairs(regions[newId].byClone) do frame.id = newId end
 	end
 	if loaded[oldId] ~= nil then
 		loaded[newId] = loaded[oldId]
@@ -679,6 +687,7 @@ function WA.Rename(oldId, newId)
 		standby[newId] = standby[oldId]
 		standby[oldId] = nil
 	end
+	WA.RenameAuraEnv(oldId, newId)
 	eachSystem(function(system) if system.Rename then system.Rename(oldId, newId) end end)
 end
 

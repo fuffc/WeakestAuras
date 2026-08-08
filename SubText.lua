@@ -131,7 +131,15 @@ WA.RegisterSubRegionType("subtext", {
 		parent.subRegionEvents:AddSubscriber("PreShow", function()
 			if region.visible then fs:Show() end
 		end)
-		if WA.TextNeedsFrameTick(region.text, region.everyFrameFormatters) then
+		-- Two independent reasons to repaint per frame: the string's own (%p, an
+		-- every-frame formatter), and a %c whose function is set to run per frame.
+		-- The second is the parent's setting, asked one level up -- the parent has
+		-- already subscribed its refresh ahead of this, so what is left here is
+		-- re-resolving the string against the values it just recomputed.
+		local needsTick = WA.TextNeedsFrameTick(region.text, region.everyFrameFormatters)
+			or (parent.customTextFunc ~= nil and parent.customTextMode == "update"
+				and WA.ContainsCustomPlaceHolder(region.text))
+		if needsTick then
 			parent.subRegionEvents:AddSubscriber("FrameTick", function() region:Update() end)
 		end
 
@@ -143,7 +151,7 @@ WA.RegisterSubRegionType("subtext", {
 			{
 				-- %i is absent from the label deliberately: it resolves to nothing
 				-- here, this client's FontString having no inline texture escape.
-				type = "input", name = "Text (%p %t %n %s)", key = "text_text",
+				type = "input", name = "Text (%p %t %n %s %c)", key = "text_text",
 				get = function() return subData.text_text end,
 				-- Re-renders the tab: Format Options below is one row per symbol
 				-- in this string, so editing it changes which rows exist.

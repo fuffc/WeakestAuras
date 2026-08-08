@@ -887,10 +887,12 @@ end
 -- expiration/duration behind the state, then the five classic symbols already
 -- rendered -- a custom function should not have to re-derive what %p says.
 --
--- safecall rather than a bare call: this is user-authored code reached from a
--- repaint, and an error in it must name the aura and leave the rest of the text
--- rendering rather than take the paint down. It is not sandboxed beyond the
--- environment GenericTrigger's own custom triggers get (drift §D2).
+-- Run through WA.RunAuraFuncPacked rather than called: this is user-authored
+-- code reached from a repaint, so it needs `aura_env` pointed at this aura
+-- (state.icon is the only way one of these functions can see an icon, the
+-- argument being blank here), and an error in it must name the aura and leave
+-- the rest of the text rendering rather than take the paint down. It is not
+-- sandboxed beyond that (drift §D2).
 function WA.RunCustomTextFunc(region, fn)
 	if not fn then return nil end
 	local state = region.state
@@ -902,17 +904,22 @@ function WA.RunCustomTextFunc(region, fn)
 			expirationTime, duration = state.total, state.value
 		end
 	end
+	-- `func` runs even where `get` came back nil, which is upstream's shape and
+	-- load-bearing: on a timed aura that has just expired, p.get yields nil and
+	-- p.func turns that into "". Short-circuiting instead hands the user function
+	-- a nil `progress`, so `progress .. "s"` errors in code that works in
+	-- WeakAuras. Only an absent state short-circuits -- both halves read fields
+	-- off it. `icon` is therefore consistently "": i.func blanks it, because this
+	-- client's FontString renders a |T...|t escape as its own path, and a
+	-- function wanting the real one reads aura_env.state.icon.
 	local dt = WA.dynamic_texts
 	local function classic(sym)
 		if not state then return nil end
-		local v = dt[sym].get(state)
-		if v == nil then return nil end
-		return dt[sym].func(v, state)
+		return dt[sym].func(dt[sym].get(state), state)
 	end
-	local ok, values = WA.safecall(region.id or "custom text", function()
-		return { fn(expirationTime or WA.INF, duration or 0,
-			classic("p"), classic("t"), classic("n"), classic("i"), classic("s")) }
-	end)
+	local ok, values = WA.RunAuraFuncPacked(region, (region.id or "?") .. ": custom text", fn,
+		expirationTime or WA.INF, duration or 0,
+		classic("p"), classic("t"), classic("n"), classic("i"), classic("s"))
 	if not ok then return nil end
 	return values
 end

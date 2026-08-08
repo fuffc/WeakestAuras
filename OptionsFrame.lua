@@ -852,6 +852,14 @@ function S.appendDisplayEffectsOptions(fields, data)
 			end,
 		})
 	end
+
+	-- The %c function is one per *aura*, shared by the region's own text and
+	-- every subtext of it, so its editor is one block here rather than a copy
+	-- inside each text's section -- upstream shows one subtext at a time and can
+	-- afford to repeat it; this page shows them all at once. Empty until
+	-- something in the aura's text references %c.
+	local customText = WA.regionPrototype.CustomTextOptionFields(data)
+	for i = 1, table.getn(customText) do table.insert(fields, customText[i]) end
 end
 
 -- ---------------------------------------------------------------------------
@@ -1279,15 +1287,18 @@ function S.appendTriggerOptions(fields, data)
 			table.insert(fields, {
 				type = "code", height = 60,
 				name = "Custom Logic (e.g. function(t) return t[1] and not t[2] end)",
-				get = function() return triggers.customTriggerLogic or "" end,
+				-- Raw, not `or ""`: nil means never configured (open at the
+				-- default below), "" means cleared and left cleared.
+				get = function() return triggers.customTriggerLogic end,
 				set = function(v) triggers.customTriggerLogic = v; WA.Add(data) end,
 				-- Seeds a working expression rather than the empty string the
 				-- field actually defaults to: "" is what you get before writing
 				-- anything, not something worth resetting *to*.
 				default = "function(t) return t[1] end",
-				-- Matches StateMachine's own compileTriggerLogic wrapper.
+				-- Asked of the compiler for its wrapper, so the reported line
+				-- numbers match what the user is looking at.
 				validate = function(txt)
-					return W.LuaSyntaxError("return " .. (txt or ""), "trigger logic")
+					return W.LuaSyntaxError(WA.WrapFunctionSource(txt), "trigger logic")
 				end,
 			})
 		end
@@ -2296,8 +2307,10 @@ local function buildPanel()
 		if S.menu then S.menu.Close() end
 	end)
 	-- A click on bare panel background (no interactive widget under the cursor)
-	-- closes an open dropdown -- the one case LibWidgets' interaction-driven
-	-- auto-close can't catch on its own.
+	-- closes an open dropdown and drops edit focus -- the one case LibWidgets'
+	-- interaction-driven auto-close can't catch on its own. The content pane and
+	-- its backdrop take no clicks, so a click into the empty space beside a code
+	-- editor lands here, which is what commits and re-colours it.
 	panel:SetScript("OnMouseDown", function()
 		LibWidgets.CloseAllMenus()
 		if S.menu then S.menu.Close() end

@@ -162,6 +162,168 @@ function proto.create(region)
 		proto.UnregisterForFrameTick(self)
 		self:Hide()
 	end
+
+	-- The two custom-text update modes are different *call counts*, not
+	-- "throttled or not" (WA2 Text.lua). `event` runs the function once per state
+	-- update and ignores the throttle entirely -- that is what `force` means
+	-- here. `update` runs it on FrameTick, and there the throttle is the
+	-- difference between a feature and a frame-rate bug.
+	--
+	-- Every region type's own Update must call this with force before it (or its
+	-- sub-regions) resolve a placeholder: StateMachine runs region:Update ahead
+	-- of the sub-region bus, so a refresh at the top of Update is what makes the
+	-- values every subtext then reads cost exactly one run.
+	function region:RefreshCustomText(force)
+		if not self.customTextFunc then return end
+		if not force then
+			local last = self.lastCustomTextUpdate
+			if last and last + (self.customTextThrottle or 0) >= GetTime() then return end
+		end
+		self.customValues = WA.RunCustomTextFunc(self, self.customTextFunc)
+		self.lastCustomTextUpdate = GetTime()
+	end
+
+	-- One stable function object, so modifyFinish's rebuild can put the same one
+	-- back rather than accumulating closures.
+	region.customTextTick = function() region:RefreshCustomText() end
+end
+
+-- ---------------------------------------------------------------------------
+-- %c custom text (§9)
+-- ---------------------------------------------------------------------------
+
+-- The function belongs to the *aura*, not to whatever renders it: upstream
+-- compiles data.customText once and every text of the display indexes the same
+-- result array, so five subtexts sharing %c1..%c5 cost one run per state update
+-- rather than five. It lives on the region for that reason -- an icon has no
+-- text of its own, every icon text being a sub-region, so machinery kept on the
+-- text region left %c unavailable everywhere it is most wanted.
+
+-- The default function, seeded into a fresh field and restored by the editor's
+-- Reset -- an emptied box is otherwise unrecoverable without remembering the
+-- signature. Arguments are WA.RunCustomTextFunc's, and every return is a %c:
+-- the first is %c or %c1, the second %c2, and so on.
+local CUSTOM_TEXT_DEFAULT = [[function(expirationTime, duration, progress, dur, name, icon, stacks)
+	return ""
+end]]
+
+-- Upstream defaults the throttle to 0, which in `update` mode is the custom
+-- function running on every frame. A default that costs frame rate is not a
+-- default. Resolved here rather than seeded into each region type's `defaults`,
+-- so the number is written once -- `or` catches only nil, so a user who
+-- deliberately chooses 0 still gets 0.
+local CUSTOM_TEXT_THROTTLE = 0.2
+
+-- Every string this aura might render: the region's own displayText, each
+-- subtext's text_text, and anything a condition swaps into either. The compile
+-- and the options gate both ask this, so the two cannot disagree -- an aura
+-- whose only %c arrives through a condition would otherwise compile a function
+-- it offers no editor to write (WA2's hideCustomTextOption walks conditions for
+-- the same reason).
+function proto.TextStrings(data)
+	local texts = {}
+	if data.displayText then table.insert(texts, data.displayText) end
+	local subs = data.subRegions or {}
+	for i = 1, table.getn(subs) do
+		local sub = subs[i]
+		if sub.type == "subtext" and sub.text_text then table.insert(texts, sub.text_text) end
+	end
+	local conditions = data.conditions or {}
+	for i = 1, table.getn(conditions) do
+		local changes = conditions[i].changes or {}
+		for c = 1, table.getn(changes) do
+			local change = changes[c]
+			-- "displayText" on the region itself, "sub.<n>.text_text" on a subtext.
+			if type(change.value) == "string" and change.property
+				and (change.property == "displayText"
+					or string.find(change.property, "%.text_text$")) then
+				table.insert(texts, change.value)
+			end
+		end
+	end
+	return texts
+end
+
+function proto.WantsCustomText(data)
+	return WA.ContainsCustomPlaceHolder(proto.TextStrings(data))
+end
+
+-- Compiles data.customText onto the region, memoized on the source it came
+-- from. modify is not the cold path it looks like: a `range` field's `set` calls
+-- WA.Add, NewSlider's onChange fires on every step of a drag, and modify runs
+-- each time -- so dragging a slider on an aura using %c would otherwise be one
+-- loadstring per frame. The key has to be the source rather than a dirty flag: a
+-- `set` writing the same text back (which a drag does to every *other* field)
+-- must compare equal. Memoizing the whole attempt, failure included, is also
+-- what keeps a broken function from reporting once per frame of that drag.
+local function applyCustomText(region, data)
+	region.customValues = nil
+	region.lastCustomTextUpdate = nil
+	region.customTextMode = data.customTextUpdate or "event"
+	region.customTextThrottle = data.customTextUpdateThrottle or CUSTOM_TEXT_THROTTLE
+
+	local source = data.customText
+	if source == "" then source = nil end
+	if not source or not proto.WantsCustomText(data) then
+		region.customTextFunc, region.customTextSource = nil, nil
+	elseif region.customTextSource ~= source then
+		region.customTextSource = source
+		region.customTextFunc = WA.LoadFunction(source, tostring(data.id) .. ": custom text")
+		-- The source changed, so whatever the old code left in aura_env belongs to
+		-- code that no longer exists.
+		WA.ClearAuraEnv(data.id)
+	end
+end
+
+-- The Custom Text block -- the code editor, the update mode, and the throttle
+-- that only decides anything in per-frame mode. One block per *aura* rather than
+-- one per text, since that is what the function is: rendered once on the Display
+-- tab (OptionsFrame's appendDisplayEffectsOptions) rather than inside each
+-- subtext's own section, which would put N identical editors on one page --
+-- upstream shows one subtext at a time and can afford to repeat them.
+-- Empty until something in the aura's text actually references %c, which is also
+-- how the connection between %c and this block is taught.
+function proto.CustomTextOptionFields(data)
+	if not proto.WantsCustomText(data) then return {} end
+	local fields = {
+		{ type = "header", name = "Custom Text" },
+		{
+			type = "code", name = "Custom Text Function", key = "customText", height = 160,
+			-- Raw, not `or ""`: nil is what tells the renderer this has never been
+			-- configured and should open at the default below.
+			get = function() return data.customText end,
+			set = function(v) data.customText = v; WA.Add(data, true) end,
+			default = CUSTOM_TEXT_DEFAULT,
+			-- Asked of the compiler for its wrapper rather than spelling one here:
+			-- two spellings drift, and the symptom is an error line number silently
+			-- off by one.
+			validate = function(txt)
+				return WA.Widgets.LuaSyntaxError(WA.WrapFunctionSource(txt), "custom text")
+			end,
+		},
+		{
+			type = "select", name = "Update on", key = "customTextUpdate",
+			values = { "event", "update" },
+			labels = { event = "Every state change", update = "Every frame" },
+			get = function() return data.customTextUpdate or "event" end,
+			set = function(v)
+				data.customTextUpdate = v
+				WA.Add(data, true)
+				-- Repaints the tab: the throttle below decides nothing outside the
+				-- per-frame mode.
+				WA.RefreshOptions()
+			end,
+		},
+	}
+	if data.customTextUpdate == "update" then
+		table.insert(fields, {
+			type = "range", name = "Throttle (seconds)", key = "customTextUpdateThrottle",
+			min = 0, max = 2, step = 0.05,
+			get = function() return data.customTextUpdateThrottle or CUSTOM_TEXT_THROTTLE end,
+			set = function(v) data.customTextUpdateThrottle = v; WA.Add(data, true) end,
+		})
+	end
+	return fields
 end
 
 -- Rebuilds a region's sub-region instances from data.subRegions and re-wires
@@ -172,6 +334,13 @@ end
 -- doesn't leak a FontString per tick. Pooling proper is deferred with clones.
 function proto.modifyFinish(region, data)
 	region.subRegionEvents:Clear()
+	applyCustomText(region, data)
+	-- Ahead of every sub-region's own subscription, because subscribers fire in
+	-- the order they were added: a subtext resolving %c on a frame tick has to
+	-- read a value refreshed on *this* frame rather than the previous one.
+	if region.customTextFunc and region.customTextMode == "update" then
+		region.subRegionEvents:AddSubscriber("FrameTick", region.customTextTick)
+	end
 	region.subRegions = region.subRegions or {}
 	local list = data.subRegions or {}
 	local n = table.getn(list)

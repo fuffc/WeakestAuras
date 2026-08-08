@@ -230,12 +230,16 @@
 -- most one NewDropButton popup is ever open at once -- see CloseAllMenus below.
 --
 -- CloseAllMenus() -- hides whichever NewDropButton popup is currently open, if
--- any. Every widget this library builds calls it on interaction (see the
--- comment above its definition for why -- there is no generic focus-lost event
--- to hook instead), so a menu closes the moment anything else in the library
--- is touched. A consuming addon's own panel can call it too (e.g. on
--- OnMouseDown for a blank-area click, or OnHide so a menu left open under a
--- closed panel doesn't pop back up still expanded next time it opens).
+-- any, and drops edit focus. Every widget this library builds calls it on
+-- interaction (see the comment above its definition for why -- there is no
+-- generic focus-lost event to hook instead), so a menu closes and a focused
+-- edit box commits the moment anything else in the library is touched. A
+-- consuming addon's own panel can call it too (e.g. on OnMouseDown for a
+-- blank-area click, or OnHide so a menu left open under a closed panel doesn't
+-- pop back up still expanded next time it opens).
+--
+-- ClearFocus() -- the focus half of CloseAllMenus on its own, for a caller that
+-- must leave an open menu alone.
 --
 -- NewIconPicker(parent, spec) -- a modal icon browser: a live search box over a
 -- scrolling grid of every icon the client knows, with a preview of the current
@@ -311,7 +315,7 @@
 -- Returns { height = <total pixel height used below (x,y)>, refresh = fn,
 --           frame = <the list's outer frame> }.
 
-local MAJOR, MINOR = "LibWidgets-1.0", 15
+local MAJOR, MINOR = "LibWidgets-1.0", 16
 -- Bind the global only on the winning copy. NewLibrary returns nil for a copy
 -- that loses the version race; assigning that nil straight to the global would
 -- wipe out the winner's binding (an older/equal copy loading last nulls it),
@@ -423,10 +427,40 @@ local MOVE_NONE = { 0.5, 0.5, 0.5 }
 -- background, or outside the addon's own frames entirely); a consuming
 -- addon can close that gap too by wiring its own panel's OnMouseDown to
 -- LibWidgets.CloseAllMenus().
+--
+-- Edit focus rides the same signal, for the same reason. Only an EditBox is
+-- told it lost focus, so a box the user clicked away from keeps focus -- and
+-- with it whatever it commits on blur -- indefinitely. CloseAllMenus therefore
+-- drops it too: "the user touched something else" is one event here, and every
+-- call site that wants a menu closed wants a stale caret gone as well.
 local activeMenu = nil
+local focusedEdit = nil
+
+-- Drops edit focus alone, for a caller that must not disturb an open menu.
+-- Clearing focus on a box that no longer has it does nothing, so a stale
+-- `focusedEdit` (a consumer replacing an OnEditFocusLost handler, say) costs
+-- nothing beyond a wasted call.
+function LibWidgets.ClearFocus()
+	local e = focusedEdit
+	focusedEdit = nil
+	if e then e:ClearFocus() end
+end
+
 function LibWidgets.CloseAllMenus()
 	if activeMenu then activeMenu:Hide() end
 	activeMenu = nil
+	LibWidgets.ClearFocus()
+end
+
+-- What every OnEditFocusGained in this file calls. The recorded box is dropped
+-- *before* the menus close, not cleared: the engine has already taken focus off
+-- whoever held it, and clearing a recorded box that is the one now gaining
+-- focus would fire its own focus-lost handler underneath it -- an inline rename
+-- box reopened on a second row closes itself that way.
+local function takeFocus(e)
+	focusedEdit = nil
+	LibWidgets.CloseAllMenus()
+	focusedEdit = e
 end
 
 -- Flat, tooltip-backdrop-styled button base shared by the reorder/delete/
@@ -639,7 +673,7 @@ function LibWidgets.NewTextBox(parent, spec)
 		end)
 	end
 
-	e:SetScript("OnEditFocusGained", function() LibWidgets.CloseAllMenus() end)
+	e:SetScript("OnEditFocusGained", function() takeFocus(this) end)
 	e:SetScript("OnEnterPressed", function()
 		if spec.onCommit then spec.onCommit(this:GetText()) end
 		this:ClearFocus()
@@ -759,7 +793,7 @@ function LibWidgets.NewMultiLineEditBox(parent, spec)
 	box.fit = fit
 
 	if spec.text then edit:SetText(spec.text) end
-	edit:SetScript("OnEditFocusGained", function() LibWidgets.CloseAllMenus() end)
+	edit:SetScript("OnEditFocusGained", function() takeFocus(this) end)
 	edit:SetScript("OnEscapePressed", function() this:ClearFocus() end)
 	edit:SetScript("OnTextChanged", function()
 		fit()
@@ -1029,7 +1063,7 @@ function LibWidgets.NewSpinBox(parent, spec)
 		setValue(edit:GetText(), true)
 	end
 
-	edit:SetScript("OnEditFocusGained", function() LibWidgets.CloseAllMenus(); focused = true end)
+	edit:SetScript("OnEditFocusGained", function() takeFocus(this); focused = true end)
 	-- Committing on focus lost as well as on Enter is what makes clicking away
 	-- keep a typed number instead of silently discarding it; Escape is the way
 	-- out. Enter still commits directly rather than leaning on ClearFocus to
@@ -2133,7 +2167,10 @@ function LibWidgets.NewCodeEditBox(parent, spec)
 
 	local function showColored()
 		suppress = true
-		local t = LibWidgets.LuaColorize(LibWidgets.LuaEncode(code), colors)
+		-- Padded like the live path: an unterminated string swallows every
+		-- token after it, and the blurred box is where most code is looked at.
+		local t = LibWidgets.LuaPadWithLinebreaks(
+			LibWidgets.LuaColorize(LibWidgets.LuaEncode(code), colors))
 		edit:SetText(t)
 		box.fit()
 		suppress = false
@@ -2146,7 +2183,7 @@ function LibWidgets.NewCodeEditBox(parent, spec)
 	end
 
 	edit:SetScript("OnEditFocusGained", function()
-		LibWidgets.CloseAllMenus()
+		takeFocus(this)
 		focused = true
 		refresh()
 	end)

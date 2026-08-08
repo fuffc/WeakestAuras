@@ -168,7 +168,7 @@ end
 -- (state, event, arg1..arg9): the status prototypes re-read live game state in
 -- `init` and ignore the event args, but the parameters carry the firing event's
 -- real payload, so a prototype can test against it instead of re-polling.
-local function constructFunction(proto, trigger)
+local function constructFunction(proto, trigger, errTag)
 	local lines = {}
 	table.insert(lines, "return function(state, event, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9)")
 	if proto.init then
@@ -201,43 +201,21 @@ local function constructFunction(proto, trigger)
 	table.insert(lines, "end")
 
 	local source = table.concat(lines, "\n")
-	local chunk, err = loadstring(source)
-	if not chunk then
-		return nil, source, err
-	end
-	local ok, fn = pcall(chunk)
-	if not ok then return nil, source, fn end
-	return fn, source
+	-- Engine-generated, so it keeps the real globals: the sandbox belongs to the
+	-- code's author, not to the call site. The source is already complete, `return
+	-- function(...)` and all, which is why it goes through the builtin door.
+	local fn, err = WA.LoadBuiltinFunction(source, errTag)
+	return fn, source, err
 end
 
-	-- Sandbox for user-authored custom triggers. Reads
--- fall through to the real globals (so a trigger can call UnitName/GetSpellInfo/
--- C_UnitAuras/string/table/math without an explicit whitelist), but writes land
--- in this table, never the global namespace -- a custom trigger can't clobber a
--- real global. Permissive on purpose (risk (b)); every call is safecall-wrapped
--- at run time (runTriggerFunc), so a runtime error names the aura and can't take
--- down ScanEvents. Same __index-passthrough idiom pfUI uses for its module env.
-local customEnv = setmetatable({}, { __index = getfenv(0) })
--- Published so the text region's custom text function compiles into the same
--- sandbox rather than a second copy of it.
-WA.customEnv = customEnv
-
 -- Compiles a custom *status* trigger's user text into f(state, event) -> show.
--- The text is a whole function expression ("function(state, event) ... end"),
--- loadstring'd behind a `return` (same idiom as StateMachine's
--- customTriggerLogic). setfenv on the chunk makes the returned inner function
--- inherit customEnv, so its global reads/writes go through the sandbox. Shape
+-- The text is a whole function expression ("function(state, event) ... end");
+-- WA.LoadFunction owns the wrapper, the sandbox and the error report. Shape
 -- mirrors constructFunction's return contract (fn, source, err).
-local function constructCustomFunction(trigger)
+local function constructCustomFunction(trigger, errTag)
 	local body = trigger.customTrigger or ""
-	if body == "" then return nil, body, "empty custom trigger" end
-	local chunk, err = loadstring("return " .. body)
-	if not chunk then return nil, body, err end
-	setfenv(chunk, customEnv)
-	local ok, fn = pcall(chunk)
-	if not ok then return nil, body, fn end
-	if type(fn) ~= "function" then return nil, body, "custom trigger must be a function" end
-	return fn, body
+	local fn, err = WA.LoadFunction(body, errTag)
+	return fn, body, err
 end
 
 -- Resolves a "spell" field's stored value -- a numeric spellID, or a name the
@@ -2347,7 +2325,7 @@ local function runTriggerFunc(ti, event, a1, a2, a3, a4, a5, a6, a7, a8, a9)
 	-- state.changed is false on entry (UpdatedTriggerState clears it after every
 	-- batch, step 7), so the flag the compiled stores / activateEvent set is a
 	-- true "changed since last apply" signal.
-	local ok, passed = WA.safecall(ti.id, ti.triggerFunc, state, event,
+	local ok, passed = WA.RunAuraFunc(ti.id, ti.id, ti.triggerFunc, state, event,
 		a1, a2, a3, a4, a5, a6, a7, a8, a9)
 	if ok and passed then
 		activateEvent(state, ti)
@@ -2418,6 +2396,11 @@ end
 -- registers into loaded_events nor force-initializes status triggers -- both
 -- wait for LoadDisplays (§11), so an unloaded display costs no events.
 function GenericTrigger.Add(data)
+	-- Kept across the Delete below so a trigger whose compiled source is
+	-- unchanged can be told from one that was edited: the second is a seam for
+	-- dropping whatever the old code cached in aura_env, and WA.Add is not --
+	-- it fires per drag step.
+	local prev = events[data.id]
 	GenericTrigger.Delete(data.id)
 	local byTrigger = {}
 	events[data.id] = byTrigger
@@ -2426,16 +2409,16 @@ function GenericTrigger.Add(data)
 		local trigger = WA.GetTrigger(data, triggernum)
 		local proto = trigger and PROTOTYPES[trigger.type]
 		if proto then
-			local fn, source, err
+			local fn, source
+			local errTag = data.id .. ": trigger " .. triggernum
 			if proto.custom then
-				fn, source, err = constructCustomFunction(trigger)
+				fn, source = constructCustomFunction(trigger, errTag)
 			else
-				fn, source, err = constructFunction(proto, trigger)
+				fn, source = constructFunction(proto, trigger, errTag)
 			end
-			if not fn then
-				DEFAULT_CHAT_FRAME:AddMessage("|cffff0000WeakestAuras|r [" .. data.id ..
-					"] trigger " .. triggernum .. " compile failed: " .. tostring(err), 1, 0.3, 0.3)
-			else
+			local prevTi = prev and prev[triggernum]
+			if not prevTi or prevTi.source ~= source then WA.ClearAuraEnv(data.id) end
+			if fn then
 				local ti = {
 					id = data.id, triggernum = triggernum, proto = proto,
 					trigger = trigger, triggerFunc = fn, source = source,
@@ -2682,17 +2665,20 @@ local function buildOptions(data, triggernum)
 				get = function() return t.customEvents or "" end,
 				set = function(v) t.customEvents = v; WA.Add(data) end },
 			{ type = "code", name = "Custom Trigger Function", key = "customTrigger", height = 180,
-				get = function() return t.customTrigger or "" end,
+				-- Raw, not `or ""`: nil means never configured (open at the
+				-- default below), "" means cleared and left cleared. MergeDefaults
+				-- seeds this one, so nil only shows up on a hand-built trigger.
+				get = function() return t.customTrigger end,
 				set = function(v) t.customTrigger = v; WA.Add(data) end,
 				-- Reset seeds the signature back, so an emptied box is recoverable
 				-- without the user having to remember the shape. Taken from the
 				-- prototype's own defaults rather than spelled out again here.
 				default = proto.defaults and proto.defaults.customTrigger,
-				-- Same wrapper constructCustomFunction compiles with, so the
-				-- reported line numbers match what the user is looking at ("return "
-				-- carries no newline).
+				-- Asked of the compiler for its wrapper rather than spelling one
+				-- here: two spellings drift, and the symptom is an error line
+				-- number silently off by one.
 				validate = function(txt)
-					return WA.Widgets.LuaSyntaxError("return " .. (txt or ""), "custom trigger")
+					return WA.Widgets.LuaSyntaxError(WA.WrapFunctionSource(txt), "custom trigger")
 				end },
 		}
 		for i = 1, table.getn(more) do table.insert(fields, more[i]) end

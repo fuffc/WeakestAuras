@@ -568,10 +568,12 @@ WA.RegisterRegionType("icon", {
 
 		-- Reads region.state (set by the state machine) -- replaces the old
 		-- updateState(region, state, data). Text (countdown/stacks) rides on
-		-- subtext elements notified via the subRegionEvents "Update" bus.
+		-- subtext elements notified via the subRegionEvents "Update" bus, and the
+		-- %c refresh goes first so every one of them reads values computed once.
 		function region:Update()
 			local state = self.state
 			if not state then return end
+			self:RefreshCustomText(true)
 			self:UpdateIcon()
 			WA.regionPrototype.UpdateProgress(self)
 		end
@@ -1521,10 +1523,12 @@ WA.RegisterRegionType("progressbar", {
 		WA.regionPrototype.create(region)
 
 		-- Name/time text rides on %n/%p subtext elements; this only paints the
-		-- icon + drives the fill (below).
+		-- icon + drives the fill (below). The %c refresh goes first so every
+		-- subtext that follows reads values computed once.
 		function region:Update()
 			local state = self.state
 			if not state then return end
+			self:RefreshCustomText(true)
 			self:UpdateIcon()
 			WA.regionPrototype.UpdateProgress(self)
 		end
@@ -1823,33 +1827,6 @@ local function textAnchorPoint(data)
 	return row[data.text_justifyH or D.justifyH] or "CENTER"
 end
 
--- The default custom text function, seeded into a fresh field and restored by the
--- editor's Reset -- an emptied box is otherwise unrecoverable without remembering
--- the signature. Arguments are WA.RunCustomTextFunc's, and every return is a
--- %c: the first is %c or %c1, the second %c2, and so on.
-local CUSTOM_TEXT_DEFAULT = [[function(expirationTime, duration, progress, dur, name, icon, stacks)
-	return ""
-end]]
-
--- Compiles a custom text function -- a whole `function(...) ... end` expression,
--- loadstring'd behind a `return`, the idiom GenericTrigger already uses for a
--- custom trigger and sharing that file's sandbox environment. A source that will
--- not compile reports and yields nil, so the rest of the text still renders.
-local function compileCustomText(source, id)
-	local function refuse(err)
-		DEFAULT_CHAT_FRAME:AddMessage("|cffff0000WeakestAuras|r [" .. tostring(id)
-			.. "] custom text: " .. tostring(err), 1, 0.3, 0.3)
-		return nil
-	end
-	local chunk, err = loadstring("return " .. source)
-	if not chunk then return refuse(err) end
-	if WA.customEnv then setfenv(chunk, WA.customEnv) end
-	local ok, fn = pcall(chunk)
-	if not ok then return refuse(fn) end
-	if type(fn) ~= "function" then return refuse("must be a function") end
-	return fn
-end
-
 -- Auto mode: size the region to whatever the string just rendered as. Both
 -- dimensions are measured, since GetStringHeight is absent here and GetHeight
 -- stands in for it -- a FontString with no explicit height reports its own text's,
@@ -1903,26 +1880,11 @@ local function textCreate(parent, data)
 	WA.regionPrototype.create(region)
 
 	-- One stable function object, so ConfigureSubscribers can take it back off the
-	-- bus -- a closure built per call could only ever be added.
-	region.frameTick = function()
-		if region.customTextMode == "update" then region:RefreshCustomText() end
-		region:UpdateText()
-	end
-
-	-- The two custom-text update modes are different *call counts*, not "throttled
-	-- or not" (WA2 Text.lua). `event` runs the function once per state update and
-	-- ignores the throttle entirely -- that is what `force` means here. `update`
-	-- runs it on FrameTick, and there the throttle is the difference between a
-	-- feature and a frame-rate bug.
-	function region:RefreshCustomText(force)
-		if not self.customTextFunc then return end
-		if not force then
-			local last = self.lastCustomTextUpdate
-			if last and last + (self.customTextThrottle or 0) >= GetTime() then return end
-		end
-		self.customValues = WA.RunCustomTextFunc(self, self.customTextFunc)
-		self.lastCustomTextUpdate = GetTime()
-	end
+	-- bus -- a closure built per call could only ever be added. The custom-text
+	-- refresh is *not* here: modifyFinish subscribes the prototype's own tick
+	-- ahead of this one, so the values are already fresh by the time this
+	-- re-resolves the string.
+	region.frameTick = function() region:UpdateText() end
 
 	function region:UpdateText()
 		local str = WA.ReplacePlaceHolders(self.displayText or "", self, self.formatters)
@@ -1985,18 +1947,6 @@ local function textModify(region, data)
 	local texts = displayTexts(data)
 	region.formatters, region.everyFrameFormatters =
 		WA.CreateFormatters(texts, textFormatGetter(data), data)
-
-	-- Compiled only when something actually references %c -- including a string
-	-- only a condition supplies, which is why the whole set is asked rather than
-	-- data.displayText alone. Nothing recompiles per frame: this is modify.
-	region.customTextFunc = nil
-	region.customValues = nil
-	region.lastCustomTextUpdate = nil
-	region.customTextMode = data.customTextUpdate or "event"
-	region.customTextThrottle = data.customTextUpdateThrottle or 0
-	if data.customText and data.customText ~= "" and WA.ContainsCustomPlaceHolder(texts) then
-		region.customTextFunc = compileCustomText(data.customText, data.id)
-	end
 
 	WA.textCore.Apply(region.text, data, "text_")
 	local point = textAnchorPoint(data)
@@ -2066,12 +2016,11 @@ WA.RegisterRegionType("text", {
 		-- restores a property's base from data, and a nil base is not a size.
 		text_size = 12,
 		text_color = { 1, 1, 1, 1 },
-		customText = "",
-		customTextUpdate = "event",
-		-- Upstream defaults this to 0, which in `update` mode is the custom
-		-- function running on every frame. A default that costs frame rate is not
-		-- a default.
-		customTextUpdateThrottle = 0.2,
+		-- The three customText* keys are deliberately absent, not seeded. Their
+		-- defaults belong to the region prototype, which owns the function for
+		-- every region type -- and for the source itself a nil is what tells the
+		-- options renderer this has never been configured, where "" means the user
+		-- cleared it and it stays cleared.
 		anchorFrameType = "SCREEN",
 		selfPoint = "CENTER",
 		anchorPoint = "CENTER",
@@ -2180,45 +2129,6 @@ WA.RegisterRegionType("text", {
 			})
 			if not collapsed then
 				for i = 1, table.getn(formatFields) do table.insert(fields, formatFields[i]) end
-			end
-		end
-
-		-- The custom-text editor appears once something in the text asks for it,
-		-- which is also how the connection between %c and this block is taught.
-		if WA.ContainsCustomPlaceHolder(data.displayText) then
-			table.insert(fields, { type = "header", name = "Custom Text" })
-			table.insert(fields, {
-				type = "code", name = "Custom Text Function", key = "customText", height = 160,
-				get = function() return data.customText or "" end,
-				set = function(v) data.customText = v; WA.Add(data, true) end,
-				default = CUSTOM_TEXT_DEFAULT,
-				-- The same wrapper compileCustomText uses, so the reported line
-				-- numbers match what the user is looking at ("return " carries no
-				-- newline).
-				validate = function(txt)
-					return WA.Widgets.LuaSyntaxError("return " .. (txt or ""), "custom text")
-				end,
-			})
-			table.insert(fields, {
-				type = "select", name = "Update on", key = "customTextUpdate",
-				values = { "event", "update" },
-				labels = { event = "Every state change", update = "Every frame" },
-				get = function() return data.customTextUpdate or "event" end,
-				set = function(v)
-					data.customTextUpdate = v
-					WA.Add(data, true)
-					-- Repaints the tab: the throttle below decides nothing outside
-					-- the per-frame mode.
-					WA.RefreshOptions()
-				end,
-			})
-			if data.customTextUpdate == "update" then
-				table.insert(fields, {
-					type = "range", name = "Throttle (seconds)", key = "customTextUpdateThrottle",
-					min = 0, max = 2, step = 0.05,
-					get = function() return data.customTextUpdateThrottle end,
-					set = function(v) data.customTextUpdateThrottle = v; WA.Add(data, true) end,
-				})
 			end
 		end
 

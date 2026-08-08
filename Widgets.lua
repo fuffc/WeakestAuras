@@ -29,12 +29,17 @@
 -- the hidden rows hold.
 -- A `range` is a spin box (LibWidgets.NewSpinBox), not a bare slider: `min`/
 -- `max`/`step` drive the track, and the value is typeable inside it.
--- `code` is a `multiline` for user-authored Lua: syntax-coloured on blur, with
+-- `code` is a `multiline` for user-authored Lua: syntax-coloured per keystroke
+-- unless WeakestAurasDB.codeEditorLive is turned off (/wa codelive), in which
+-- case colouring waits for blur. With
 -- `height`, `validate(text) -> errOrNil` (a red line under the box, re-run on
 -- every keystroke -- W.LuaSyntaxError is what both call sites pass) and
 -- `default` (string or function; adds a two-click-confirm Reset button that
--- seeds the box back to it). The error line and Reset belong to the widget
--- (LibWidgets.NewCodeEditBox), not to this renderer.
+-- seeds the box back to it, and is what a never-configured field opens at --
+-- committed, not just shown, which is why a `code` field's `get` returns the
+-- raw stored value rather than `... or ""`: nil means never set, "" means the
+-- user cleared it and must stay cleared). The error line and Reset belong to
+-- the widget (LibWidgets.NewCodeEditBox), not to this renderer.
 -- `spell` renders a spell-name/ID box with a live icon preview (numeric -> its
 -- spell icon); `item` is the same idea keyed by WA.ResolveItemID/GetItemInfo
 -- instead. `icon` is the same box but stores a resolved texture path (a
@@ -131,7 +136,7 @@ end
 W.LIBWIDGETS_REQUIRED = {
 	"NewButton", "NewIconButton", "NewCheckBox", "NewColorSwatch", "NewTextBox",
 	"NewMultiLineEditBox", "NewScrollFrame", "NewScrollBar", "NewSpinBox", "NewDropButton",
-	"NewListEditor", "NewIconPicker", "GetIconDatabase", "CloseAllMenus",
+	"NewListEditor", "NewIconPicker", "GetIconDatabase", "CloseAllMenus", "ClearFocus",
 	"FormatNumber", "BarTexturePath",
 	"LuaColorize", "LuaEncode", "LuaDecode", "LuaStripColors",
 	"LuaPadWithLinebreaks", "LuaNextToken", "NewCodeEditBox",
@@ -711,11 +716,14 @@ local function poolCode(page, f, width, height)
 	-- previous field's validator against this field's text.
 	box.bind.onChange, box.bind.onCommit, box.bind.validate = nil, nil, nil
 	box.setSize(width, height)
-	-- Live colouring is opt-in and off by default.
-	-- Read per paint rather than at construction, so /wa codelive takes effect
-	-- on the next repaint instead of needing a reload.
+	-- Read per paint rather than at construction, so /wa codelive takes effect on
+	-- the next repaint instead of needing a reload. `false` is a real stored
+	-- value, so this can't collapse to `or true` -- only an unset (nil) setting
+	-- falls back to the default, the same shape as the tab width below.
 	if box.setLive then
-		box.setLive(WeakestAurasDB and WeakestAurasDB.codeEditorLive)
+		local liveOn = WeakestAurasDB and WeakestAurasDB.codeEditorLive
+		if liveOn == nil then liveOn = true end
+		box.setLive(liveOn)
 	end
 	if box.setFontSize then
 		box.setFontSize((WeakestAurasDB and WeakestAurasDB.codeEditorFontSize) or W.CODE_FONT_SIZE)
@@ -730,10 +738,29 @@ local function poolCode(page, f, width, height)
 	-- setDefault also disarms, so a Reset primed for the field this box served
 	-- in the last paint can never commit against the one it lands on now.
 	box.setDefault(f.default)
-	box.setText(f.get() or "")
+	-- A field that has never been configured opens *at* its Reset default rather
+	-- than empty: an empty box runs nothing and teaches nothing, and the default
+	-- is the signature the user has to start from either way. It is committed,
+	-- not merely displayed -- a box showing logic the aura is not running is
+	-- worse than an empty one -- so it goes through `set` once the binds are
+	-- back.
+	--
+	-- "Never configured" is `get` returning nil, and the distinction from "" is
+	-- load-bearing: seeding an empty *string* would put the default back every
+	-- time the user cleared the box, which makes an emptied code field
+	-- impossible to keep. A `code` field's `get` must therefore return the raw
+	-- stored value, not `... or ""`.
+	local stored = f.get()
+	local seeding = (stored == nil and f.default ~= nil)
+	local text = stored or ""
+	if seeding then
+		text = (type(f.default) == "function" and f.default() or f.default) or ""
+	end
+	box.setText(text)
 	box.bind.validate = f.validate
 	box.bind.onCommit = f.set
 	box.bind.onChange = f.onChange
+	if seeding and f.set then f.set(text) end
 	-- The seed above ran with no validator bound; drive the error line now that
 	-- the real one is in place.
 	box.revalidate()
@@ -1029,7 +1056,10 @@ function W.BuildOptions(page, fields)
 	-- page, so the sweep below can't take it down: an open menu would survive the
 	-- repaint and float over the new controls. Closing it here rather than
 	-- relying on the caller is what lets the invariant below hold for *every*
-	-- widget this page owns.
+	-- widget this page owns. It also drops edit focus, which has to happen
+	-- before anything below re-seeds a pooled box -- a commit-on-blur editor
+	-- reached by the seed first would have the user's unsaved text overwritten
+	-- by the stored value and only then be asked to commit it.
 	LibWidgets.CloseAllMenus()
 	-- Everything on the page goes down before anything comes back up, and
 	-- `acquire` re-Shows only what this paint actually uses. Hiding up front
