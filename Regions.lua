@@ -470,6 +470,7 @@ WA.RegisterRegionType("icon", {
 		frameStrata = 1,
 	},
 	icon = "Interface\\Icons\\INV_Misc_QuestionMark",
+	getSubRegionAnchors = function() return ICON_SUB_ANCHORS end,
 	-- List-row preview: the resolved icon (WA.ResolveDisplayIcon, Data.lua) at
 	-- the saved zoom, same texcoord rule as the runtime region's own SetZoom.
 	createThumbnail = function(parent)
@@ -561,10 +562,28 @@ WA.RegisterRegionType("icon", {
 		iconTex:SetAllPoints(region)
 		iconTex:SetTexCoord(0.07, 0.93, 0.07, 0.93)
 		region.iconTex = iconTex
+		local inner = CreateFrame("Frame", nil, region)
+		local outer = CreateFrame("Frame", nil, region)
+		region.inner, region.outer = inner, outer
+		function region:UpdateInnerOuterSize()
+			local w, h = self.regionWidth or 0, self.regionHeight or 0
+			inner:ClearAllPoints()
+			inner:SetPoint("TOPLEFT", self, "TOPLEFT", w * 0.1, -h * 0.1)
+			inner:SetPoint("BOTTOMRIGHT", self, "BOTTOMRIGHT", -w * 0.1, h * 0.1)
+			outer:ClearAllPoints()
+			outer:SetPoint("TOPLEFT", self, "TOPLEFT", -w * 0.05, h * 0.05)
+			outer:SetPoint("BOTTOMRIGHT", self, "BOTTOMRIGHT", w * 0.05, -h * 0.05)
+		end
 
 		region.swipe = WA.regionPrototype.CreateSwipe(region)
 
 		WA.regionPrototype.create(region)
+		function region:GetSubAnchorTarget(key)
+			if key == "region" or key == "ALL" then return self end
+			if string.find(key, "^INNER_") then return self.inner end
+			if string.find(key, "^OUTER_") then return self.outer end
+			return self.iconTex or self
+		end
 
 		-- Reads region.state (set by the state machine) -- replaces the old
 		-- updateState(region, state, data). Text (countdown/stacks) rides on
@@ -598,8 +617,8 @@ WA.RegisterRegionType("icon", {
 		-- Both dimensions feed the swipe's square sizing (SizeSwipe centers a
 		-- min(width,height) square rather than stretching non-uniformly), so
 		-- either setter re-runs it with the latest known value of the other.
-		function region:SetRegionWidth(w) self.regionWidth = w; self:SetWidth(w); WA.regionPrototype.SizeSwipe(self.swipe, w, self.regionHeight) end
-		function region:SetRegionHeight(h) self.regionHeight = h; self:SetHeight(h); WA.regionPrototype.SizeSwipe(self.swipe, self.regionWidth, h) end
+		function region:SetRegionWidth(w) self.regionWidth = w; self:SetWidth(w); self:UpdateInnerOuterSize(); WA.regionPrototype.SizeSwipe(self.swipe, w, self.regionHeight) end
+		function region:SetRegionHeight(h) self.regionHeight = h; self:SetHeight(h); self:UpdateInnerOuterSize(); WA.regionPrototype.SizeSwipe(self.swipe, self.regionWidth, h) end
 		function region:SetDesaturated(b) self.iconTex:SetDesaturated(b and true or false) end
 		function region:Color(r, g, b, a) self.iconTex:SetVertexColor(r, g, b, a or 1) end
 		-- Off clears the swipe now; on re-drives from the current state (if any).
@@ -681,10 +700,10 @@ local ICON_SIDES = { "LEFT", "RIGHT" }
 
 -- Condition properties render `values` as a key -> label map (the key is what
 -- gets stored and passed to the setter), unlike the options `select` widget's
--- plain array -- so this can't just point at LibWidgets.BAR_TEXTURES itself.
+-- plain array -- so this can't just point at W.BarTextures() itself.
 -- Texture names are their own labels; derived so the two lists can't drift.
 local BAR_TEXTURE_LABELS = {}
-for _, name in ipairs(LibWidgets.BAR_TEXTURES) do
+for _, name in ipairs(WA.Widgets.BarTextures()) do
 	BAR_TEXTURE_LABELS[name] = name
 end
 
@@ -695,6 +714,42 @@ end
 local function isInverse(o)
 	return string.find(o, "INVERSE") ~= nil
 end
+
+local function regionAnchor(display, point, area)
+	return { display = display, point = point, area = area }
+end
+
+local ICON_SUB_ANCHORS = {
+	TOPLEFT = regionAnchor("Edge / Top Left", true), TOP = regionAnchor("Edge / Top", true), TOPRIGHT = regionAnchor("Edge / Top Right", true),
+	LEFT = regionAnchor("Edge / Left", true), CENTER = regionAnchor("Center", true), RIGHT = regionAnchor("Edge / Right", true),
+	BOTTOMLEFT = regionAnchor("Edge / Bottom Left", true), BOTTOM = regionAnchor("Edge / Bottom", true), BOTTOMRIGHT = regionAnchor("Edge / Bottom Right", true),
+	INNER_TOPLEFT = regionAnchor("Inner / Top Left", true), INNER_TOP = regionAnchor("Inner / Top", true), INNER_TOPRIGHT = regionAnchor("Inner / Top Right", true),
+	INNER_LEFT = regionAnchor("Inner / Left", true), INNER_CENTER = regionAnchor("Inner / Center", true), INNER_RIGHT = regionAnchor("Inner / Right", true),
+	INNER_BOTTOMLEFT = regionAnchor("Inner / Bottom Left", true), INNER_BOTTOM = regionAnchor("Inner / Bottom", true), INNER_BOTTOMRIGHT = regionAnchor("Inner / Bottom Right", true),
+	OUTER_TOPLEFT = regionAnchor("Outer / Top Left", true), OUTER_TOP = regionAnchor("Outer / Top", true), OUTER_TOPRIGHT = regionAnchor("Outer / Top Right", true),
+	OUTER_LEFT = regionAnchor("Outer / Left", true), OUTER_CENTER = regionAnchor("Outer / Center", true), OUTER_RIGHT = regionAnchor("Outer / Right", true),
+	OUTER_BOTTOMLEFT = regionAnchor("Outer / Bottom Left", true), OUTER_BOTTOM = regionAnchor("Outer / Bottom", true), OUTER_BOTTOMRIGHT = regionAnchor("Outer / Bottom Right", true),
+	ALL = regionAnchor("Whole area", nil, true),
+}
+
+local function progressbarAnchor(display, point, area)
+	return { display = display, point = point, area = area }
+end
+
+local PROGRESSBAR_SUB_ANCHORS = {
+	TOPLEFT = progressbarAnchor("Background / Top Left", true), TOP = progressbarAnchor("Background / Top", true), TOPRIGHT = progressbarAnchor("Background / Top Right", true),
+	LEFT = progressbarAnchor("Background / Left", true), CENTER = progressbarAnchor("Background / Center", true), RIGHT = progressbarAnchor("Background / Right", true),
+	BOTTOMLEFT = progressbarAnchor("Background / Bottom Left", true), BOTTOM = progressbarAnchor("Background / Bottom", true), BOTTOMRIGHT = progressbarAnchor("Background / Bottom Right", true),
+	INNER_TOPLEFT = progressbarAnchor("Background inner / Top Left", true), INNER_TOP = progressbarAnchor("Background inner / Top", true), INNER_TOPRIGHT = progressbarAnchor("Background inner / Top Right", true),
+	INNER_LEFT = progressbarAnchor("Background inner / Left", true), INNER_CENTER = progressbarAnchor("Background inner / Center", true), INNER_RIGHT = progressbarAnchor("Background inner / Right", true),
+	INNER_BOTTOMLEFT = progressbarAnchor("Background inner / Bottom Left", true), INNER_BOTTOM = progressbarAnchor("Background inner / Bottom", true), INNER_BOTTOMRIGHT = progressbarAnchor("Background inner / Bottom Right", true),
+	ICON_TOPLEFT = progressbarAnchor("Icon / Top Left", true), ICON_TOP = progressbarAnchor("Icon / Top", true), ICON_TOPRIGHT = progressbarAnchor("Icon / Top Right", true),
+	ICON_LEFT = progressbarAnchor("Icon / Left", true), ICON_CENTER = progressbarAnchor("Icon / Center", true), ICON_RIGHT = progressbarAnchor("Icon / Right", true),
+	ICON_BOTTOMLEFT = progressbarAnchor("Icon / Bottom Left", true), ICON_BOTTOM = progressbarAnchor("Icon / Bottom", true), ICON_BOTTOMRIGHT = progressbarAnchor("Icon / Bottom Right", true),
+	SPARK = progressbarAnchor("Spark", true),
+	bar = progressbarAnchor("Full bar", true, true), icon = progressbarAnchor("Icon", true, true),
+	fg = progressbarAnchor("Foreground", true, true), bg = progressbarAnchor("Background", true, true),
+}
 
 -- Which two corners of the bar the fill is pinned to. The pair is always the
 -- edge the texture's u = 0 lands on below, so the fill grows away from it.
@@ -1065,6 +1120,7 @@ WA.RegisterRegionType("progressbar", {
 		frameStrata = 1,
 	},
 	icon = "Interface\\Icons\\Spell_Nature_TimeStop",
+	getSubRegionAnchors = function() return PROGRESSBAR_SUB_ANCHORS end,
 	-- List-row preview: a background + a fill sized to a fraction of the bar
 	-- along the orientation's axis, an icon square carved out on icon_side when
 	-- shown. Not the runtime's cropped-texcoord bar (layoutBar/fillBar above) --
@@ -1213,7 +1269,7 @@ WA.RegisterRegionType("progressbar", {
 				set = function(v) data.textureInput = v; WA.Add(data, true) end,
 			} or {
 				type = "select", name = "Bar texture", key = "texture",
-				values = LibWidgets.BAR_TEXTURES, swatches = W.BarTextureSwatches(),
+				values = W.BarTextures(), swatches = W.BarTextureSwatches(),
 				get = function() return data.texture end,
 				set = function(v) data.texture = v; WA.Add(data, true) end,
 			},
@@ -1521,6 +1577,15 @@ WA.RegisterRegionType("progressbar", {
 		region.subRegionAnchor = bar
 
 		WA.regionPrototype.create(region)
+		function region:GetSubAnchorTarget(key)
+			if key == "region" or key == "bar" then return self.bar end
+			if key == "icon" then return self.iconFrame end
+			if key == "fg" then return self.fg end
+			if key == "bg" then return self.bg end
+			if key == "spark" or key == "SPARK" then return self.spark end
+			if string.find(key, "^ICON_") then return self.iconFrame end
+			return self.bar
+		end
 
 		-- Name/time text rides on %n/%p subtext elements; this only paints the
 		-- icon + drives the fill (below). The %c refresh goes first so every

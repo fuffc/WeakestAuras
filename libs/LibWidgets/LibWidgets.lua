@@ -16,6 +16,14 @@
 -- auto-scroll -- and an optional add row built from NewButton + NewTextBox).
 -- Further widgets are expected to join it under the same library name.
 --
+-- NewAnchorGrid is a nine-point anchor picker: a bordered 3x3 grid of small
+-- buttons whose selected point is highlighted. spec:
+--   values       -- ordered nine point values, row-major
+--   get()        -- optional initial value
+--   onSelect(v)  -- called when a point is picked
+--   width/height -- optional outer size (defaults to 100x50)
+-- Returns the frame with `.setValue(v)` and `.setSize(width, height)` methods.
+--
 -- NewCodeEditBox decorates NewMultiLineEditBox into a syntax-coloured Lua
 -- editor: it colours on blur (never while typing, so the caret never lands
 -- inside a colour escape), carries its own red error line under the box, and
@@ -315,7 +323,7 @@
 -- Returns { height = <total pixel height used below (x,y)>, refresh = fn,
 --           frame = <the list's outer frame> }.
 
-local MAJOR, MINOR = "LibWidgets-1.0", 16
+local MAJOR, MINOR = "LibWidgets-1.0", 17
 -- Bind the global only on the winning copy. NewLibrary returns nil for a copy
 -- that loses the version race; assigning that nil straight to the global would
 -- wipe out the winner's binding (an older/equal copy loading last nulls it),
@@ -594,6 +602,73 @@ function LibWidgets.NewCheckBox(parent, spec)
 	function cb.setChecked(on) cb:SetChecked(on and true or false) end
 	if spec.get then cb:SetChecked(spec.get() and true or false) end
 	return cb
+end
+
+-- A compact nine-point anchor picker. The outer frame owns the border and the
+-- buttons are created once; repainting only changes their points, colour and
+-- selected state, so a consumer can safely pool the whole widget.
+function LibWidgets.NewAnchorGrid(parent, spec)
+	spec = spec or {}
+	local frame = CreateFrame("Frame", nil, parent)
+	frame:SetWidth(spec.width or 100)
+	frame:SetHeight(spec.height or 50)
+	frame:SetBackdrop({
+		bgFile = "Interface\\Buttons\\WHITE8X8",
+		edgeFile = "Interface\\Buttons\\WHITE8X8",
+		tile = true, tileEdge = true, edgeSize = 1,
+	})
+	frame:SetBackdropColor(0.2, 0.2, 0.2, 0.5)
+	frame:SetBackdropBorderColor(1, 1, 1, 0.6)
+	local buttons = {}
+	local values = spec.values or {}
+	local bindValue = spec.get
+	local bindSelect = spec.onSelect
+	for i = 1, 9 do
+		local index = i
+		local b = CreateFrame("Button", nil, frame)
+		b:SetWidth(10); b:SetHeight(10)
+		local t = b:CreateTexture(nil, "ARTWORK")
+		t:SetAllPoints(b)
+		b.texture = t
+		b:SetScript("OnClick", function()
+			LibWidgets.CloseAllMenus()
+			local value = values[index]
+			if frame.setValue then frame.setValue(value) end
+			if bindSelect then bindSelect(value) end
+		end)
+		buttons[i] = b
+	end
+	local function layout()
+		local width, height = frame:GetWidth(), frame:GetHeight()
+		for i = 1, 9 do
+			local b = buttons[i]
+			b:ClearAllPoints()
+			b:SetPoint("CENTER", frame, values[i])
+		end
+	end
+	local function paint(value)
+		for i = 1, 9 do
+			local selected = values[i] == value
+			if selected then
+				buttons[i].texture:SetTexture(0.95, 0.75, 0.15, 1)
+			else
+				buttons[i].texture:SetTexture(0.5, 0.5, 0.5, 0.9)
+			end
+		end
+		frame.value = value
+	end
+	function frame.setValue(value) paint(value) end
+	function frame.setBindings(newValues, get, onSelect)
+		values = newValues or values
+		bindValue, bindSelect = get, onSelect
+	end
+	function frame.setSize(width, height)
+		frame:SetWidth(width); frame:SetHeight(height); layout()
+	end
+	frame.buttons = buttons
+	layout()
+	paint(bindValue and bindValue())
+	return frame
 end
 
 -- A colour swatch opening the stock ColorPickerFrame; see the header comment

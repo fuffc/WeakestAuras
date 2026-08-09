@@ -5,7 +5,7 @@
 -- WA.Widgets.BuildOptions(page, fields) paints a whole tab's controls from a
 -- plain array of field descriptors instead of hand-building a frame per field:
 --   { type = "header"|"disclosure"|"toggle"|"input"|"multiline"|"range"|"select"
---            |"color"|"spell"|"item"|"icon"|"namelist"|"opnumber"|"button"|"menu",
+--            |"color"|"spell"|"item"|"icon"|"namelist"|"opnumber"|"button"|"menu"|"anchorgrid",
 --     name = "...",
 --     key = "...",         -- stable field id, see below; omitted for header/button
 --     get = function() end, set = function(value) end,   -- color: get/set a {r,g,b,a}
@@ -113,11 +113,34 @@ function W.BarTexturePath(name)
 	return LibWidgets.BarTexturePath(W.BAR_TEXTURE_DIR, name)
 end
 
+-- Bar textures this addon ships on top of LibWidgets' shared set. They stay
+-- here rather than in LibWidgets.BAR_TEXTURES because that list is shared by
+-- every addon vendoring the library, and only this one ships these files -- a
+-- name added there would offer the other consumers a texture that resolves to
+-- nothing.
+local EXTRA_BAR_TEXTURES = { "Clean", "Stripes", "ThinStripes", "ThickStripes" }
+
+-- LibWidgets' set plus ours, built once. Every consumer of the bar list reads
+-- this rather than LibWidgets.BAR_TEXTURES directly, or the two drift.
+function W.BarTextures()
+	if not W.barTextures then
+		W.barTextures = {}
+		local shared = LibWidgets.BAR_TEXTURES or {}
+		for i = 1, table.getn(shared) do
+			table.insert(W.barTextures, shared[i])
+		end
+		for i = 1, table.getn(EXTRA_BAR_TEXTURES) do
+			table.insert(W.barTextures, EXTRA_BAR_TEXTURES[i])
+		end
+	end
+	return W.barTextures
+end
+
 -- value -> path map for a `select` field's `swatches`, built once.
 function W.BarTextureSwatches()
 	if not W.barSwatches then
 		W.barSwatches = {}
-		local list = LibWidgets.BAR_TEXTURES or {}
+		local list = W.BarTextures()
 		for i = 1, table.getn(list) do
 			W.barSwatches[list[i]] = W.BarTexturePath(list[i])
 		end
@@ -139,7 +162,7 @@ W.LIBWIDGETS_REQUIRED = {
 	"NewListEditor", "NewIconPicker", "GetIconDatabase", "CloseAllMenus", "ClearFocus",
 	"FormatNumber", "BarTexturePath",
 	"LuaColorize", "LuaEncode", "LuaDecode", "LuaStripColors",
-	"LuaPadWithLinebreaks", "LuaNextToken", "NewCodeEditBox",
+	"LuaPadWithLinebreaks", "LuaNextToken", "NewCodeEditBox", "NewAnchorGrid",
 }
 W.libWidgetsMissing = {}
 for i = 1, table.getn(W.LIBWIDGETS_REQUIRED) do
@@ -650,6 +673,26 @@ local function poolDropdown(page, width, values, labels, onSelect, get, swatches
 	return d
 end
 
+local function poolAnchorGrid(page, f, width)
+	local grid = acquire(page, "anchorgrid", function()
+		local bind = {}
+		local w = LibWidgets.NewAnchorGrid(page, {
+			values = f.values,
+			get = function() return bind.get and bind.get() end,
+			onSelect = function(v) if bind.set then bind.set(v) end end,
+		})
+		w.bind = bind
+		return w
+	end)
+	grid.bind.get = f.get
+	grid.bind.set = f.set
+	grid.setBindings(f.values, function() return grid.bind.get and grid.bind.get() end,
+		function(v) if grid.bind.set then grid.bind.set(v) end end)
+	grid.setSize(f.width or 100, f.height or 50)
+	grid.setValue(f.get())
+	return grid
+end
+
 -- A drop button whose face never changes: it names an action and its entries
 -- are the choices. NewDropButton repaints the face from the picked value only
 -- when given a `get`, so omitting one leaves the face entirely to setValue --
@@ -1042,6 +1085,33 @@ local function placeField(page, f, x, y, w)
 		local d = poolMenuButton(page, f.width or w, f.name, f.values, f.labels, f.onSelect)
 		d:SetPoint("TOPLEFT", x, y)
 		return 28
+	elseif f.type == "anchorgrid" then
+		local label = poolLabel(page, f.name)
+		label:SetPoint("TOPLEFT", x, y)
+		local gw = f.width or w
+		local grid = poolAnchorGrid(page, f, gw)
+		grid:SetPoint("TOPLEFT", x, y - 16)
+		return 16 + (f.height or 50) + 8
+	elseif f.type == "anchorlayout" then
+		local grid = f.grid
+		local gridW = grid.width or 100
+		local gridH = grid.height or 50
+		local anchor = poolLabel(page, grid.name)
+		anchor:SetPoint("TOPLEFT", x, y)
+		local anchorGrid = poolAnchorGrid(page, grid, gridW)
+		anchorGrid:SetPoint("TOPLEFT", x, y - 16)
+		local sideX = x + gridW + 12
+		local sideW = w - gridW - 12
+		if sideW < 90 then sideW = 90 end
+		local sideY = y
+		local sideHeight = 0
+		for i = 1, table.getn(f.sideFields or {}) do
+			local used = placeField(page, f.sideFields[i], sideX, sideY, sideW)
+			sideY = sideY - used
+			sideHeight = sideHeight + used
+		end
+		local gridHeight = 16 + gridH + 8
+		return gridHeight > sideHeight and gridHeight or sideHeight
 	end
 	return 0
 end

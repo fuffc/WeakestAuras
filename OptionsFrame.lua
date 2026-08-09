@@ -844,7 +844,8 @@ function S.appendDisplayEffectsOptions(fields, data)
 				local spec = WA.subRegionTypes[name]
 				if not spec then return end
 				data.subRegions = data.subRegions or {}
-				table.insert(data.subRegions, copySubDefault(spec.default))
+				local default = spec.defaultFor and spec.defaultFor(data.regionType) or spec.default
+				table.insert(data.subRegions, copySubDefault(default))
 				-- Open the one just added -- it's what the user is about to edit.
 				S.setCollapsed(data, "sub:" .. table.getn(data.subRegions), false)
 				WA.Add(data)

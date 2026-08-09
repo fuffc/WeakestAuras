@@ -540,6 +540,148 @@ function proto.AnchorArea(region, parent, inset)
 	region:SetPoint("BOTTOMRIGHT", parent, "BOTTOMRIGHT", inset, -inset)
 end
 
+local function subRegionAnchorValue(parentData, subData, key, fallback)
+	local value = subData[key]
+	if value ~= nil then return value end
+	return fallback
+end
+
+function proto.GetSubRegionAnchorTarget(parent, key)
+	if parent.GetSubAnchorTarget then
+		return parent:GetSubAnchorTarget(key)
+	end
+	return parent
+end
+
+function proto.GetSubRegionAnchorPoint(key, fallback)
+	if not key or key == "region" or key == "bar" or key == "icon" or key == "fg" or key == "bg" or key == "SPARK" then
+		return fallback or "CENTER"
+	end
+	local point = string.gsub(key, "^ICON_", "")
+	point = string.gsub(point, "^INNER_", "")
+	point = string.gsub(point, "^OUTER_", "")
+	return point
+end
+
+function proto.GetSubRegionAnchors(parentData, mode)
+	local spec = WA.RegionSpecFor(parentData)
+	local anchors = spec and spec.getSubRegionAnchors and spec.getSubRegionAnchors(parentData) or {}
+	local copy = { region = { display = "Whole region", point = true, area = true } }
+	for key, anchor in pairs(anchors) do copy[key] = anchor end
+	anchors = copy
+	local values, labels = {}, {}
+	for key, anchor in pairs(anchors) do
+		if anchor[mode] then
+			table.insert(values, key)
+			labels[key] = anchor.display or key
+		end
+	end
+	table.sort(values)
+	return values, labels
+end
+
+function proto.AnchorSubRegion(frame, parent, subData, defaults)
+	defaults = defaults or {}
+	local mode = defaults.areaOnly and "area" or (subData.anchor_mode or defaults.mode or "point")
+	local targetKey
+	local targetPoint
+	local selfPoint
+	local xOffset
+	local yOffset
+	if mode == "area" then
+		targetKey = subRegionAnchorValue(parent, subData, "anchor_area", defaults.areaTarget or "region")
+		xOffset = subRegionAnchorValue(parent, subData, "anchorXOffset", subData.border_offset or defaults.x or 0)
+		yOffset = subRegionAnchorValue(parent, subData, "anchorYOffset", subData.border_offset or defaults.y or 0)
+	else
+		targetKey = subRegionAnchorValue(parent, subData, "anchor_target", defaults.target or "region")
+		if subData.anchor_point then
+			targetPoint = subData.anchor_point
+		elseif subData.anchor_target then
+			targetPoint = proto.GetSubRegionAnchorPoint(targetKey, defaults.anchorPoint)
+		else
+			targetPoint = subRegionAnchorValue(parent, subData, "anchor_point", subData.text_anchorPoint or defaults.anchorPoint or "CENTER")
+		end
+		selfPoint = subRegionAnchorValue(parent, subData, "self_point", defaults.selfPoint or targetPoint or "CENTER")
+		xOffset = subRegionAnchorValue(parent, subData, "anchorXOffset", defaults.x or 0)
+		yOffset = subRegionAnchorValue(parent, subData, "anchorYOffset", defaults.y or 0)
+	end
+
+	local target = proto.GetSubRegionAnchorTarget(parent, targetKey)
+	if not target then target = parent end
+	frame:ClearAllPoints()
+	if mode == "area" then
+		frame:SetPoint("TOPLEFT", target, "TOPLEFT", -xOffset, yOffset)
+		frame:SetPoint("BOTTOMRIGHT", target, "BOTTOMRIGHT", xOffset, -yOffset)
+	else
+		frame:SetPoint(selfPoint or "CENTER", target, targetPoint or "CENTER", xOffset, yOffset)
+	end
+end
+
+function proto.SubRegionAnchorFields(parentData, subData, defaults)
+	defaults = defaults or {}
+	local fields = {}
+	local modeField = {
+			type = "select", name = "Anchor mode", key = "anchor_mode",
+			values = { "point", "area" },
+			labels = { point = "Point", area = "Area" },
+			get = function() return subData.anchor_mode or defaults.mode or "point" end,
+			set = function(v)
+				subData.anchor_mode = v
+				WA.Add(parentData, true)
+				WA.RefreshOptions()
+			end,
+	}
+
+	local mode = defaults.areaOnly and "area" or (subData.anchor_mode or defaults.mode or "point")
+	if mode == "area" then
+		if not defaults.areaOnly then table.insert(fields, modeField) end
+		local values, labels = proto.GetSubRegionAnchors(parentData, "area")
+		table.insert(fields, {
+			type = "select", name = "Area", key = "anchor_area", values = values, labels = labels,
+			get = function() return subData.anchor_area or defaults.areaTarget or "region" end,
+			set = function(v) subData.anchor_area = v; WA.Add(parentData, true) end,
+		})
+	else
+		local values, labels = proto.GetSubRegionAnchors(parentData, "point")
+		local targetField = {
+			type = "select", name = "Target", key = "anchor_target", values = values, labels = labels,
+			get = function() return subData.anchor_target or defaults.target or "region" end,
+			set = function(v)
+				subData.anchor_target = v
+				local point = proto.GetSubRegionAnchorPoint(v)
+				subData.anchor_point, subData.self_point = point, point
+				WA.Add(parentData, true)
+			end,
+		}
+		table.insert(fields, {
+			type = "anchorlayout", grid = {
+				type = "anchorgrid", name = "Anchor", key = "self_point",
+				values = proto.anchorGridPoints, width = 100, height = 50,
+				get = function() return subData.self_point or defaults.selfPoint or "CENTER" end,
+				set = function(v)
+					subData.anchor_point, subData.self_point = v, v
+					WA.Add(parentData, true)
+				end,
+			},
+			sideFields = { modeField, targetField },
+		})
+	end
+
+	table.insert(fields, {
+		type = "range", name = mode == "area" and "Extra width" or "X", key = "anchorXOffset", half = true,
+		min = -200, max = 200, step = 1,
+		get = function() return subData.anchorXOffset or defaults.x or 0 end,
+		set = function(v) subData.anchorXOffset = v; WA.Add(parentData, true) end,
+	})
+	table.insert(fields, {
+		type = "range", name = mode == "area" and "Extra height" or "Y", key = "anchorYOffset", half = true,
+		min = -200, max = 200, step = 1, half = true,
+		get = function() return subData.anchorYOffset or defaults.y or 0 end,
+		set = function(v) subData.anchorYOffset = v; WA.Add(parentData, true) end,
+	})
+	return fields
+end
+
 -- Injects the universal conditionable properties into a region type's registry
 -- (§7 AddProperties). Lives beside the setters it names so the two stay honest.
 function proto.AddProperties(properties)
@@ -563,6 +705,8 @@ end
 -- The nine anchor tokens every region's self/anchor point picks from.
 proto.anchorPoints = { "CENTER", "TOP", "BOTTOM", "LEFT", "RIGHT",
 	"TOPLEFT", "TOPRIGHT", "BOTTOMLEFT", "BOTTOMRIGHT" }
+proto.anchorGridPoints = { "TOPLEFT", "TOP", "TOPRIGHT", "LEFT", "CENTER", "RIGHT",
+	"BOTTOMLEFT", "BOTTOM", "BOTTOMRIGHT" }
 
 -- Upstream's frame_strata_types (WA2 Types.lua): 1-based, where 1 is
 -- "Inherited" rather than a real strata. Shared by the Frame strata select
@@ -579,6 +723,220 @@ local FRAME_STRATA_NAMES = {
 	[9] = "TOOLTIP",
 }
 local FRAME_STRATA_VALUES = { 1, 2, 3, 4, 5, 6, 7, 8, 9 }
+
+local ANCHOR_FRAME_TYPES = { "SCREEN", "UIPARENT", "SELECTFRAME", "MOUSE", "NAMEPLATE", "UNITFRAME", "CUSTOM" }
+local ANCHOR_FRAME_LABELS = {
+	SCREEN = "Screen / group",
+	UIPARENT = "UIParent",
+	SELECTFRAME = "Selected frame",
+	MOUSE = "Mouse",
+	NAMEPLATE = "Nameplate",
+	UNITFRAME = "Unit frame",
+	CUSTOM = "Custom",
+}
+local ANCHOR_FRAME_VALUES = { "SCREEN", "UIPARENT", "SELECTFRAME", "MOUSE", "NAMEPLATE", "UNITFRAME", "CUSTOM" }
+
+local hiddenFrames
+local pendingAnchorRetries = {}
+local anchorRetryScheduled
+local mouseAnchorFrame
+local optionsNameplateAnchorFrame
+local mouseAnchorMarker
+local nameplateAnchorMarker
+local dynamicAnchorWatcher
+local nameplateFor
+
+local function moveMouseAnchor()
+	local x, y = GetCursorPosition()
+	local scale = UIParent.GetEffectiveScale and UIParent:GetEffectiveScale() or 1
+	if not scale or scale == 0 then scale = 1 end
+	mouseAnchorFrame:ClearAllPoints()
+	mouseAnchorFrame:SetPoint("CENTER", UIParent, "BOTTOMLEFT", x / scale, y / scale)
+end
+
+local function hiddenAnchorFrame()
+	if not hiddenFrames then
+		hiddenFrames = CreateFrame("Frame", "WeakestAurasHiddenFrames", UIParent)
+		hiddenFrames:SetWidth(1)
+		hiddenFrames:SetHeight(1)
+		hiddenFrames:Hide()
+		WA.HiddenFrames = hiddenFrames
+	end
+	return hiddenFrames
+end
+
+local function createMouseAnchorFrame()
+	if mouseAnchorFrame then return mouseAnchorFrame end
+	mouseAnchorFrame = CreateFrame("Frame", "WeakestAurasMouseAnchor", UIParent)
+	mouseAnchorFrame:SetWidth(1)
+	mouseAnchorFrame:SetHeight(1)
+	mouseAnchorFrame:Hide()
+	mouseAnchorMarker = CreateFrame("Frame", nil, mouseAnchorFrame)
+	mouseAnchorMarker:SetWidth(92)
+	mouseAnchorMarker:SetHeight(28)
+	mouseAnchorMarker:SetPoint("CENTER", mouseAnchorFrame, "CENTER")
+	mouseAnchorMarker:SetFrameStrata("TOOLTIP")
+	mouseAnchorMarker:SetBackdrop({
+		edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+		edgeSize = 10,
+		insets = { left = 0, right = 0, top = 0, bottom = 0 },
+	})
+	mouseAnchorMarker:SetBackdropBorderColor(1, 0.82, 0, 1)
+	local label = mouseAnchorMarker:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+	label:SetPoint("TOP", mouseAnchorMarker, "BOTTOM", 0, -2)
+	label:SetJustifyH("CENTER")
+	label:SetText("Mouse Anchor")
+	if label.SetTextColor then label:SetTextColor(1, 0.82, 0, 1) end
+	mouseAnchorFrame.mouseAnchorLabel = label
+	mouseAnchorMarker:Hide()
+	mouseAnchorFrame:SetScript("OnUpdate", function()
+		if WA.optionsOpen then return end
+		moveMouseAnchor()
+	end)
+	mouseAnchorFrame:Show()
+	return mouseAnchorFrame
+end
+
+local function xPositionNextToOptions()
+	local panel = getglobal("WeakestAurasOptions")
+	local screenWidth = GetScreenWidth and GetScreenWidth() or 1920
+	if not panel or not panel.GetLeft or not panel.GetRight then return screenWidth / 2 end
+	local left, right = panel:GetLeft(), panel:GetRight()
+	if not left or not right then return screenWidth / 2 end
+	local center = (left + right) / 2
+	if center > screenWidth / 2 then
+		if left > 400 then return left - 200 end
+		return left / 2
+	end
+	if screenWidth - right > 400 then return right + 200 end
+	return (screenWidth + right) / 2
+end
+
+local function positionMouseAnchor()
+	if not mouseAnchorFrame or not WA.optionsOpen then return end
+	local panel = getglobal("WeakestAurasOptions")
+	local top = panel and panel.GetTop and panel:GetTop()
+	local bottom = panel and panel.GetBottom and panel:GetBottom()
+	local y = (top and bottom and (top + bottom) / 2) or (GetScreenHeight() / 2)
+	local x = xPositionNextToOptions()
+	mouseAnchorFrame:ClearAllPoints()
+	mouseAnchorFrame:SetPoint("CENTER", UIParent, "BOTTOMLEFT", x, y)
+end
+
+local function createOptionsNameplateAnchorFrame()
+	if optionsNameplateAnchorFrame then return optionsNameplateAnchorFrame end
+	optionsNameplateAnchorFrame = CreateFrame("Frame", "WeakestAurasNameplateAnchor", UIParent)
+	optionsNameplateAnchorFrame:SetWidth(200)
+	optionsNameplateAnchorFrame:SetHeight(40)
+	optionsNameplateAnchorFrame:SetFrameStrata("TOOLTIP")
+	optionsNameplateAnchorFrame:SetBackdrop({
+		edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+		edgeSize = 12,
+		insets = { left = 0, right = 0, top = 0, bottom = 0 },
+	})
+	optionsNameplateAnchorFrame:SetBackdropBorderColor(0, 1, 0, 1)
+	nameplateAnchorMarker = optionsNameplateAnchorFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+	nameplateAnchorMarker:SetPoint("CENTER", optionsNameplateAnchorFrame, "CENTER")
+	nameplateAnchorMarker:SetJustifyH("CENTER")
+	nameplateAnchorMarker:SetText("Nameplate Anchor")
+	if nameplateAnchorMarker.SetTextColor then nameplateAnchorMarker:SetTextColor(0, 1, 0, 1) end
+	optionsNameplateAnchorFrame:Hide()
+	return optionsNameplateAnchorFrame
+end
+
+local function positionNameplateAnchor()
+	if not optionsNameplateAnchorFrame or not WA.optionsOpen then return end
+	local panel = getglobal("WeakestAurasOptions")
+	local top = panel and panel.GetTop and panel:GetTop()
+	local bottom = panel and panel.GetBottom and panel:GetBottom()
+	local x = panel and panel.GetLeft and panel:GetLeft() or (GetScreenWidth() / 2)
+	local right = panel and panel.GetRight and panel:GetRight()
+	local width = optionsNameplateAnchorFrame:GetWidth() or 200
+	local height = optionsNameplateAnchorFrame:GetHeight() or 40
+	local y = (top and bottom and bottom - 24 - height / 2) or (GetScreenHeight() / 2)
+	if right and x then x = (x + right) / 2 end
+	optionsNameplateAnchorFrame:ClearAllPoints()
+	optionsNameplateAnchorFrame:SetPoint("CENTER", UIParent, "BOTTOMLEFT", x, y)
+end
+
+local function queueAnchorRetry(data)
+	if not data or not data.id then return end
+	pendingAnchorRetries[data.id] = true
+	if anchorRetryScheduled then return end
+	anchorRetryScheduled = true
+	C_Timer.After(1, function()
+		anchorRetryScheduled = nil
+		local retry = pendingAnchorRetries
+		pendingAnchorRetries = {}
+		for id in pairs(retry) do
+			local d = WeakestAurasDB.displays[id]
+			local region = d and WA.PeekRegion(id, "")
+			if d and region then proto.ApplyPosition(region, d) end
+		end
+	end)
+end
+
+function WA.GetAnchorAuraID(data)
+	if not data or data.anchorFrameType ~= "SELECTFRAME" then return nil end
+	local ref = data.anchorFrameFrame
+	if not ref or ref == "" then return nil end
+	local _, _, id = string.find(ref, "^WeakestAuras:(.+)$")
+	if id then return id end
+	if WeakestAurasDB.displays[ref] then return ref end
+	return nil
+end
+
+local function anchorReference(data)
+	local id = WA.GetAnchorAuraID(data)
+	if id then return WA.PeekRegion(id, "") end
+	local ref = data.anchorFrameFrame
+	if not ref or ref == "" then return nil end
+	return getglobal(ref)
+end
+
+local function unitForRegion(region)
+	local state = region and region.state
+	if not state then return nil, nil end
+	return state.unit or state.unitId, state.guid or state.guidUnit
+end
+
+nameplateFor = function(unit, guid)
+	if not C_NamePlate then return nil end
+	if unit and C_NamePlate.GetNamePlateForUnit then
+		local frame = C_NamePlate.GetNamePlateForUnit(unit)
+		if frame then return frame end
+	end
+	if C_NamePlate.GetNamePlateForGUID then
+		if not guid and unit and UnitGUID then guid = UnitGUID(unit) end
+		if guid then return C_NamePlate.GetNamePlateForGUID(guid) end
+	end
+	return nil
+end
+
+function WA.GetUnitFrame(unit)
+	if not unit then return nil end
+	local pf = _G and _G.pfUI
+	local pfuf = pf and pf.uf
+	local probes = {
+		player = function() return pfuf and pfuf.player or getglobal("PlayerFrame") end,
+		target = function() return pfuf and pfuf.target or getglobal("TargetFrame") end,
+		targettarget = function() return pfuf and pfuf.targettarget or getglobal("TargetTargetFrame") end,
+		focus = function() return pfuf and pfuf.focus or getglobal("FocusFrame") end,
+		focustarget = function() return pfuf and pfuf.focustarget or getglobal("FocusTargetFrame") end,
+		pet = function() return pfuf and pfuf.pet or getglobal("PetFrame") end,
+		pettarget = function() return pfuf and pfuf.pettarget or getglobal("PetTargetFrame") end,
+	}
+	local probe = probes[unit]
+	if probe then return probe() end
+	local _, _, n = string.find(unit, "^party(%d+)$")
+	if n then return pfuf and pfuf.group and pfuf.group[tonumber(n)]
+		or getglobal("PartyMemberFrame" .. tostring(n)) end
+	local _, _, raid = string.find(unit, "^raid(%d+)$")
+	if raid and pfuf and pfuf.raid then return pfuf.raid[tonumber(raid)] end
+	local _, _, nameplate = string.find(unit, "^nameplate(%d+)$")
+	if nameplate then return nameplateFor(unit) end
+	return nil
+end
 
 local function FrameStrataField(data)
 	return {
@@ -604,7 +962,8 @@ function proto.ApplyFrameStrata(region, data)
 end
 
 -- Resolves a display's anchor frame and applies its saved anchor tuple. The one
--- place anchor-frame selection lives.
+-- place anchor-frame selection lives (§16). An unresolved target parks the
+-- region on a hidden singleton and schedules one shared retry.
 --   * Grouped child (data.parent is a group): SetParent + anchor to the group
 --     frame's CENTER, so the group's scale cascades and moving/dragging the
 --     group carries its children. xOffset/yOffset are CENTER-relative and
@@ -613,28 +972,167 @@ end
 --   * Top-level (SCREEN): anchor selfPoint to UIParent at data.anchorPoint.
 -- Ensuring the group frame here (WA.GetRegion) means a child applied before its
 -- group still resolves -- the group is created on demand.
-function proto.ApplyPosition(region, data)
+function proto.ResolveAnchor(region, data)
+	local frameType = data.anchorFrameType or "SCREEN"
 	local parentId = data.parent
 	local pdata = parentId and WeakestAurasDB.displays[parentId]
-	if pdata and WA.IsGroup(pdata) then
+	if frameType == "SCREEN" and pdata and WA.IsGroup(pdata) then
 		local groupFrame = WA.GetRegion(parentId, "")
-		if groupFrame then
-			region:SetParent(groupFrame)
-			if pdata.regionType == "dynamicgroup" then
-				-- The grower (Regions.lua layoutDynamicGroup) owns the real
-				-- offset; anchor to CENTER as a baseline until it runs.
-				region:SetAnchor("CENTER", groupFrame, "CENTER")
-				region:SetOffset(0, 0)
-			else
-				region:SetAnchor(data.selfPoint or "CENTER", groupFrame, "CENTER")
-				region:SetOffset(data.xOffset or 0, data.yOffset or 0)
-			end
-			return
-		end
+		if groupFrame then return groupFrame, "CENTER", true end
 	end
-	region:SetParent(UIParent)
-	region:SetAnchor(data.selfPoint or "CENTER", UIParent, data.anchorPoint or "CENTER")
+	if frameType == "SCREEN" or frameType == "UIPARENT" then
+		return UIParent, data.anchorPoint or "CENTER", true
+	elseif frameType == "SELECTFRAME" then
+		local frame = anchorReference(data)
+		if frame then return frame, data.anchorPoint or "CENTER", data.anchorFrameParent ~= false end
+		queueAnchorRetry(data)
+		return hiddenAnchorFrame(), data.anchorPoint or "CENTER", true
+	elseif frameType == "MOUSE" then
+		local frame = createMouseAnchorFrame()
+		if WA.optionsOpen then
+			positionMouseAnchor()
+			if mouseAnchorMarker then mouseAnchorMarker:Show() end
+			return frame, "CENTER", true
+		end
+		return frame, "CENTER", false
+	elseif frameType == "NAMEPLATE" then
+		if WA.optionsOpen then
+			local frame = createOptionsNameplateAnchorFrame()
+			positionNameplateAnchor()
+			frame:Show()
+			if nameplateAnchorMarker then nameplateAnchorMarker:Show() end
+			return frame, data.anchorPoint or "CENTER", true
+		end
+		local unit, guid = unitForRegion(region)
+		local frame = nameplateFor(unit, guid)
+		if frame then return frame, data.anchorPoint or "CENTER", data.anchorFrameParent ~= false end
+		queueAnchorRetry(data)
+		return hiddenAnchorFrame(), data.anchorPoint or "CENTER", true
+	elseif frameType == "UNITFRAME" then
+		local unit = unitForRegion(region)
+		local frame = WA.GetUnitFrame(unit)
+		if frame then return frame, data.anchorPoint or "CENTER", data.anchorFrameParent ~= false end
+		queueAnchorRetry(data)
+		if WA.optionsOpen then return UIParent, data.anchorPoint or "CENTER", true end
+		return hiddenAnchorFrame(), data.anchorPoint or "CENTER", true
+	elseif frameType == "CUSTOM" and data.customAnchor then
+		local fn = region.customAnchorFunc
+		if not fn then
+			fn = WA.LoadFunction(data.customAnchor, tostring(data.id) .. ": custom anchor")
+			region.customAnchorFunc = fn
+		end
+		if fn then
+			local ok, frame = WA.RunAuraFunc(data.id, data.id .. ": custom anchor", fn)
+			if ok and frame then return frame, data.anchorPoint or "CENTER", data.anchorFrameParent ~= false end
+		end
+		return hiddenAnchorFrame(), data.anchorPoint or "CENTER", true
+	end
+	return UIParent, data.anchorPoint or "CENTER", data.anchorFrameParent ~= false
+end
+
+function proto.ReanchorDynamic(frameType)
+	if not WA.ForEachRegion then return end
+	WA.ForEachRegion(function(region)
+		local data = WeakestAurasDB.displays[region.id]
+		if data and (not frameType or data.anchorFrameType == frameType) then
+			if data.anchorFrameType == "MOUSE" or data.anchorFrameType == "NAMEPLATE"
+				or data.anchorFrameType == "UNITFRAME" then
+				proto.ApplyPosition(region, data)
+				proto.ApplyFrameStrata(region, data)
+			end
+		end
+	end)
+	proto.SyncOptionsAnchorMarkers()
+end
+
+function proto.SyncOptionsAnchorMarkers()
+	if not WA.optionsOpen then
+		if mouseAnchorMarker then mouseAnchorMarker:Hide() end
+		if nameplateAnchorMarker then nameplateAnchorMarker:Hide() end
+		if optionsNameplateAnchorFrame then optionsNameplateAnchorFrame:Hide() end
+		return
+	end
+	local mouseVisible, nameplateVisible = false, false
+	if WA.ForEachRegion then
+		WA.ForEachRegion(function(region)
+			local data = WeakestAurasDB.displays[region.id]
+			if data and region.IsShown and region:IsShown() then
+				if data.anchorFrameType == "MOUSE" then mouseVisible = true end
+				if data.anchorFrameType == "NAMEPLATE" then nameplateVisible = true end
+			end
+		end)
+	end
+	if mouseAnchorMarker then
+		if mouseVisible then mouseAnchorMarker:Show() else mouseAnchorMarker:Hide() end
+	end
+	if optionsNameplateAnchorFrame then
+		if nameplateVisible then optionsNameplateAnchorFrame:Show() else optionsNameplateAnchorFrame:Hide() end
+	end
+	if nameplateAnchorMarker then
+		if nameplateVisible then nameplateAnchorMarker:Show() else nameplateAnchorMarker:Hide() end
+	end
+end
+
+function proto.SetOptionsAnchors(open)
+	if open then
+		createMouseAnchorFrame()
+		createOptionsNameplateAnchorFrame()
+		positionMouseAnchor()
+		positionNameplateAnchor()
+		optionsNameplateAnchorFrame:Hide()
+		if mouseAnchorMarker then mouseAnchorMarker:Hide() end
+		proto.ReanchorDynamic("MOUSE")
+		proto.ReanchorDynamic("NAMEPLATE")
+		proto.SyncOptionsAnchorMarkers()
+	else
+		if mouseAnchorFrame then
+			mouseAnchorFrame:SetScript("OnUpdate", function()
+				moveMouseAnchor()
+			end)
+		end
+		if optionsNameplateAnchorFrame then optionsNameplateAnchorFrame:Hide() end
+		if mouseAnchorMarker then mouseAnchorMarker:Hide() end
+		if nameplateAnchorMarker then nameplateAnchorMarker:Hide() end
+		proto.ReanchorDynamic("MOUSE")
+		proto.ReanchorDynamic("NAMEPLATE")
+	end
+end
+
+dynamicAnchorWatcher = CreateFrame("Frame")
+dynamicAnchorWatcher:RegisterEvent("NAME_PLATE_UNIT_ADDED")
+dynamicAnchorWatcher:RegisterEvent("NAME_PLATE_UNIT_REMOVED")
+dynamicAnchorWatcher:RegisterEvent("PLAYER_TARGET_CHANGED")
+dynamicAnchorWatcher:RegisterEvent("PLAYER_FOCUS_CHANGED")
+dynamicAnchorWatcher:RegisterEvent("PARTY_MEMBERS_CHANGED")
+dynamicAnchorWatcher:RegisterEvent("PLAYER_ENTERING_WORLD")
+dynamicAnchorWatcher:SetScript("OnEvent", function()
+	if event == "NAME_PLATE_UNIT_ADDED" or event == "NAME_PLATE_UNIT_REMOVED" then
+		proto.ReanchorDynamic("NAMEPLATE")
+	else
+		proto.ReanchorDynamic("UNITFRAME")
+	end
+end)
+
+function proto.ApplyPosition(region, data)
+	local anchorFrame, anchorPoint, setParent = proto.ResolveAnchor(region, data)
+	local parentId = data.parent
+	local pdata = parentId and WeakestAurasDB.displays[parentId]
+	if setParent then region:SetParent(anchorFrame) else region:SetParent(UIParent) end
+	if pdata and WA.IsGroup(pdata) and data.anchorFrameType == "SCREEN" then
+		if pdata.regionType == "dynamicgroup" then
+			region:SetAnchor("CENTER", anchorFrame, "CENTER")
+			region:SetOffset(0, 0)
+		else
+			region:SetAnchor(data.selfPoint or "CENTER", anchorFrame, anchorPoint)
+			region:SetOffset(data.xOffset or 0, data.yOffset or 0)
+		end
+		return
+	end
+	if data.anchorFrameType == "MOUSE" then anchorPoint = "CENTER" end
+	if pdata and WA.IsGroup(pdata) and data.anchorFrameType == "SCREEN" then anchorPoint = "CENTER" end
+	region:SetAnchor(data.selfPoint or "CENTER", anchorFrame, anchorPoint)
 	region:SetOffset(data.xOffset or 0, data.yOffset or 0)
+	if WA.optionsOpen then proto.SyncOptionsAnchorMarkers() end
 end
 
 -- The Display-tab Position section, shared by every non-group region type so a
@@ -654,17 +1152,34 @@ function proto.PositionOptions(data)
 			FrameStrataField(data),
 		}
 	end
-	return {
+	local fields = {
 		{ type = "header", name = "Position" },
 		{
-			type = "select", name = "Anchor", key = "selfPoint", half = true,
-			values = proto.anchorPoints,
+			type = "select", name = "Anchored to", key = "anchorFrameType",
+			values = ANCHOR_FRAME_VALUES, labels = ANCHOR_FRAME_LABELS,
+			get = function() return data.anchorFrameType or "SCREEN" end,
+			set = function(v)
+				data.anchorFrameType = v
+				WA.Add(data, true)
+				WA.RefreshOptions()
+			end,
+		},
+		{
+			type = "anchorgrid", name = "Anchor", key = "selfPoint", half = true,
+			width = 100, height = 50,
+			values = proto.anchorGridPoints,
 			get = function() return data.selfPoint end,
 			set = function(v) data.selfPoint = v; WA.Add(data, true) end,
 		},
 		{
-			type = "select", name = "To screen point", key = "anchorPoint", half = true,
-			values = proto.anchorPoints,
+			type = "anchorgrid", name = (data.anchorFrameType == "SELECTFRAME" and "To frame point")
+				or (data.anchorFrameType == "UIPARENT" and "To UIParent point")
+				or (data.anchorFrameType == "MOUSE" and "To mouse point")
+				or (data.anchorFrameType == "NAMEPLATE" and "To nameplate point")
+				or (data.anchorFrameType == "UNITFRAME" and "To unit frame point")
+				or "To screen point", key = "anchorPoint", half = true,
+			width = 100, height = 50,
+			values = proto.anchorGridPoints,
 			get = function() return data.anchorPoint end,
 			set = function(v) data.anchorPoint = v; WA.Add(data, true) end,
 		},
@@ -680,6 +1195,31 @@ function proto.PositionOptions(data)
 		},
 		FrameStrataField(data),
 	}
+	if data.anchorFrameType ~= "SCREEN" and data.anchorFrameType ~= "UIPARENT" then
+		table.insert(fields, 3, {
+			type = "toggle", name = "Set parent to anchor", key = "anchorFrameParent",
+			get = function() return data.anchorFrameParent ~= false end,
+			set = function(v) data.anchorFrameParent = v; WA.Add(data, true) end,
+		})
+	end
+	if data.anchorFrameType == "SELECTFRAME" then
+		table.insert(fields, 4, {
+			type = "input", name = "Frame or aura ID", key = "anchorFrameFrame",
+			get = function() return data.anchorFrameFrame end,
+			set = function(v) data.anchorFrameFrame = v; WA.Add(data, true) end,
+		})
+		table.insert(fields, 5, {
+			type = "button", name = "Choose frame", width = 140,
+			onClick = function()
+				WA.StartFrameChooser(data, function(value)
+					data.anchorFrameFrame = value
+					WA.Add(data, true)
+					WA.RefreshOptions()
+				end)
+			end,
+		})
+	end
+	return fields
 end
 
 -- Re-applies a region's progress source and adjusted min/max from data at

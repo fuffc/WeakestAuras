@@ -8,23 +8,31 @@
 if WeakestAuras.disabled then return end
 
 local WA = WeakestAuras
+local proto = WA.regionPrototype
 
 local TEX_ALERT = "Interface\\AddOns\\WeakestAuras\\textures\\IconAlert"
 local TEX_ANTS = "Interface\\AddOns\\WeakestAuras\\textures\\IconAlertAnts"
+local TEX_SOLID = "Interface\\Buttons\\WHITE8X8"
+local TEX_STAR = "Interface\\Buttons\\GlowStar"
+local TEX_SOFT = "Interface\\Buttons\\CheckButtonGlow"
 local FRAME_INTERVAL = 0.04
 
--- Both files are 256x256 sheets. Regions are written as source pixels and
--- normalised here rather than as decimal literals, so they stay checkable
--- against the artwork instead of being magic numbers.
-local SHEET = 256
-local function rect(x, y, w, h)
-	return x / SHEET, (x + w) / SHEET, y / SHEET, (y + h) / SHEET
+-- Regions are written as source pixels and normalised here rather than as
+-- decimal literals, so they stay checkable against the artwork.
+local function rect(x, y, w, h, sheetWidth, sheetHeight)
+	return x / sheetWidth, (x + w) / sheetWidth, y / sheetHeight, (y + h) / sheetHeight
 end
 
-local GLOW_X, GLOW_Y, GLOW_W, GLOW_H = 14, 77, 104, 52
+local ALERT_W, ALERT_H = 128, 256
+local ANTS_W, ANTS_H = 256, 256
+local GLOW_X, GLOW_Y, GLOW_W, GLOW_H = 0, 136, 66, 66
+local GLOW_SCALE = 66 / 54
+local SOFT_GLOW_SCALE = 64 / 34
+local DEFAULT_GLOW_COLOR = { 248 / 255, 212 / 255, 72 / 255, 1 }
 
 -- The ant sheet is a grid of 44px cells on a 48px pitch, inset 2px/1px from the
--- top-left corner; 22 of its 25 cells carry a frame.
+-- top-left corner; 22 frames form the loop. Cells 23-25 are the next cycle's
+-- first three frames, so playing all 25 replays them and visibly hesitates.
 local ANT_COLUMNS, ANT_FRAMES = 5, 22
 local ANT_PITCH, ANT_CELL = 48, 44
 local ANT_X0, ANT_Y0 = 2, 1
@@ -33,7 +41,7 @@ local antFrames = {}
 do
 	local col, row = 0, 0
 	for i = 1, ANT_FRAMES do
-		antFrames[i] = { rect(ANT_X0 + col * ANT_PITCH, ANT_Y0 + row * ANT_PITCH, ANT_CELL, ANT_CELL) }
+		antFrames[i] = { rect(ANT_X0 + col * ANT_PITCH, ANT_Y0 + row * ANT_PITCH, ANT_CELL, ANT_CELL, ANTS_W, ANTS_H) }
 		col = col + 1
 		if col >= ANT_COLUMNS then col = 0; row = row + 1 end
 	end
@@ -41,7 +49,7 @@ end
 
 -- Frames cannot be destroyed, so a released overlay is pooled rather than
 -- dropped.
-local pool = {}
+local pools = {}
 local numOverlays = 0
 
 -- Every lit overlay advances off one shared ticker instead of carrying its own
@@ -53,22 +61,202 @@ local numLit = 0
 local antIndex = 1
 local ticker
 
-local function applyFrame(overlay)
+local function applyButtonOverlay(overlay, now)
+	overlay.bgFrame:Show()
+	overlay.antTex:Show()
+	for i = 1, table.getn(overlay.segments or {}) do
+		overlay.segments[i]:Hide()
+		if overlay.borders[i] then overlay.borders[i]:Hide() end
+	end
 	local f = antFrames[antIndex]
 	overlay.antTex:SetTexCoord(f[1], f[2], f[3], f[4])
+end
+
+local function applyPixel(overlay, now)
+	overlay.bgFrame:Hide()
+	overlay.antTex:Hide()
+	local p = overlay.params or {}
+	local width = overlay:GetWidth() or 0
+	local height = overlay:GetHeight() or 0
+	local lines = p.lines or 8
+	local frequency = p.frequency or 0
+	local phase = now * math.abs(frequency)
+	if frequency < 0 then phase = -phase end
+	local length = p.length or 10
+	local thickness = p.thickness or 1
+	local borderEnabled = p.border and true or false
+	local perimeter = 2 * (width + height)
+	if perimeter <= 0 then return end
+	for i = 1, lines do
+		local fraction = math.mod(phase + (i - 1) / lines, 1)
+		if fraction < 0 then fraction = fraction + 1 end
+		local distance = fraction * perimeter
+		local segment = overlay.segments[i]
+		local border = overlay.borders[i]
+		if border then border:Hide() end
+		local side, along, sideLength
+		if distance < width then
+			side, along, sideLength = "TOP", distance, width
+		elseif distance < width + height then
+			side, along, sideLength = "RIGHT", distance - width, height
+		elseif distance < width * 2 + height then
+			side, along, sideLength = "BOTTOM", distance - width - height, width
+		else
+			side, along, sideLength = "LEFT", distance - width * 2 - height, height
+		end
+		if along < 0 then along = 0 elseif along > sideLength then along = sideLength end
+		local vertical = side == "LEFT" or side == "RIGHT"
+		local segmentLength = math.min(length, sideLength)
+		segment:SetWidth(vertical and thickness or segmentLength)
+		segment:SetHeight(vertical and segmentLength or thickness)
+		segment:ClearAllPoints()
+		local x, y = 0, 0
+		if side == "TOP" then x, y = -width / 2 + along, height / 2
+		elseif side == "RIGHT" then x, y = width / 2, height / 2 - along
+		elseif side == "BOTTOM" then x, y = width / 2 - along, -height / 2
+		else x, y = -width / 2, -height / 2 + along end
+		segment:SetPoint("CENTER", overlay, "CENTER", x, y)
+		segment:Show()
+		if border and borderEnabled then
+			border:SetWidth(vertical and thickness + 2 or segmentLength + 2)
+			border:SetHeight(vertical and segmentLength + 2 or thickness + 2)
+			border:ClearAllPoints()
+			border:SetPoint("CENTER", overlay, "CENTER", x, y)
+			border:Show()
+		end
+	end
+	for i = lines + 1, table.getn(overlay.segments) do
+		overlay.segments[i]:Hide()
+		if overlay.borders[i] then overlay.borders[i]:Hide() end
+	end
+end
+
+local function applyPixelColor(overlay, color)
+	local c = color or { 1, 1, 1, 1 }
+	for i = 1, table.getn(overlay.segments or {}) do
+		overlay.segments[i]:SetVertexColor(c[1] or 1, c[2] or 1, c[3] or 1, c[4] or 1)
+		if overlay.borders[i] then overlay.borders[i]:SetVertexColor(0, 0, 0, c[4] or 1) end
+	end
+end
+
+local function applyACShine(overlay, now)
+	overlay.bgFrame:Hide()
+	overlay.antTex:Hide()
+	local p = overlay.params or {}
+	local count = p.lines or 8
+	local frequency = p.frequency or 0
+	local scale = p.scale or 1
+	local width = overlay:GetWidth() or 0
+	local height = overlay:GetHeight() or 0
+	if p.shape ~= "circular" then
+		local sizes = { 7, 6, 5, 4 }
+		local perimeter = 2 * (width + height)
+		if perimeter <= 0 then return end
+		local textureIndex = 0
+		for group = 1, 4 do
+			local phase = now * frequency / group
+			for i = 1, count do
+				textureIndex = textureIndex + 1
+				local fraction = math.mod(i / count + phase, 1)
+				if fraction < 0 then fraction = fraction + 1 end
+				local distance = fraction * perimeter
+				local x, y
+				if distance < width then
+					x, y = -width / 2 + distance, -height / 2
+				elseif distance < width + height then
+					x, y = width / 2, -height / 2 + distance - width
+				elseif distance < width * 2 + height then
+					x, y = width / 2 - distance + width + height, height / 2
+				else
+					x, y = -width / 2, height / 2 - distance + width * 2 + height
+				end
+				local particle = overlay.particles[textureIndex]
+				local size = sizes[group] * scale
+				particle:SetWidth(size)
+				particle:SetHeight(size)
+				particle:ClearAllPoints()
+				particle:SetPoint("CENTER", overlay, "CENTER", x, y)
+				particle:SetTexCoord(0, 1, 0, 1)
+				particle:Show()
+			end
+		end
+		for i = textureIndex + 1, table.getn(overlay.particles) do overlay.particles[i]:Hide() end
+		return
+	end
+	local radiusX = width / 2
+	local radiusY = height / 2
+	local size = 16 * scale
+	local phase = now * frequency * 2 * math.pi
+	for i = 1, count do
+		local angle = phase + (i - 1) * 2 * math.pi / count
+		local particle = overlay.particles[i]
+		local x = math.cos(angle) * radiusX
+		local y = math.sin(angle) * radiusY
+		particle:SetWidth(size)
+		particle:SetHeight(size)
+		particle:ClearAllPoints()
+		particle:SetPoint("CENTER", overlay, "CENTER", x, y)
+		particle:SetTexCoord(0, 1, 0, 1)
+		particle:Show()
+	end
+	for i = count + 1, table.getn(overlay.particles) do overlay.particles[i]:Hide() end
+end
+
+local function applySoft(overlay)
+	overlay.bgFrame:Hide()
+	overlay.antTex:Hide()
+	for i = 1, table.getn(overlay.segments or {}) do
+		overlay.segments[i]:Hide()
+		if overlay.borders[i] then overlay.borders[i]:Hide() end
+	end
+	for i = 1, table.getn(overlay.particles or {}) do overlay.particles[i]:Hide() end
+	overlay.softTex:SetAlpha(1)
+	overlay.softTex:Show()
+end
+
+local function applyPulse(overlay, now)
+	applySoft(overlay)
+	local frequency = (overlay.params and overlay.params.frequency) or 0.25
+	local phase = now * frequency * 2 * math.pi
+	overlay.softTex:SetAlpha(0.5 + 0.5 * math.sin(phase))
+end
+
+local function glowSummary(data)
+	local color = data.useGlowColor and "Custom color" or "Default color"
+	if data.glowType == "Pixel" then
+		local border = data.glowBorder and ", Border" or ""
+		return string.format("%s, %d lines, %.2f frequency, %d length, %d thickness%s",
+			color, data.glowLines or 8, data.glowFrequency or 0.25,
+			data.glowLength or 10, data.glowThickness or 1, border)
+	elseif data.glowType == "ACShine" then
+		return string.format("%s, %s, %d groups, %.2f frequency, %.2f scale",
+			color, data.glowShape == "circular" and "Circular" or "Rectangular",
+			data.glowLines or 8, data.glowFrequency or 0.25, data.glowScale or 1)
+	elseif data.glowType == "Pulse" then
+		return string.format("%s, %.2f frequency, %.2f scale",
+			color, data.glowFrequency or 0.25, data.glowScale or 1)
+	elseif data.glowType == "Soft" then
+		return string.format("%s, %.2f scale", color, data.glowScale or 1)
+	end
+	return color
 end
 
 local function step()
 	antIndex = antIndex + 1
 	if antIndex > ANT_FRAMES then antIndex = 1 end
-	for overlay in pairs(lit) do applyFrame(overlay) end
+	local now = GetTime()
+	for overlay in pairs(lit) do overlay.renderer.apply(overlay, now) end
 end
 
 local function light(overlay)
+	if not overlay.renderer.animate then
+		overlay.renderer.apply(overlay, GetTime())
+		return
+	end
 	if lit[overlay] then return end
 	lit[overlay] = true
 	numLit = numLit + 1
-	applyFrame(overlay)
+	overlay.renderer.apply(overlay, GetTime())
 	if not ticker then ticker = C_Timer.NewTicker(FRAME_INTERVAL, step) end
 end
 
@@ -84,49 +272,212 @@ local function douse(overlay)
 	end
 end
 
-local function getOverlay()
+local function getOverlay(glowType)
+	local pool = pools[glowType]
 	local overlay = table.remove(pool)
 	if not overlay then
 		numOverlays = numOverlays + 1
 		overlay = CreateFrame("Frame", "WeakestAurasGlowOverlay" .. numOverlays)
-		overlay:SetFrameStrata("TOOLTIP")
+		overlay.bgFrame = CreateFrame("Frame", "WeakestAurasGlowBackground" .. numOverlays)
 
-		overlay.bg = overlay:CreateTexture(nil, "ARTWORK")
+		overlay.bg = overlay.bgFrame:CreateTexture(nil, "ARTWORK")
 		overlay.bg:SetTexture(TEX_ALERT)
-		overlay.bg:SetTexCoord(rect(GLOW_X, GLOW_Y, GLOW_W, GLOW_H))
-		overlay.bg:SetAllPoints(overlay)
+		overlay.bg:SetTexCoord(rect(GLOW_X, GLOW_Y, GLOW_W, GLOW_H, ALERT_W, ALERT_H))
+		overlay.bg:SetAllPoints(overlay.bgFrame)
 
 		overlay.antTex = overlay:CreateTexture(nil, "OVERLAY")
 		overlay.antTex:SetTexture(TEX_ANTS)
 		overlay.antTex:SetAllPoints(overlay)
 		overlay.antTex:SetBlendMode("ADD")
+			overlay.antTex:SetVertexColor(1, 1, 1, 1)
 	end
+		if glowType == "Pixel" and not overlay.segments then
+			overlay.segments, overlay.borders = {}, {}
+			for i = 1, 30 do
+				local border = overlay:CreateTexture(nil, "ARTWORK")
+				border:SetTexture(TEX_SOLID)
+				border:SetVertexColor(0, 0, 0, 1)
+				overlay.borders[i] = border
+				local segment = overlay:CreateTexture(nil, "OVERLAY")
+				segment:SetTexture(TEX_SOLID)
+				segment:SetVertexColor(1, 1, 1, 1)
+				overlay.segments[i] = segment
+			end
+		end
+		if glowType == "ACShine" and not overlay.particles then
+			overlay.particles = {}
+			for i = 1, 120 do
+				local particle = overlay:CreateTexture(nil, "OVERLAY")
+				particle:SetTexture(TEX_STAR)
+				particle:SetBlendMode("ADD")
+				particle:SetVertexColor(1, 1, 1, 1)
+				overlay.particles[i] = particle
+			end
+		end
+		if (glowType == "Soft" or glowType == "Pulse") and not overlay.softTex then
+			overlay.softTex = overlay:CreateTexture(nil, "OVERLAY")
+			overlay.softTex:SetTexture(TEX_SOFT)
+			overlay.softTex:SetAllPoints(overlay)
+			overlay.softTex:SetBlendMode("ADD")
+			overlay.softTex:SetVertexColor(1, 1, 1, 1)
+		end
+	overlay.poolType = glowType
 	return overlay
+end
+
+local function releaseOverlay(glowType, overlay)
+	pools[glowType] = pools[glowType] or {}
+	table.insert(pools[glowType], overlay)
+end
+
+WA.glow_types = {
+	buttonOverlay = "Action Button Glow",
+	Pixel = "Pixel Glow",
+	ACShine = "Autocast Shine",
+	Soft = "Soft Glow",
+	Pulse = "Pulse Glow",
+}
+
+local glowRenderers = {}
+for glowType in pairs(WA.glow_types) do
+	local typeName = glowType
+	pools[glowType] = {}
+	glowRenderers[glowType] = {
+		acquire = function() return getOverlay(typeName) end,
+		release = function(overlay) releaseOverlay(typeName, overlay) end,
+		animate = typeName ~= "Soft",
+		apply = typeName == "Pixel" and applyPixel
+			or typeName == "ACShine" and applyACShine
+			or typeName == "Soft" and applySoft
+			or typeName == "Pulse" and applyPulse
+			or applyButtonOverlay,
+	}
+end
+
+local function getRenderer(glowType)
+	return glowRenderers[glowType] or glowRenderers.buttonOverlay
+end
+
+local function glowAnchorArea(parentData, subData)
+	local requested = subData.anchor_area
+	local values = proto.GetSubRegionAnchors(parentData, "area")
+	for i = 1, table.getn(values) do
+		if values[i] == requested then return requested end
+	end
+	return parentData.regionType == "progressbar" and "bar" or "region"
+end
+
+local function glowTarget(parent, key)
+	if parent.bar and parent.iconFrame then
+		if key == "bar" then return parent.bar end
+		if key == "icon" then return parent.iconFrame end
+		return parent.bar
+	end
+	return proto.GetSubRegionAnchorTarget(parent, key)
+end
+
+local function glowGeometryTarget(parent, key, target)
+	if parent.bar and (key == "region" or key == "bar") then
+		return parent
+	end
+	return target
+end
+
+local function applyGeometry(region)
+	local overlay = region.overlay
+	if not overlay then return end
+	local area = glowAnchorArea(region.parentData, region.anchorData)
+	local target = glowTarget(region.parent, area)
+	local geometryTarget = glowGeometryTarget(region.parent, area, target)
+	if not target then target = region.host end
+	if not geometryTarget then geometryTarget = target end
+	local scale = region.glowScale or 1
+	local x = region.glowXOffset or 0
+	local y = region.glowYOffset or 0
+	local width = geometryTarget:GetWidth() or 0
+	local height = geometryTarget:GetHeight() or 0
+	local anchorX = region.anchorData.anchorXOffset or 0
+	local anchorY = region.anchorData.anchorYOffset or 0
+	local artScale = overlay.poolType == "buttonOverlay" and GLOW_SCALE
+		or (overlay.poolType == "Soft" or overlay.poolType == "Pulse") and SOFT_GLOW_SCALE
+		or 1
+	local geometryScale = overlay.poolType == "ACShine" and 1 or scale
+	local glowWidth = (width + anchorX * 2) * artScale * geometryScale
+	local glowHeight = (height + anchorY * 2) * artScale * geometryScale
+	overlay:SetWidth(glowWidth)
+	overlay:SetHeight(glowHeight)
+	overlay:ClearAllPoints()
+	overlay:SetPoint("CENTER", geometryTarget, "CENTER", x, y)
+	overlay.bgFrame:SetWidth(glowWidth)
+	overlay.bgFrame:SetHeight(glowHeight)
+	overlay.bgFrame:ClearAllPoints()
+	overlay.bgFrame:SetPoint("CENTER", geometryTarget, "CENTER", x, y)
+	if overlay.renderer and (overlay.poolType == "Pixel" or overlay.poolType == "ACShine") then
+		overlay.renderer.apply(overlay, GetTime())
+	end
 end
 
 -- Read-only pool stats for Debug.lua's glow-leak check (verification: a hidden
 -- aura must release its overlay, not leave one ticking off-screen).
-function WA.GetGlowPoolStats()
-	return numOverlays, table.getn(pool)
+function WA.GetGlowPoolStats(glowType)
+	if glowType then
+		return table.getn(pools[glowType] or {})
+	end
+	local free = 0
+	for _, pool in pairs(pools) do free = free + table.getn(pool) end
+	return numOverlays, free
+end
+
+local function glowDefault(regionType)
+	local default = {
+		type = "subglow",
+		glow = false,
+		glowType = "buttonOverlay",
+		glowColor = { 1, 1, 1, 1 },
+		useGlowColor = false,
+		glowScale = 1,
+		glowShape = "rectangular",
+		glowXOffset = 0,
+		glowYOffset = 0,
+		glowLines = 8,
+		glowFrequency = 0.25,
+		glowLength = 10,
+		glowThickness = 1,
+		glowBorder = false,
+		anchor_mode = "area",
+		anchor_area = "region",
+	}
+	if regionType == "progressbar" then
+		default.glowType = "Pixel"
+		default.anchor_area = "bar"
+	end
+	return default
 end
 
 WA.RegisterSubRegionType("subglow", {
 	displayName = "Glow",
-	-- Glow-on-a-bar is unusual; icon only for now.
 	supports = function(regionType)
 		return regionType == "icon"
+			or regionType == "progressbar"
+			or regionType == "text"
 	end,
-	default = {
-		type = "subglow",
-		glow = false,
-		glowColor = { 1, 1, 1, 1 },
-		useGlowColor = false,
-	},
+	default = glowDefault("icon"),
+	defaultFor = glowDefault,
 	-- The point of the feature: conditionable on/off + colour.
 	properties = {
 		glow = { display = "Glow", setter = "SetVisible", type = "bool" },
+		glowType = { display = "Glow Type", setter = "SetGlowType", type = "list", values = WA.glow_types },
+		glowLines = { display = "Lines", setter = "SetGlowLines", type = "number", min = 1, max = 30, step = 1 },
+		glowFrequency = { display = "Frequency", setter = "SetGlowFrequency", type = "number", min = -2, max = 2, step = 0.05 },
+		glowShape = { display = "Shape", setter = "SetGlowShape", type = "list", values = { rectangular = "Rectangular", circular = "Circular" } },
+		glowLength = { display = "Length", setter = "SetGlowLength", type = "number", min = 1, max = 20, step = 1 },
+		glowThickness = { display = "Thickness", setter = "SetGlowThickness", type = "number", min = 1, max = 20, step = 1 },
+		glowBorder = { display = "Border", setter = "SetGlowBorder", type = "bool" },
 		useGlowColor = { display = "Use Color", setter = "SetUseGlowColor", type = "bool" },
 		glowColor = { display = "Color", setter = "SetGlowColor", type = "color" },
+		glowScale = { display = "Scale", setter = "SetGlowScale", type = "number", min = 0.05, max = 10, step = 0.05 },
+		glowXOffset = { display = "X Offset", setter = "SetGlowXOffset", type = "number", min = -100, max = 100, step = 1 },
+		glowYOffset = { display = "Y Offset", setter = "SetGlowYOffset", type = "number", min = -100, max = 100, step = 1 },
 	},
 	create = function(parent)
 		local region = { parent = parent, host = parent }
@@ -135,29 +486,74 @@ WA.RegisterSubRegionType("subglow", {
 			if not self.overlay then return end
 			if self.useGlowColor and self.glowColor then
 				local c = self.glowColor
+				self.overlay.bg:SetVertexColor(c[1] or 1, c[2] or 1, c[3] or 1, c[4] or 1)
 				self.overlay.antTex:SetVertexColor(c[1] or 1, c[2] or 1, c[3] or 1, c[4] or 1)
 			else
+				self.overlay.bg:SetVertexColor(DEFAULT_GLOW_COLOR[1], DEFAULT_GLOW_COLOR[2], DEFAULT_GLOW_COLOR[3], DEFAULT_GLOW_COLOR[4])
 				self.overlay.antTex:SetVertexColor(1, 1, 1, 1)
+			end
+			if self.overlay.poolType == "Pixel" then
+				applyPixelColor(self.overlay, self.useGlowColor and self.glowColor or DEFAULT_GLOW_COLOR)
+			elseif self.overlay.poolType == "ACShine" then
+				local c = self.useGlowColor and self.glowColor or DEFAULT_GLOW_COLOR
+				for i = 1, table.getn(self.overlay.particles or {}) do
+					self.overlay.particles[i]:SetVertexColor(c[1] or 1, c[2] or 1, c[3] or 1, c[4] or 1)
+				end
+			elseif self.overlay.poolType == "Soft" or self.overlay.poolType == "Pulse" then
+				local c = self.useGlowColor and self.glowColor or DEFAULT_GLOW_COLOR
+				self.overlay.softTex:SetVertexColor(c[1] or 1, c[2] or 1, c[3] or 1, c[4] or 1)
 			end
 		end
 		function region:StartGlow()
-			if self.overlay then return end
-			local overlay = getOverlay()
-			overlay:SetParent(self.host)
-			overlay:SetAllPoints(self.host)
+			local glowType = self.glowType or "buttonOverlay"
+			local renderer = getRenderer(glowType)
+			local overlay = self.overlay
+			if overlay and overlay.poolType ~= glowType then
+				self:StopGlow()
+				overlay = nil
+			end
+			if not overlay then overlay = renderer.acquire() end
+			local target = glowTarget(self.parent, glowAnchorArea(self.parentData, self.anchorData))
+			overlay:SetParent(target or self.host)
+			overlay.bgFrame:SetParent(target or self.host)
+			overlay.bgFrame:SetFrameLevel(self.parent:GetFrameLevel() + proto.SUB_LEVEL + 1)
+			overlay:SetFrameLevel(self.parent:GetFrameLevel() + proto.SUB_LEVEL + 2)
+			overlay.renderer = renderer
 			self.overlay = overlay
+			overlay.params = {
+				lines = self.glowLines or 8,
+				frequency = self.glowFrequency or 0.25,
+				length = self.glowLength or 10,
+				thickness = self.glowThickness or 1,
+				border = self.glowBorder,
+				scale = self.glowScale or 1,
+				shape = self.glowShape or "rectangular",
+			}
+			overlay.target = target or self.host
+			applyGeometry(self)
 			self:ReapplyTint()
+			overlay.bgFrame:Show()
 			overlay:Show()
 			light(overlay)
 		end
 		function region:StopGlow()
 			if not self.overlay then return end
 			local overlay = self.overlay
+			local renderer = overlay.renderer or getRenderer(self.glowType)
 			douse(overlay)
 			overlay:Hide()
+			overlay.bgFrame:Hide()
 			overlay:SetParent(UIParent)
+			overlay.bgFrame:SetParent(UIParent)
 			self.overlay = nil
-			table.insert(pool, overlay)
+			renderer.release(overlay)
+		end
+		function region:SetGlowType(glowType)
+			glowType = glowType or "buttonOverlay"
+			if not glowRenderers[glowType] then glowType = "buttonOverlay" end
+			if self.glowType == glowType then return end
+			self.glowType = glowType
+			if self.visible then self:StartGlow() end
 		end
 		function region:SetVisible(b)
 			self.visible = b and true or false
@@ -165,6 +561,21 @@ WA.RegisterSubRegionType("subglow", {
 		end
 		function region:SetUseGlowColor(b) self.useGlowColor = b and true or false; self:ReapplyTint() end
 		function region:SetGlowColor(r, g, b, a) self.glowColor = { r, g, b, a or 1 }; self:ReapplyTint() end
+		function region:SetGlowScale(v) self.glowScale = v or 1; if self.overlay then self.overlay.params.scale = self.glowScale end; applyGeometry(self) end
+		function region:SetGlowShape(v) self.glowShape = v == "circular" and "circular" or "rectangular"; if self.overlay then self.overlay.params.shape = self.glowShape; self.overlay.renderer.apply(self.overlay, GetTime()) end end
+		function region:SetGlowXOffset(v) self.glowXOffset = v or 0; applyGeometry(self) end
+		function region:SetGlowYOffset(v) self.glowYOffset = v or 0; applyGeometry(self) end
+		function region:SetGlowLines(v) self.glowLines = v or 8; if self.overlay then self.overlay.params.lines = self.glowLines; self.overlay.renderer.apply(self.overlay, GetTime()) end end
+		function region:SetGlowFrequency(v) self.glowFrequency = v or 0.25; if self.overlay then self.overlay.params.frequency = self.glowFrequency; self.overlay.renderer.apply(self.overlay, GetTime()) end end
+		function region:SetGlowLength(v) self.glowLength = v or 10; if self.overlay then self.overlay.params.length = self.glowLength end end
+		function region:SetGlowThickness(v) self.glowThickness = v or 1; if self.overlay then self.overlay.params.thickness = self.glowThickness end end
+		function region:SetGlowBorder(v)
+			self.glowBorder = v and true or false
+			if self.overlay then
+				self.overlay.params.border = self.glowBorder
+				self.overlay.renderer.apply(self.overlay, GetTime())
+			end
+		end
 		-- modifyFinish's Show/Hide: honour the current visible flag, and always
 		-- release on Hide so a removed/unsupported instance can't leak a ticking
 		-- overlay.
@@ -174,10 +585,22 @@ WA.RegisterSubRegionType("subglow", {
 	end,
 	modify = function(parent, region, parentData, subData)
 		region.host = parent
+		region.parentData = parentData
+		region.anchorData = subData
+		region.visible = subData.glow and true or false
 		region.useGlowColor = subData.useGlowColor and true or false
 		region.glowColor = subData.glowColor or { 1, 1, 1, 1 }
-		region.visible = subData.glow and true or false
-
+		region.glowScale = subData.glowScale or 1
+		region.glowShape = subData.glowShape == "circular" and "circular" or "rectangular"
+		region.glowXOffset = subData.glowXOffset or 0
+		region.glowYOffset = subData.glowYOffset or 0
+		region.glowLines = subData.glowLines or 8
+		region.glowFrequency = subData.glowFrequency or 0.25
+		region.glowLength = subData.glowLength or 10
+		region.glowThickness = subData.glowThickness or 1
+		region.glowBorder = subData.glowBorder and true or false
+		region.glowType = nil
+		region:SetGlowType(subData.glowType or "buttonOverlay")
 		if region.visible then region:StartGlow() else region:StopGlow() end
 		region:ReapplyTint()
 
@@ -185,11 +608,24 @@ WA.RegisterSubRegionType("subglow", {
 		-- forever. PreHide releases it; PreShow re-arms one that's still on.
 		parent.subRegionEvents:AddSubscriber("PreHide", function() region:StopGlow() end)
 		parent.subRegionEvents:AddSubscriber("PreShow", function()
-			if region.visible then region:StartGlow() end
+			if region.visible then
+				region:StartGlow()
+				applyGeometry(region)
+			end
 		end)
 	end,
 	options = function(parentData, subData, index)
-		return {
+		local fields = {
+			{
+				type = "select", name = "Glow type", key = "glowType",
+				values = { "buttonOverlay", "Pixel", "ACShine", "Soft", "Pulse" }, labels = WA.glow_types,
+				get = function() return subData.glowType or "buttonOverlay" end,
+				set = function(v)
+					subData.glowType = v
+					WA.Add(parentData, true)
+					WA.RefreshOptions()
+				end,
+			},
 			{
 				type = "toggle", name = "Glow", key = "glow",
 				get = function() return subData.glow and true or false end,
@@ -206,5 +642,87 @@ WA.RegisterSubRegionType("subglow", {
 				set = function(v) subData.glowColor = v; WA.Add(parentData, true) end,
 			},
 		}
+		local S = WA.OptionsState
+		local key = "sub:" .. index .. ":glowextra"
+		local collapsed = S.isCollapsed(parentData, key, true)
+		table.insert(fields, {
+			type = "disclosure", name = "Extra Options", summary = glowSummary(subData),
+			collapsed = collapsed,
+			onToggle = function()
+				S.setCollapsed(parentData, key, not collapsed)
+				WA.RefreshOptions()
+			end,
+		})
+		if not collapsed then
+			if (subData.glowType or "buttonOverlay") == "Pixel"
+				or (subData.glowType or "buttonOverlay") == "ACShine" then
+				table.insert(fields, {
+					type = "range", name = "Lines", key = "glowLines", min = 1, max = 30, step = 1, half = true,
+					get = function() return subData.glowLines or 8 end,
+					set = function(v) subData.glowLines = v; WA.Add(parentData, true) end,
+				})
+			end
+			if (subData.glowType or "buttonOverlay") == "Pixel"
+				or (subData.glowType or "buttonOverlay") == "ACShine"
+				or (subData.glowType or "buttonOverlay") == "Pulse" then
+				table.insert(fields, {
+					type = "range", name = "Frequency", key = "glowFrequency", min = -2, max = 2, step = 0.05, half = true,
+					get = function() return subData.glowFrequency or 0.25 end,
+					set = function(v) subData.glowFrequency = v; WA.Add(parentData, true) end,
+				})
+			end
+			if (subData.glowType or "buttonOverlay") == "Pixel" then
+				table.insert(fields, {
+					type = "range", name = "Length", key = "glowLength", min = 1, max = 20, step = 1, half = true,
+					get = function() return subData.glowLength or 10 end,
+					set = function(v) subData.glowLength = v; WA.Add(parentData, true) end,
+				})
+				table.insert(fields, {
+					type = "range", name = "Thickness", key = "glowThickness", min = 1, max = 20, step = 1, half = true,
+					get = function() return subData.glowThickness or 1 end,
+					set = function(v) subData.glowThickness = v; WA.Add(parentData, true) end,
+				})
+				table.insert(fields, {
+					type = "toggle", name = "Border", key = "glowBorder", half = true,
+					get = function() return subData.glowBorder and true or false end,
+					set = function(v) subData.glowBorder = v and true or false; WA.Add(parentData, true) end,
+				})
+			end
+			table.insert(fields, {
+				type = "range", name = "Scale", key = "glowScale", min = 0.05, max = 10, step = 0.05,
+				get = function() return subData.glowScale or 1 end,
+				set = function(v) subData.glowScale = v; WA.Add(parentData, true) end,
+			})
+			if (subData.glowType or "buttonOverlay") == "ACShine" then
+				table.insert(fields, {
+					type = "select", name = "Shape", key = "glowShape",
+					values = { "rectangular", "circular" },
+					labels = { rectangular = "Rectangular", circular = "Circular" },
+					get = function() return subData.glowShape == "circular" and "circular" or "rectangular" end,
+					set = function(v) subData.glowShape = v == "circular" and "circular" or "rectangular"; WA.Add(parentData, true) end,
+				})
+			end
+			table.insert(fields, {
+				type = "range", name = "X Offset", key = "glowXOffset", min = -100, max = 100, step = 1, half = true,
+				get = function() return subData.glowXOffset or 0 end,
+				set = function(v) subData.glowXOffset = v; WA.Add(parentData, true) end,
+			})
+			table.insert(fields, {
+				type = "range", name = "Y Offset", key = "glowYOffset", min = -100, max = 100, step = 1, half = true,
+				get = function() return subData.glowYOffset or 0 end,
+				set = function(v) subData.glowYOffset = v; WA.Add(parentData, true) end,
+			})
+		end
+		local anchorFields = proto.SubRegionAnchorFields(parentData, subData, {
+			areaOnly = true,
+			areaTarget = glowAnchorArea(parentData, subData),
+		})
+		for i = 1, table.getn(anchorFields) do
+			if anchorFields[i].key == "anchor_area" then
+				anchorFields[i].get = function() return glowAnchorArea(parentData, subData) end
+			end
+			table.insert(fields, anchorFields[i])
+		end
+		return fields
 	end,
 })

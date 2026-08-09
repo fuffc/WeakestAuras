@@ -27,6 +27,8 @@ WA.RegisterSubRegionType("subborder", {
 		border_color = { 0, 0, 0, 1 },
 		border_size = 1,
 		border_offset = 0,
+		anchor_mode = "area",
+		anchor_area = "region",
 	},
 	-- Condition-overridable (§8): visibility + colour. Size/offset are
 	-- config-only (a condition animating border thickness is niche).
@@ -57,7 +59,10 @@ WA.RegisterSubRegionType("subborder", {
 		-- One above the text so a border always frames the whole region cleanly
 		-- (and above whatever the region type builds as a child -- see SUB_LEVEL).
 		frame:SetFrameLevel(parent:GetFrameLevel() + proto.SUB_LEVEL + 1)
-		proto.AnchorArea(frame, parent, subData.border_offset or 0)
+		proto.AnchorSubRegion(frame, parent, subData, {
+			areaOnly = true, areaTarget = "region", x = subData.border_offset or 0,
+			y = subData.border_offset or 0,
+		})
 		local size = subData.border_size or 1
 		if size < 1 then size = 1 end
 		frame:SetBackdrop({ edgeFile = EDGE, edgeSize = size })
@@ -75,7 +80,7 @@ WA.RegisterSubRegionType("subborder", {
 	end,
 	-- BuildOptions field array for OptionsFrame's Display Effects list.
 	options = function(parentData, subData, index)
-		return {
+		local fields = {
 			{
 				type = "toggle", name = "Show border", key = "border_visible",
 				get = function() return subData.border_visible ~= false end,
@@ -91,11 +96,12 @@ WA.RegisterSubRegionType("subborder", {
 				get = function() return subData.border_size end,
 				set = function(v) subData.border_size = v; WA.Add(parentData, true) end,
 			},
-			{
-				type = "range", name = "Offset", key = "border_offset", min = -16, max = 16, step = 1, half = true,
-				get = function() return subData.border_offset end,
-				set = function(v) subData.border_offset = v; WA.Add(parentData, true) end,
-			},
 		}
+		local anchorFields = proto.SubRegionAnchorFields(parentData, subData, {
+			areaOnly = true, areaTarget = "region", x = subData.border_offset or 0,
+			y = subData.border_offset or 0,
+		})
+		for i = 1, table.getn(anchorFields) do table.insert(fields, anchorFields[i]) end
+		return fields
 	end,
 })

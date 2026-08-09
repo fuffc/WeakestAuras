@@ -13,6 +13,7 @@
 if WeakestAuras.disabled then return end
 
 local WA = WeakestAuras
+local proto = WA.regionPrototype
 
 -- The nine standard frame anchor points offered by the Anchor dropdown.
 local TEXT_ANCHORS = {
@@ -116,14 +117,12 @@ WA.RegisterSubRegionType("subtext", {
 
 		region.frame:SetFrameLevel(parent:GetFrameLevel() + WA.regionPrototype.SUB_LEVEL)
 
-		-- Anchored to the region's text anchor rather than the region itself: a
-		-- progress bar sets it to the bar, so "%p at RIGHT" lands at the end of the
-		-- fill instead of past the icon beside it (WA2's AuraBar AnchorSubRegion
-		-- defaults anchorRegion to self.bar for the same reason).
-		local anchor = parent.subRegionAnchor or parent
-		local point = subData.text_anchorPoint or "CENTER"
-		fs:ClearAllPoints()
-		fs:SetPoint(point, anchor, point, subData.text_x or 0, subData.text_y or 0)
+		proto.AnchorSubRegion(fs, parent, subData, {
+			mode = subData.anchor_mode or "point", target = parent.subRegionAnchor and "bar" or "region",
+			anchorPoint = subData.anchor_point or subData.text_anchorPoint or "CENTER",
+			selfPoint = subData.text_anchorPoint or "CENTER",
+			x = subData.text_x or 0, y = subData.text_y or 0,
+		})
 
 		if region.visible then fs:Show() else fs:Hide() end
 
@@ -170,26 +169,18 @@ WA.RegisterSubRegionType("subtext", {
 				set = function(v) subData.text_size = v; WA.Add(parentData, true) end,
 			},
 			{
-				type = "select", name = "Anchor", key = "text_anchorPoint", values = TEXT_ANCHORS, half = true,
-				get = function() return subData.text_anchorPoint end,
-				set = function(v) subData.text_anchorPoint = v; WA.Add(parentData, true) end,
-			},
-			{
 				type = "color", name = "Color", key = "text_color",
 				get = function() return subData.text_color end,
 				set = function(v) subData.text_color = v; WA.Add(parentData, true) end,
 			},
-			{
-				type = "range", name = "X", key = "text_x", min = -200, max = 200, step = 1, half = true,
-				get = function() return subData.text_x end,
-				set = function(v) subData.text_x = v; WA.Add(parentData, true) end,
-			},
-			{
-				type = "range", name = "Y", key = "text_y", min = -200, max = 200, step = 1, half = true,
-				get = function() return subData.text_y end,
-				set = function(v) subData.text_y = v; WA.Add(parentData, true) end,
-			},
 		}
+		local anchorFields = WA.regionPrototype.SubRegionAnchorFields(parentData, subData, {
+			mode = subData.anchor_mode or "point", target = parentData.regionType == "progressbar" and "bar" or "region",
+			anchorPoint = subData.anchor_point or subData.text_anchorPoint or "CENTER",
+			selfPoint = subData.text_anchorPoint or "CENTER",
+			x = subData.text_x or 0, y = subData.text_y or 0,
+		})
+		for i = 1, table.getn(anchorFields) do table.insert(fields, anchorFields[i]) end
 
 		-- Directly under the Text field, whose label can only name the five
 		-- built-in symbols.

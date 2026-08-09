@@ -35,10 +35,6 @@ function WA.RegisterRegionType(name, spec)
 	WA.regionTypes[name] = spec
 end
 
--- Per-region-type thumbnail pool: a released frame waits here for reuse rather
--- than being destroyed. Keyed by regionType so a group's thumbnail frame can
--- never be handed to an icon row -- WA.ReleaseThumbnail reads the type back off
--- the frame itself (stamped once, at creation) rather than trusting the caller.
 WA.thumbnailPools = {}
 local function thumbnailPool(regionType)
 	local pool = WA.thumbnailPools[regionType]
@@ -778,6 +774,14 @@ end
 function WA.DeleteAura(id)
 	local data = WeakestAurasDB.displays[id]
 	if not data then return end
+	for _, other in pairs(WeakestAurasDB.displays) do
+		if other.anchorFrameType == "SELECTFRAME"
+			and other.anchorFrameFrame == "WeakestAuras:" .. id then
+			other.anchorFrameFrame = nil
+			other.anchorFrameType = "UIPARENT"
+			WA.Add(other, true)
+		end
+	end
 
 	if WA.IsGroup(data) and data.controlledChildren then
 		-- Snapshot first: RemoveChildFromGroup mutates controlledChildren as
@@ -825,6 +829,13 @@ function WA.RenameAura(id, newId)
 	if WeakestAurasDB.displays[newId] then return false end
 	local data = WeakestAurasDB.displays[id]
 	if not data then return false end
+	local dependants = {}
+	for _, other in pairs(WeakestAurasDB.displays) do
+		if other.anchorFrameType == "SELECTFRAME"
+			and other.anchorFrameFrame == "WeakestAuras:" .. id then
+			table.insert(dependants, other)
+		end
+	end
 	data.id = newId
 	WeakestAurasDB.displays[id] = nil
 	WeakestAurasDB.displays[newId] = data
@@ -858,6 +869,11 @@ function WA.RenameAura(id, newId)
 	-- Re-key the engine's runtime state to match the new id (no-op stub until
 	-- StateMachine.lua loads).
 	WA.Rename(id, newId)
+	for i = 1, table.getn(dependants) do
+		local other = dependants[i]
+		other.anchorFrameFrame = "WeakestAuras:" .. newId
+		WA.Add(other, true)
+	end
 	return true
 end
 

@@ -239,6 +239,9 @@ local function ApplyStatesToRegions(id, activeTrigger, allstates)
 		local region = EnsureRegion(id, cloneId)
 		if region then
 			region.state = state
+			if data.anchorFrameType == "NAMEPLATE" or data.anchorFrameType == "UNITFRAME" then
+				WA.regionPrototype.ApplyPosition(region, data)
+			end
 			region.states = region.states or {}
 			-- Every trigger's state for this clone is readable (falling back to
 			-- the "" state), so text can say %2.p and conditions can check
@@ -374,6 +377,9 @@ function WA.UpdatedTriggerState(id)
 	-- static group refreshes its box. Cheap and idempotent; the batching happens
 	-- naturally since all of this id's clones settle within this one call.
 	if data.parent then WA.RelayoutGroup(data.parent) end
+	if WA.regionPrototype and WA.regionPrototype.SyncOptionsAnchorMarkers then
+		WA.regionPrototype.SyncOptionsAnchorMarkers()
+	end
 end
 
 -- Toggle the config-mode mute (WA2 SetFakeStates/ClearFakeStates). Opening
@@ -381,6 +387,9 @@ end
 -- their real states. OptionsFrame calls this from the panel's show/hide.
 function WA.SetOptionsOpen(open)
 	WA.optionsOpen = open and true or false
+	if WA.regionPrototype and WA.regionPrototype.SetOptionsAnchors then
+		WA.regionPrototype.SetOptionsAnchors(WA.optionsOpen)
+	end
 	for id in pairs(triggerState) do
 		WA.safecall(id, WA.UpdatedTriggerState, id)
 	end
@@ -389,6 +398,53 @@ end
 -- ---------------------------------------------------------------------------
 -- Add / Remove / Rename (§3 pAdd, scaled)
 -- ---------------------------------------------------------------------------
+
+local function anchorDependency(data)
+	if not data then return nil end
+	local target = WA.GetAnchorAuraID and WA.GetAnchorAuraID(data)
+	if target then return target end
+	return data.parent
+end
+
+function WA.CheckForAnchorCycle(source)
+	local visited = {}
+	local current = source
+	while current do
+		if visited[current] then return true end
+		visited[current] = true
+		current = anchorDependency(WeakestAurasDB.displays[current])
+	end
+	return false
+end
+
+local function resetAnchorCycle(data)
+	if not data or not WA.CheckForAnchorCycle(data.id) then return false end
+	data.anchorFrameType = "UIPARENT"
+	data.anchorFrameFrame = nil
+	DEFAULT_CHAT_FRAME:AddMessage(
+		"|cffff0000WeakestAuras|r Warning: anchoring in aura '" .. tostring(data.id)
+			.. "' was reset because it creates an anchoring cycle.", 1, 0.3, 0.3)
+	return true
+end
+
+local function dependencyOrder(ids)
+	local ordered, added, visiting = {}, {}, {}
+	local function visit(id)
+		if added[id] then return end
+		if visiting[id] then return end
+		visiting[id] = true
+		local data = WeakestAurasDB.displays[id]
+		local anchor = WA.GetAnchorAuraID and WA.GetAnchorAuraID(data)
+		if anchor and ids[anchor] then visit(anchor) end
+		local parent = data and data.parent
+		if parent and ids[parent] then visit(parent) end
+		visiting[id] = nil
+		added[id] = true
+		table.insert(ordered, id)
+	end
+	for id in pairs(ids) do visit(id) end
+	return ordered
+end
 
 -- Recomputes the standby label for a display whose load state is `isLoaded`.
 -- Returns whether it changed, so a caller that skipped the load transition can
@@ -539,6 +595,7 @@ function WA.Add(data, simpleChange)
 	-- region. WA.RefreshList is a no-op while the options panel is closed.
 	if WA.RefreshList then WA.RefreshList() end
 	if WA.IsGroup(data) then WA.AddGroup(data); return end
+	resetAnchorCycle(data)
 
 	local id = data.id
 
@@ -696,9 +753,29 @@ end
 -- file). WA.Add routes groups to WA.AddGroup; order is irrelevant since a
 -- child's ApplyPosition ensures its group frame on demand and AddGroup
 -- re-anchors children that already exist.
+function WA.AddMany(list)
+	local ids = {}
+	for i = 1, table.getn(list or {}) do
+		local data = list[i]
+		if data and data.id then ids[data.id] = true end
+	end
+	for id in pairs(ids) do resetAnchorCycle(WeakestAurasDB.displays[id]) end
+	local order = dependencyOrder(ids)
+	for i = 1, table.getn(order) do
+		local id = order[i]
+		local data = WeakestAurasDB.displays[id]
+		if data then WA.safecall(id, WA.Add, data) end
+	end
+end
+
 function WA.AddAllDisplays()
-	for id, data in pairs(WeakestAurasDB.displays) do
-		WA.safecall(id, WA.Add, data)
+	local ids = {}
+	for id in pairs(WeakestAurasDB.displays) do ids[id] = true end
+	local order = dependencyOrder(ids)
+	for i = 1, table.getn(order) do
+		local id = order[i]
+		local data = WeakestAurasDB.displays[id]
+		if data then WA.safecall(id, WA.Add, data) end
 	end
 end
 

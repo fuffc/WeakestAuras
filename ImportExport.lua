@@ -151,7 +151,8 @@ end
 -- renames an aura out from under the list. Everything else is replaced.
 local UPDATE_PRESERVED = {
 	id = true, uid = true, parent = true, controlledChildren = true,
-	anchorFrameType = true, selfPoint = true, anchorPoint = true,
+	anchorFrameType = true, anchorFrameFrame = true, anchorFrameParent = true,
+	selfPoint = true, anchorPoint = true,
 	xOffset = true, yOffset = true, frameStrata = true,
 	scale = true, width = true, height = true,
 }
@@ -227,13 +228,16 @@ function WA.Import(str)
 
 	if type(payload.c) == "table" and WA.IsGroup(root) then
 		root.controlledChildren = {}
+		local imported = { root }
 		for i = 1, table.getn(payload.c) do
-			local childId = installDisplay(payload.c[i], newId)
+			local child = payload.c[i]
+			local childId = installDisplay(child, newId)
 			table.insert(root.controlledChildren, childId)
-			WA.Add(WeakestAurasDB.displays[childId])
+			table.insert(imported, child)
 		end
+		WA.AddMany(imported)
+	else
+		WA.Add(root)
 	end
-
-	WA.Add(root)
 	return newId
 end
