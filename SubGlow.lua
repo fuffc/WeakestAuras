@@ -460,6 +460,7 @@ WA.RegisterSubRegionType("subglow", {
 		return regionType == "icon"
 			or regionType == "progressbar"
 			or regionType == "text"
+			or regionType == "texture"
 	end,
 	default = glowDefault("icon"),
 	defaultFor = glowDefault,

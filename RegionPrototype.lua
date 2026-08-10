@@ -693,8 +693,8 @@ function proto.AddProperties(properties)
 	return properties
 end
 
--- Separate from AddProperties: only the two progress region types (icon,
--- progressbar) have adjusted min/max to condition on, so this isn't folded
+-- Separate from AddProperties: only progress region types (icon, progressbar,
+-- progresstexture) have adjusted min/max to condition on, so this isn't folded
 -- into the universal set a future non-progress region type would also inherit.
 function proto.AddProgressProperties(properties)
 	properties.adjustedMin = { display = "Minimum Progress", setter = "SetAdjustedMin", type = "string" }

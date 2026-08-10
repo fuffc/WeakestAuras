@@ -343,6 +343,81 @@ function W.OpenIconPicker(current, onPick)
 	W.iconPicker.Open(current)
 end
 
+local TEXTURE_PATH_PREFIX = "Interface\\AddOns\\WeakestAuras\\textures\\"
+local TEXTURE_CATEGORIES = {
+	Shapes = {
+		"arrows_target.tga", "Circle_AlphaGradient_In.tga", "Circle_AlphaGradient_Out.tga", "circle_border5.tga",
+		"Circle_Smooth.tga", "Circle_Smooth2.tga", "Circle_Smooth_Border.tga", "Circle_Squirrel.tga", "Circle_Squirrel_Border.tga",
+		"Circle_White.tga", "Circle_White_Border.tga", "Ring_10px.tga", "Ring_20px.tga", "Ring_30px.tga", "Ring_40px.tga",
+		"ring_glow3.tga", "Square_AlphaGradient.tga", "square_border_10px.tga", "square_border_1px.tga", "square_border_5px.tga",
+		"Square_FullWhite.tga", "square_mini.tga", "Square_Smooth.tga", "Square_Smooth_Border.tga", "Square_Squirrel.tga",
+		"Square_Squirrel_Border.tga", "Square_White.tga", "Square_White_Border.tga", "target_indicator.tga",
+		"target_indicator_glow.tga", "Trapezoid.tga", "triangle-border.tga", "triangle.tga", "Triangle45.tga",
+	},
+	Alerts = {
+		"ArcaneMissiles.blp", "ArcaneMissiles1.blp", "ArcaneMissiles2.blp", "ArcaneMissiles3.blp", "ArcaneSoul.blp",
+		"ArtOfWar.blp", "BacklashGreen.blp", "Backslash.blp", "BanditsGuile.blp", "Berserk.blp",
+		"BloodBoil.blp", "BloodSurge.blp", "BrainFreeze.blp", "DarkTiger.blp", "DarkTransformation.blp", "Daybreak.blp",
+		"DemonicCore.blp", "DemonicCoreVertical.blp", "Denounce.blp", "EchoOfTheElements.blp", "EclipseMoon.blp", "EclipseSun.blp",
+		"EssenceBurst.blp", "FocusFire.blp", "FrozenFingers.blp", "Fulmination.blp", "FuryOfStormrage.blp", "GenericArc1.blp",
+		"GenericArc2.blp", "GenericArc3.blp", "GenericArc4.blp", "GenericArc5.blp", "GenericArc6.blp", "GenericTop1.blp",
+		"GenericTop2.blp", "GrandCrusader.blp", "HandOfLight.blp", "HighTide.blp", "HotStreak.blp", "Hyperthermia.blp",
+		"ImpEmpowerment.blp", "ImpEmpowermentGreen.blp", "Impact.blp", "KillingMachine.blp", "LockAndLoad.blp", "MaelstromWeapon.blp",
+		"MaelstromWeapon1.blp", "MaelstromWeapon2.blp", "MaelstromWeapon3.blp", "MaelstromWeapon4.blp", "MasterMarksman.blp",
+		"MoltenCore.blp", "MonkBlackoutKick.blp", "MonkOx.blp", "MonkOx2.blp", "MonkOx3.blp", "MonkSerpent.blp",
+		"MonkTiger.blp", "MonkTigerPalm.blp", "NatureSGrace.blp", "Necropolis.blp", "Nightfall.blp", "PredatorySwiftness.blp",
+		"OmenOfClarityFeral.blp", "PredatorySwiftnessGreen.blp", "RagingBlow.blp", "Rime.blp", "Serendipity.blp", "ShadowOfDeath.blp",
+		"ShadowWordInsanity.blp", "ShootingStars.blp",
+		"SliceAndDice.blp", "Snapfire.blp", "SuddenDeath.blp", "SuddenDoom.blp", "SurgeOfDarkness.blp", "SurgeOfLight.blp",
+		"SpellActivationOverlay0.blp", "SwordAndBoard.blp", "ThrillOfTheHunt1.blp", "ThrillOfTheHunt2.blp", "ThrillOfTheHunt3.blp", "ToothAndClaw.blp",
+		"Ultimatum.blp", "WhiteTiger.blp",
+	},
+}
+WA.textureTypes = TEXTURE_CATEGORIES
+local TEXTURE_CATEGORY_VALUES = { "Alerts", "Shapes" }
+local TEXTURE_CATEGORY_LABELS = { Alerts = "Blizzard Alerts", Shapes = "Shapes" }
+
+local function texturePath(category, name)
+	return TEXTURE_PATH_PREFIX .. string.lower(category) .. "\\" .. name
+end
+
+function W.OpenTexturePicker(current, onPick)
+	if not LibWidgets.NewIconPicker then
+		DEFAULT_CHAT_FRAME:AddMessage("|cffff4040WeakestAuras:|r "
+			.. (W.LibWidgetsProblem() or "the loaded LibWidgets has no texture picker support."))
+		return
+	end
+	if not W.texturePicker then
+		W.texturePicker = LibWidgets.NewIconPicker(UIParent, {
+			nameFrame = "WeakestAurasTexturePicker",
+			title = "Select Texture",
+			categories = TEXTURE_CATEGORIES,
+			categoryValues = TEXTURE_CATEGORY_VALUES,
+			categoryLabels = TEXTURE_CATEGORY_LABELS,
+			defaultCategory = "Shapes",
+			pathFor = function(name, category) return texturePath(category or "Shapes", name) end,
+			normalize = function(value)
+				local _, _, name = string.find(string.lower(value or ""), "textures\\[^\\]+\\([^\\]+)$")
+				return name or value
+			end,
+			categoryFor = function(value)
+				if string.find(string.lower(value or ""), "textures\\alerts\\", 1, true) then return "Alerts" end
+				return "Shapes"
+			end,
+			labelFor = function(name) return name end,
+			onAccept = function(path)
+				if W.onTexturePicked then W.onTexturePicked(path) end
+			end,
+		})
+	end
+	W.onTexturePicked = onPick
+	W.texturePicker.Open(current)
+end
+
+function W.CloseTexturePicker()
+	if W.texturePicker then W.texturePicker.Close() end
+end
+
 function W.CloseIconPicker()
 	if W.iconPicker then W.iconPicker.Close() end
 end
@@ -943,7 +1018,7 @@ local function placeField(page, f, x, y, w)
 		-- line (14) -- which is always allotted, so the layout below doesn't
 		-- shift as errors come and go while typing.
 		return 20 + mh + 8 + 14
-	elseif f.type == "spell" or f.type == "item" or f.type == "icon" then
+	elseif f.type == "spell" or f.type == "item" or f.type == "icon" or f.type == "texture" then
 		local label = poolLabel(page, f.name)
 		label:SetPoint("TOPLEFT", x, y)
 		local icon = poolPreviewIcon(page)
@@ -973,10 +1048,11 @@ local function placeField(page, f, x, y, w)
 		end
 		-- An `icon` field additionally gets a Browse button opening the picker;
 		-- typing a path by hand still works, it just stops being the only way.
-		local browseW = (f.type == "icon") and 62 or 0
+		local browsable = f.type == "icon" or f.type == "texture"
+		local browseW = browsable and 62 or 0
 		local e = poolEditBox(page, w - 24 - browseW, function(v)
 			local path = resolve(v)
-			if f.type == "icon" then f.set(path or "") else f.set(v) end
+			if browsable then f.set(path or "") else f.set(v) end
 			icon:SetTexture(path or QUESTION_ICON)
 			if WA.RefreshList then WA.RefreshList() end
 		end)
@@ -986,10 +1062,11 @@ local function placeField(page, f, x, y, w)
 		local v = f.get()
 		e:SetText(v ~= nil and tostring(v) or "")
 		e:SetPoint("TOPLEFT", x + 24, y - 16)
-		if f.type == "icon" then
+		if browsable then
 			icon:SetTexture((v and v ~= "" and v) or QUESTION_ICON)
 			local b = poolButton(page, "Browse", browseW - 4, function()
-				W.OpenIconPicker(f.get(), function(path)
+				local picker = f.type == "texture" and W.OpenTexturePicker or W.OpenIconPicker
+				picker(f.get(), function(path)
 					f.set(path or "")
 					if WA.RefreshList then WA.RefreshList() end
 					if WA.RefreshOptions then WA.RefreshOptions() end

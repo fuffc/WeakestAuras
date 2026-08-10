@@ -36,7 +36,7 @@ end
 WA.RegisterSubRegionType("subtext", {
 	displayName = "Text",
 	supports = function(regionType)
-		return regionType == "icon" or regionType == "progressbar"
+		return regionType == "icon" or regionType == "progressbar" or regionType == "texture"
 	end,
 	default = {
 		type = "subtext",

@@ -2303,6 +2303,7 @@ local function buildPanel()
 		-- The icon picker is a UIParent-level dialog (it has to outrank the panel
 		-- to sit over it), so nothing takes it down with the panel unless we do.
 		W.CloseIconPicker()
+		W.CloseTexturePicker()
 		-- Same for the context menu's click-away catcher, which is a UIParent
 		-- child so that it can cover the whole screen.
 		if S.menu then S.menu.Close() end

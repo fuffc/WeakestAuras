@@ -1,6 +1,6 @@
 -- WeakestAuras -- in-game probes and verification commands for the runtime
 -- engine. Registers /wa probe, states, libs, addons, gen, load, conditions,
--- codeprobe, textprobe, and cdtest.
+-- codeprobe, textprobe, texprobe, and cdtest.
 
 if WeakestAuras.disabled then return end
 
@@ -1041,6 +1041,138 @@ function D.Probe()
 end
 
 -- ---------------------------------------------------------------------------
+-- /wa texprobe -- the Texture questions no headless harness can answer.
+--
+-- The log records capability read-backs and the frame puts the visual tests
+-- beside labels that say exactly what to compare. The client is the authority
+-- for arbitrary-angle rotation, out-of-range texcoords, rect modification and
+-- desaturation; the mock cannot model any of those results.
+-- ---------------------------------------------------------------------------
+
+local texProbeFrame
+local TEXPROBE_ART = "Interface\\AddOns\\WeakestAuras\\textures\\shapes\\arrows_target.tga"
+local TEXPROBE_COLOR_ART = "Interface\\Icons\\Spell_Nature_LightningShield"
+
+local function texProbeLabel(parent, text, point, relative, relPoint, x, y)
+	local label = parent:CreateFontString(nil, "OVERLAY")
+	label:SetFont("Fonts\\FRIZQT__.TTF", 11, "")
+	label:SetJustifyH("CENTER")
+	label:SetText(text)
+	label:SetPoint(point, relative, relPoint, x, y)
+	return label
+end
+
+local function texProbeBox(parent, x, y)
+	local box = CreateFrame("Frame", nil, parent)
+	box:SetWidth(96); box:SetHeight(96)
+	box:SetPoint("TOPLEFT", parent, "TOPLEFT", x, y)
+	box:SetBackdrop({ edgeFile = "Interface\\Buttons\\WHITE8X8", edgeSize = 1 })
+	box:SetBackdropBorderColor(0.5, 0.5, 0.5, 1)
+	return box
+end
+
+local function texProbeTexture(box, rotation)
+	local texture = box:CreateTexture(nil, "ARTWORK")
+	texture:SetAllPoints(box)
+	texture:SetTexture(TEXPROBE_ART)
+	if rotation then
+		local angle = math.pi * (135 - rotation) / 180
+		local vx = math.cos(angle) / math.sqrt(2)
+		local vy = math.sin(angle) / math.sqrt(2)
+		local ulx, uly = 0.5 + vx, 0.5 - vy
+		local llx, lly = 0.5 - vy, 0.5 - vx
+		local urx, ury = 0.5 + vy, 0.5 + vx
+		local lrx, lry = 0.5 - vx, 0.5 + vy
+		texture:SetTexCoord(ulx, uly, llx, lly, urx, ury, lrx, lry)
+	else
+		texture:SetTexCoord(0, 0, 0, 1, 1, 0, 1, 1)
+	end
+	return texture
+end
+
+local function texProbeCall(texture, method, a, b, c, d)
+	local fn = texture and texture[method]
+	if not fn then return false, "ABSENT" end
+	return pcall(fn, texture, a, b, c, d)
+end
+
+function D.TexProbe()
+	D.Log("--- texprobe ---")
+
+	if not texProbeFrame then
+		texProbeFrame = CreateFrame("Frame", nil, UIParent)
+		texProbeFrame:SetWidth(620); texProbeFrame:SetHeight(300)
+		texProbeFrame:SetPoint("CENTER", UIParent, "CENTER", 0, 80)
+		texProbeFrame:SetBackdrop({ bgFile = "Interface\\Buttons\\WHITE8X8" })
+		texProbeFrame:SetBackdropColor(0, 0, 0, 0.8)
+		texProbeLabel(texProbeFrame, "Texture probe: compare each sample with its label", "TOP", texProbeFrame, "TOP", 0, -10)
+
+		local rotated = texProbeBox(texProbeFrame, 18, -34)
+		texProbeTexture(rotated, 30)
+		texProbeLabel(texProbeFrame, "30 deg rotation\n(inside-box / sqrt2)", "TOP", rotated, "BOTTOM", 0, -4)
+
+		local normal = texProbeBox(texProbeFrame, 128, -34)
+		texProbeTexture(normal)
+		texProbeLabel(texProbeFrame, "0 deg reference", "TOP", normal, "BOTTOM", 0, -4)
+
+		local outside = texProbeBox(texProbeFrame, 238, -34)
+		local outsideTexture = texProbeTexture(outside)
+		outsideTexture:SetTexCoord(-0.25, -0.25, -0.25, 1.25, 1.25, -0.25, 1.25, 1.25)
+		texProbeLabel(texProbeFrame, "out-of-range\n(-.25 to 1.25)", "TOP", outside, "BOTTOM", 0, -4)
+
+		local rectOn = texProbeBox(texProbeFrame, 348, -34)
+		local rectOnTexture = texProbeTexture(rectOn)
+		texProbeCall(rectOnTexture, "SetTexCoordModifiesRect", true)
+		rectOnTexture:SetTexCoord(0, 0, 0, 1, 0.5, 0, 0.5, 1)
+		texProbeLabel(texProbeFrame, "half texcoord\nrect setting ON", "TOP", rectOn, "BOTTOM", 0, -4)
+
+		local rectOff = texProbeBox(texProbeFrame, 458, -34)
+		local rectOffTexture = texProbeTexture(rectOff)
+		texProbeCall(rectOffTexture, "SetTexCoordModifiesRect", false)
+		rectOffTexture:SetTexCoord(0, 0, 0, 1, 0.5, 0, 0.5, 1)
+		texProbeLabel(texProbeFrame, "half texcoord\nrect setting OFF", "TOP", rectOff, "BOTTOM", 0, -4)
+
+		local regular = texProbeBox(texProbeFrame, 183, -174)
+		local regularTexture = texProbeTexture(regular)
+		regularTexture:SetTexture(TEXPROBE_COLOR_ART)
+		texProbeLabel(texProbeFrame, "colored normal", "TOP", regular, "BOTTOM", 0, -4)
+
+		local desaturated = texProbeBox(texProbeFrame, 293, -174)
+		local desaturatedTexture = texProbeTexture(desaturated)
+		desaturatedTexture:SetTexture(TEXPROBE_COLOR_ART)
+		local desatOK, desatReturn = texProbeCall(desaturatedTexture, "SetDesaturated", true)
+		texProbeLabel(texProbeFrame, "SetDesaturated(true)", "TOP", desaturated, "BOTTOM", 0, -4)
+
+		texProbeFrame._texProbe = {
+			regular = regular, desatOK = desatOK, desatReturn = desatReturn,
+		}
+	end
+	texProbeFrame:Show()
+
+	local p = texProbeFrame._texProbe
+	D.Log("  art: " .. TEXPROBE_ART)
+	D.Log("  desaturation comparison art: " .. TEXPROBE_COLOR_ART)
+	D.Log("  rotation sample: 30 degrees with the sqrt2-safe 8-argument SetTexCoord -- compare with 0 degree reference")
+	D.Log("  out-of-range sample: transparent margin, edge smear, or tiled art?")
+
+	local scratch = p.regular:CreateTexture(nil, "ARTWORK")
+	local getOK, defaultValue = texProbeCall(scratch, "GetTexCoordModifiesRect")
+	D.Log("  GetTexCoordModifiesRect default: " .. (getOK and tostring(defaultValue) or tostring(defaultValue)))
+	local setOnOK = texProbeCall(scratch, "SetTexCoordModifiesRect", true)
+	local setOffOK = texProbeCall(scratch, "SetTexCoordModifiesRect", false)
+	D.Log("  SetTexCoordModifiesRect calls: on=" .. tostring(setOnOK) .. " off=" .. tostring(setOffOK)
+		.. " -- compare the ON/OFF sample box widths")
+
+	local vertexOK, vertexReturn = texProbeCall(scratch, "SetVertexOffset", 0, 0)
+	D.Log("  SetVertexOffset: " .. (vertexOK and ("PRESENT (return " .. tostring(vertexReturn) .. ")") or "ABSENT"))
+	D.Log("  SetRotation: " .. ((scratch.SetRotation and "PRESENT") or "ABSENT"))
+	D.Log("  SetDesaturated(true): " .. (p.desatOK and "call accepted" or "ABSENT/FAILED")
+		.. " (return " .. tostring(p.desatReturn) .. ") -- compare normal and desaturated samples")
+	D.Log("  visual answers: rotate 30 degrees; margin behavior; whether ON changes the half-width box; whether art greys")
+	D.Log("--- end texprobe ---")
+end
+
+-- ---------------------------------------------------------------------------
 -- /wa codeprobe -- checks the EditBox behavior needed by the code editor:
 -- engine behaviour a syntax-highlighting code editor rests on, none of which
 -- raw color escapes, indexing, caret movement, and sentinel round-trips.
@@ -1860,6 +1992,8 @@ function D.HandleSlash(msg)
 		D.CodeProbe()
 	elseif cmd == "textprobe" then
 		D.TextProbe()
+	elseif cmd == "texprobe" then
+		D.TexProbe()
 	elseif cmd == "codelive" then
 		D.CodeLive()
 	elseif cmd == "codetab" then
@@ -1884,6 +2018,6 @@ function D.HandleSlash(msg)
 		ensureFrame()
 		frame:Hide()
 	else
-		D.Log("[debug] unknown command \"" .. cmd .. "\". Available: dump [unit] [filter], watch [unit], events [EVENT ...], timers, linkprobe, commprobe [charname|throttle [channel] [rate] [secs]], cdtest, swipetest [sizes/WxH...], swipenudge <k> [yflat], track <spellName>, states <id>, conditions <id>, gen <id>, load <id>, probe, ver [version], codeprobe, textprobe, codelive, codetab <1-8|tabs>, codefont <6-16>, rows, libs, addons, export <id>, import, clear, show, hide")
+		D.Log("[debug] unknown command \"" .. cmd .. "\". Available: dump [unit] [filter], watch [unit], events [EVENT ...], timers, linkprobe, commprobe [charname|throttle [channel] [rate] [secs]], cdtest, swipetest [sizes/WxH...], swipenudge <k> [yflat], track <spellName>, states <id>, conditions <id>, gen <id>, load <id>, probe, ver [version], codeprobe, textprobe, texprobe, codelive, codetab <1-8|tabs>, codefont <6-16>, rows, libs, addons, export <id>, import, clear, show, hide")
 	end
 end

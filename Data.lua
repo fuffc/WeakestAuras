@@ -183,7 +183,13 @@ end
 -- whose type we later gain starts working on its own, with no second migration.
 function WA.RegionSpecFor(data)
 	local spec = data and WA.regionTypes[data.regionType]
-	if spec then return spec end
+	if spec then
+		if data.regionType == "progresstexture"
+			and (data.orientation == "CLOCKWISE" or data.orientation == "ANTICLOCKWISE") then
+			return WA.regionTypes["fallback"]
+		end
+		return spec
+	end
 	return WA.regionTypes["fallback"]
 end
 

@@ -1912,6 +1912,7 @@ end
 -- approach NewListEditor uses).
 function LibWidgets.NewIconPicker(parent, spec)
 	spec = spec or {}
+	local hasCategories = spec.categories ~= nil
 	local cols    = spec.columns or 10
 	local vis     = spec.visibleRows or 7
 	local iconSz  = spec.iconSize or 30
@@ -1925,7 +1926,7 @@ function LibWidgets.NewIconPicker(parent, spec)
 
 	local frame = CreateFrame("Frame", scrollName .. "Dialog", spec.dialogParent or UIParent)
 	frame:SetWidth(gridW + pad * 2)
-	frame:SetHeight(gridH + 118)
+	frame:SetHeight(gridH + 118 + (hasCategories and 26 or 0))
 	frame:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
 	frame:SetBackdrop(WIDGET_BACKDROP)
 	frame:SetBackdropColor(0, 0, 0, 0.92)
@@ -1962,6 +1963,21 @@ function LibWidgets.NewIconPicker(parent, spec)
 
 	local filtered, selected = {}, nil
 	local refresh, applyFilter
+	local normalize = spec.normalize or iconBaseName
+	local pathFor = spec.pathFor or LibWidgets.IconPath
+	local labelFor = spec.labelFor or function(value) return value end
+	local categoryValues = spec.categoryValues
+	if not categoryValues and spec.categories then
+		categoryValues = {}
+		for category in pairs(spec.categories) do table.insert(categoryValues, category) end
+		table.sort(categoryValues)
+	end
+	local selectedCategory = spec.defaultCategory or (categoryValues and categoryValues[1])
+	local function valuesForCategory(category)
+		if spec.categories then return spec.categories[category] or {} end
+		if spec.icons then return spec.icons(category) end
+		return LibWidgets.GetIconDatabase()
+	end
 
 	local search = LibWidgets.NewTextBox(frame, {
 		width = 160, height = 20, hint = spec.searchHint or "Search",
@@ -1969,9 +1985,28 @@ function LibWidgets.NewIconPicker(parent, spec)
 	})
 	search:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -pad, -pad - 18)
 	search:SetScript("OnEscapePressed", function() this:SetText(""); this:ClearFocus() end)
+	frame.search = search
+
+	local categoryButton
+	if categoryValues then
+		categoryButton = LibWidgets.NewDropButton(frame, {
+			values = categoryValues,
+			labels = spec.categoryLabels or {},
+			width = spec.categoryWidth or 130,
+			height = 20,
+			menuParent = frame,
+			get = function() return selectedCategory end,
+			onSelect = function(value)
+				selectedCategory = value
+				applyFilter(search:GetText() or "")
+			end,
+		})
+		categoryButton:SetPoint("TOPLEFT", frame, "TOPLEFT", pad, -pad - 52)
+		frame.categoryButton = categoryButton
+	end
 
 	local grid = CreateFrame("Frame", nil, frame)
-	grid:SetPoint("TOPLEFT", pad, -pad - 54)
+	grid:SetPoint("TOPLEFT", pad, -pad - (hasCategories and 80 or 54))
 	grid:SetWidth(gridW); grid:SetHeight(gridH)
 	grid:SetBackdrop(WIDGET_BACKDROP)
 	grid:SetBackdropColor(0, 0, 0, 0.5)
@@ -2009,7 +2044,7 @@ function LibWidgets.NewIconPicker(parent, spec)
 		c:SetScript("OnEnter", function()
 			if not this.name then return end
 			GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
-			GameTooltip:AddLine(this.name)
+			GameTooltip:AddLine(labelFor(this.name))
 			GameTooltip:Show()
 		end)
 		c:SetScript("OnLeave", function() GameTooltip:Hide() end)
@@ -2028,7 +2063,7 @@ function LibWidgets.NewIconPicker(parent, spec)
 			local name = filtered[index]
 			if name then
 				c.name = name
-				c.icon:SetTexture(ICON_PREFIX .. name)
+				c.icon:SetTexture(pathFor(name, selectedCategory))
 				c.icon:Show()
 				if name == selected then
 					c:SetBackdropBorderColor(1, 0.82, 0, 1)
@@ -2051,8 +2086,8 @@ function LibWidgets.NewIconPicker(parent, spec)
 		end
 		count:SetText(n .. (n == 1 and " icon" or " icons"))
 		if selected then
-			preview:SetTexture(ICON_PREFIX .. selected)
-			previewLabel:SetText(selected)
+			preview:SetTexture(pathFor(selected, selectedCategory))
+			previewLabel:SetText(labelFor(selected))
 		else
 			preview:SetTexture(nil)
 			previewLabel:SetText("")
@@ -2070,20 +2105,19 @@ function LibWidgets.NewIconPicker(parent, spec)
 	grid:EnableMouseWheel(true); grid:SetScript("OnMouseWheel", wheel)
 
 	local function allIcons()
-		if spec.icons then return spec.icons() end
-		return LibWidgets.GetIconDatabase()
+		return valuesForCategory(selectedCategory)
 	end
 
 	applyFilter = function(text)
 		local all = allIcons()
 		filtered = {}
 		if not text or text == "" then
-			for i = 1, table.getn(all) do filtered[i] = iconBaseName(all[i]) end
+			for i = 1, table.getn(all) do filtered[i] = normalize(all[i]) end
 		else
 			local needle = string.upper(text)
 			for i = 1, table.getn(all) do
-				local name = iconBaseName(all[i])
-				if string.find(name, needle, 1, true) then table.insert(filtered, name) end
+				local name = normalize(all[i])
+				if string.find(string.upper(labelFor(name)), needle, 1, true) then table.insert(filtered, name) end
 			end
 		end
 		local bar = getglobal(scrollName .. "ScrollBar")
@@ -2121,7 +2155,7 @@ function LibWidgets.NewIconPicker(parent, spec)
 		onClick = function()
 			local pick = selected
 			frame.Close()
-			if pick and spec.onAccept then spec.onAccept(ICON_PREFIX .. pick, pick) end
+			if pick and spec.onAccept then spec.onAccept(pathFor(pick, selectedCategory), pick) end
 		end,
 	})
 	accept:SetPoint("RIGHT", cancel, "LEFT", -6, 0)
@@ -2136,7 +2170,10 @@ function LibWidgets.NewIconPicker(parent, spec)
 	clear:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", pad, pad)
 
 	function frame.Open(current)
-		selected = current and current ~= "" and iconBaseName(current) or nil
+		if categoryValues and spec.categoryFor then
+			selectedCategory = spec.categoryFor(current) or selectedCategory
+		end
+		selected = current and current ~= "" and normalize(current) or nil
 		search:SetText("")
 		applyFilter("")
 		scrollToSelected()

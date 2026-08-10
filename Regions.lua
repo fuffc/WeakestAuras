@@ -437,6 +437,192 @@ WA.RegisterRegionType("dynamicgroup", {
 	end,
 })
 
+local TEXTURE_BLEND_MODES = { "BLEND", "ADD" }
+local TEXTURE_BLEND_LABELS = {
+	BLEND = "Opaque", ADD = "Glow",
+}
+
+local TEXTURE_DEFAULT = "Interface\\AddOns\\WeakestAuras\\textures\\shapes\\arrows_target.tga"
+local TEXTURE_SQRT2 = math.sqrt(2)
+
+local function textureRotationCoords(degrees, mirror)
+	local angle = math.pi * (135 - (degrees or 0)) / 180
+	local vx = math.cos(angle) / TEXTURE_SQRT2
+	local vy = math.sin(angle) / TEXTURE_SQRT2
+	local ulx, uly = 0.5 + vx, 0.5 - vy
+	local llx, lly = 0.5 - vy, 0.5 - vx
+	local urx, ury = 0.5 + vy, 0.5 + vx
+	local lrx, lry = 0.5 - vx, 0.5 + vy
+	if mirror then return urx, ury, lrx, lry, ulx, uly, llx, lly end
+	return ulx, uly, llx, lly, urx, ury, lrx, lry
+end
+
+local function applyTextureCoords(texture, mirror, rotation)
+	texture:SetTexCoord(textureRotationCoords(rotation, mirror))
+end
+
+local TEXTURE_SUB_ANCHORS = {
+	TOPLEFT = { display = "Edge / Top Left", point = true }, TOP = { display = "Edge / Top", point = true }, TOPRIGHT = { display = "Edge / Top Right", point = true },
+	LEFT = { display = "Edge / Left", point = true }, CENTER = { display = "Center", point = true }, RIGHT = { display = "Edge / Right", point = true },
+	BOTTOMLEFT = { display = "Edge / Bottom Left", point = true }, BOTTOM = { display = "Edge / Bottom", point = true }, BOTTOMRIGHT = { display = "Edge / Bottom Right", point = true },
+}
+
+local function textureCoords(mirror)
+	if mirror then return 1, 0, 1, 1, 0, 0, 0, 1 end
+	return 0, 0, 0, 1, 1, 0, 1, 1
+end
+
+local function textureThumbnailSize(frame, data)
+	local size = frame:GetWidth() or 32
+	local width, height = data.width or 1, data.height or 1
+	local scale = size / math.max(width, height)
+	return width * scale, height * scale
+end
+
+WA.RegisterRegionType("texture", {
+	displayName = "Texture",
+	description = "A custom texture with colour, mirroring and desaturation.",
+	defaults = {
+		texture = TEXTURE_DEFAULT,
+		width = 200,
+		height = 200,
+		alpha = 1,
+		desaturate = false,
+		color = { 1, 1, 1, 1 },
+		blendMode = "BLEND",
+		mirror = false,
+		anchorFrameType = "SCREEN",
+		selfPoint = "CENTER",
+		anchorPoint = "CENTER",
+		xOffset = 0,
+		yOffset = 0,
+		frameStrata = 1,
+	},
+	icon = TEXTURE_DEFAULT,
+	getSubRegionAnchors = function() return TEXTURE_SUB_ANCHORS end,
+	properties = WA.regionPrototype.AddProperties({
+		texture = { display = "Texture", setter = "SetTexture", type = "texture" },
+		color = { display = "Color", setter = "Color", type = "color" },
+		desaturate = { display = "Desaturate", setter = "SetDesaturated", type = "bool" },
+		blendMode = { display = "Blend Mode", setter = "SetBlendMode", type = "list", values = TEXTURE_BLEND_LABELS },
+		width = { display = "Width", setter = "SetRegionWidth", type = "number", min = 8, max = 512, step = 1 },
+		height = { display = "Height", setter = "SetRegionHeight", type = "number", min = 8, max = 512, step = 1 },
+		mirror = { display = "Mirror", setter = "SetMirror", type = "bool" },
+	}),
+	createThumbnail = function(parent)
+		local frame = CreateFrame("Frame", nil, parent)
+		local texture = frame:CreateTexture(nil, "ARTWORK")
+		frame.texture = texture
+		return frame
+	end,
+	modifyThumbnail = function(frame, data)
+		local texture = frame.texture
+		local width, height = textureThumbnailSize(frame, data)
+		texture:ClearAllPoints()
+		texture:SetPoint("CENTER", frame, "CENTER")
+		texture:SetWidth(width)
+		texture:SetHeight(height)
+		texture:SetTexture(data.texture or TEXTURE_DEFAULT)
+		local color = data.color or { 1, 1, 1, 1 }
+		texture:SetVertexColor(color[1] or 1, color[2] or 1, color[3] or 1, color[4] or 1)
+		texture:SetBlendMode(data.blendMode or "BLEND")
+		texture:SetDesaturated(data.desaturate and true or false)
+		applyTextureCoords(texture, data.mirror, data.rotation)
+	end,
+	options = function(data)
+		local fields = {
+			{ type = "header", name = "Texture" },
+			{
+				type = "texture", name = "Texture", key = "texture",
+				get = function() return data.texture end,
+				set = function(v) data.texture = v; WA.Add(data, true); WA.RefreshList() end,
+			},
+			{
+				type = "color", name = "Color", key = "color",
+				half = true,
+				get = function() return data.color end,
+				set = function(v) data.color = v; WA.Add(data, true) end,
+			},
+			{
+				type = "toggle", name = "Desaturate", key = "desaturate",
+				half = true,
+				get = function() return data.desaturate end,
+				set = function(v) data.desaturate = v; WA.Add(data, true) end,
+			},
+			{
+				type = "range", name = "Alpha", key = "alpha", min = 0, max = 1, step = 0.05, half = true,
+				get = function() return data.alpha end,
+				set = function(v) data.alpha = v; WA.Add(data, true) end,
+			},
+			{
+				type = "select", name = "Blend mode", key = "blendMode", half = true,
+				values = TEXTURE_BLEND_MODES, labels = TEXTURE_BLEND_LABELS,
+				get = function() return data.blendMode end,
+				set = function(v) data.blendMode = v; WA.Add(data, true) end,
+			},
+			{
+				type = "toggle", name = "Mirror", key = "mirror", half = true,
+				get = function() return data.mirror end,
+				set = function(v) data.mirror = v; WA.Add(data, true) end,
+			},
+			{
+				type = "range", name = "Rotation", key = "rotation", min = 0, max = 360, step = 1, half = true,
+				get = function() return data.rotation end,
+				set = function(v) data.rotation = v; WA.Add(data, true) end,
+			},
+			{ type = "header", name = "Size" },
+			{
+				type = "range", name = "Width", key = "width", min = 8, max = 512, step = 1, half = true,
+				get = function() return data.width end,
+				set = function(v) data.width = v; WA.Add(data, true) end,
+			},
+			{
+				type = "range", name = "Height", key = "height", min = 8, max = 512, step = 1, half = true,
+				get = function() return data.height end,
+				set = function(v) data.height = v; WA.Add(data, true) end,
+			},
+		}
+		for _, field in ipairs(WA.regionPrototype.PositionOptions(data)) do table.insert(fields, field) end
+		return fields
+	end,
+	create = function(parent)
+		local region = CreateFrame("Frame", nil, parent)
+		local texture = region:CreateTexture(nil, "ARTWORK")
+		texture:SetAllPoints(region)
+		region.texture = texture
+		WA.regionPrototype.create(region)
+		function region:Update()
+			if self.state and self.state.texture then self:SetTexture(self.state.texture) end
+		end
+		region:Hide()
+		return region
+	end,
+	modify = function(region, data)
+		function region:SetRegionWidth(width) self.regionWidth = width; self:SetWidth(width) end
+		function region:SetRegionHeight(height) self.regionHeight = height; self:SetHeight(height) end
+		function region:SetTexture(path) self.texture:SetTexture(path or TEXTURE_DEFAULT) end
+		function region:Color(r, g, b, a) self.texture:SetVertexColor(r, g, b, a or 1) end
+		function region:SetDesaturated(value) self.texture:SetDesaturated(value and true or false) end
+		function region:SetBlendMode(value) self.texture:SetBlendMode(value or "BLEND") end
+		function region:SetMirror(value) self.mirror = value and true or false; applyTextureCoords(self.texture, self.mirror, self.rotation) end
+		function region:SetRotation(value) self.rotation = value or 0; applyTextureCoords(self.texture, self.mirror, self.rotation) end
+
+		region:SetRegionWidth(data.width)
+		region:SetRegionHeight(data.height)
+		region:SetRegionAlpha(data.alpha)
+		region:SetTexture(data.texture)
+		local color = data.color or { 1, 1, 1, 1 }
+		region:Color(color[1], color[2], color[3], color[4])
+		region:SetDesaturated(data.desaturate)
+		region:SetBlendMode(data.blendMode)
+		region:SetMirror(data.mirror)
+		region:SetRotation(data.rotation)
+		WA.regionPrototype.ApplyPosition(region, data)
+		WA.regionPrototype.ApplyFrameStrata(region, data)
+		WA.regionPrototype.modifyFinish(region, data)
+	end,
+})
+
 WA.RegisterRegionType("icon", {
 	displayName = "Icon",
 	description = "A spell icon with a cooldown swipe, stacks and timer text.",
@@ -2061,6 +2247,285 @@ local function textModify(region, data)
 	region:ConfigureSubscribers()
 end
 
+local PROGTEX_ORIENTATIONS = { "HORIZONTAL", "HORIZONTAL_INVERSE", "VERTICAL", "VERTICAL_INVERSE" }
+local PROGTEX_ORIENTATION_LABELS = {
+	HORIZONTAL = "Right to Left", HORIZONTAL_INVERSE = "Left to Right",
+	VERTICAL = "Bottom to Top", VERTICAL_INVERSE = "Top to Bottom",
+}
+local PROGTEX_DEFAULT = "Interface\\AddOns\\WeakestAuras\\textures\\shapes\\Square_FullWhite.tga"
+
+-- Corner texcoords cropping the source to the drawn fraction, in SetTexCoord's
+-- (UL, LL, UR, LR) order. Ported from WA2 LinearProgressTextureBase's
+-- ApplyProgressToCoordFunctions with startProgress pinned at 0, since there are
+-- no overlays here to occupy a sub-range.
+--
+-- These deliberately do *not* match BAR_TEXCOORDS: the bar rotates its source
+-- 90 degrees for the vertical pair, and a progress texture must not. Bar art is
+-- a grain that has to run along the fill axis; a progress texture is a picture
+-- the user chose, and standing it on its side is a bug. Rotating also crops the
+-- wrong source axis -- the drawn rect then shrinks on one axis while the crop
+-- shrinks the other, so the art squashes instead of being revealed.
+local PROGTEX_TEXCOORDS = {
+	HORIZONTAL = function(p)
+		return 0, 0, 0, 1, p, 0, p, 1
+	end,
+	HORIZONTAL_INVERSE = function(p)
+		return 1 - p, 0, 1 - p, 1, 1, 0, 1, 1
+	end,
+	VERTICAL = function(p)
+		return 0, 1 - p, 0, 1, 1, 1 - p, 1, 1
+	end,
+	VERTICAL_INVERSE = function(p)
+		return 0, 0, 0, p, 1, 0, 1, p
+	end,
+}
+
+-- Rotates/mirrors one source corner about the texture's centre (WA2
+-- TextureCoords.TransformPoint, minus the crop and user-offset terms this
+-- region type exposes no options for). Upstream's 1/sqrt(2) shrink is absent
+-- with it: that shrink exists to be cancelled by upstream's default crop of
+-- 1.41, so reproducing only half the pair would silently zoom the art. A
+-- rotation therefore runs the corners outside [0, 1], which reads as
+-- transparent margins on this client rather than as wrapped or clamped art.
+local function progTexPoint(x, y, cosR, sinR, mirror, userX, userY)
+	x, y = x - 0.5, y - 0.5
+	if mirror then x = -x end
+	x, y = cosR * x - sinR * y, sinR * x + cosR * y
+	return x + 0.5 + (userX or 0), y + 0.5 + (userY or 0)
+end
+
+-- The crop above, then the rotation/mirror on top of it -- upstream's order in
+-- LinearProgressTextureBase.UpdateTextures, and it is load-bearing: rotating
+-- first would spin the axis the crop then measures along.
+local function progTexCoords(o, p, rotation, mirror, cropX, cropY, userX, userY)
+	local coords = PROGTEX_TEXCOORDS[o] or PROGTEX_TEXCOORDS.HORIZONTAL
+	local ULx, ULy, LLx, LLy, URx, URy, LRx, LRy = coords(p)
+	cropX, cropY = cropX or 0, cropY or 0
+	local sx, sy = 1 - cropX * 2, 1 - cropY * 2
+	local function crop(x, y) return cropX + x * sx, cropY + y * sy end
+	ULx, ULy = crop(ULx, ULy); LLx, LLy = crop(LLx, LLy)
+	URx, URy = crop(URx, URy); LRx, LRy = crop(LRx, LRy)
+	if not mirror and math.mod(rotation or 0, 360) == 0 then
+		return ULx + (userX or 0), ULy + (userY or 0), LLx + (userX or 0), LLy + (userY or 0), URx + (userX or 0), URy + (userY or 0), LRx + (userX or 0), LRy + (userY or 0)
+	end
+	local r = math.rad(rotation or 0)
+	local cosR, sinR = math.cos(r), math.sin(r)
+	ULx, ULy = progTexPoint(ULx, ULy, cosR, sinR, mirror, userX, userY)
+	LLx, LLy = progTexPoint(LLx, LLy, cosR, sinR, mirror, userX, userY)
+	URx, URy = progTexPoint(URx, URy, cosR, sinR, mirror, userX, userY)
+	LRx, LRy = progTexPoint(LRx, LRy, cosR, sinR, mirror, userX, userY)
+	return ULx, ULy, LLx, LLy, URx, URy, LRx, LRy
+end
+
+-- Which two corners of the region the fill is pinned to -- the edge the crop
+-- above keeps, so the art stays put and the fill grows away from it. WA2's
+-- LinearProgressTextureBase orientationToAnchorPoint, as a corner pair. The
+-- vertical entries are the opposite edge from BAR_ALIGN's, for the same reason
+-- PROGTEX_TEXCOORDS is not BAR_TEXCOORDS.
+local PROGTEX_ALIGN = {
+	HORIZONTAL = { "TOPLEFT", "BOTTOMLEFT" },
+	HORIZONTAL_INVERSE = { "TOPRIGHT", "BOTTOMRIGHT" },
+	VERTICAL = { "BOTTOMLEFT", "BOTTOMRIGHT" },
+	VERTICAL_INVERSE = { "TOPLEFT", "TOPRIGHT" },
+}
+
+-- Sizes and crops the fill texture to region.progress. Both have to move
+-- together, exactly as in fillBar: the texture is cropped to the same fraction
+-- of the same axis it is scaled to, or the art squashes instead of revealing.
+local function progTexFill(region)
+	local o = region.orientation or "HORIZONTAL"
+	local align = PROGTEX_ALIGN[o] or PROGTEX_ALIGN.HORIZONTAL
+	local p = region.progress or 0
+	if p < 0 then p = 0 elseif p > 1 then p = 1 end
+	local fg = region.foreground
+	if not fg then return end
+
+	local vertical = isVertical(o)
+	local extent = (vertical and (region.regionHeight or 0) or (region.regionWidth or 0)) * p
+	-- A zero-dimension texture is not worth asking the client to draw.
+	if extent <= 0 then fg:Hide(); return end
+
+	fg:ClearAllPoints()
+	fg:SetPoint(align[1], region, align[1])
+	fg:SetPoint(align[2], region, align[2])
+	-- Two corners on one edge fix the cross axis, leaving the fill axis free to
+	-- be set explicitly.
+	if vertical then fg:SetHeight(extent) else fg:SetWidth(extent) end
+	fg:SetTexCoord(progTexCoords(o, p, region.rotation, region.mirror, region.cropX, region.cropY, region.userX, region.userY))
+	fg:Show()
+end
+
+local function progTexBackground(region)
+	local background = region.background
+	if not background then return end
+	local o = region.orientation or "HORIZONTAL"
+	background:SetTexCoord(progTexCoords(o, 1, region.rotation, region.mirror, region.cropX, region.cropY, region.userX, region.userY))
+end
+
+WA.RegisterRegionType("progresstexture", {
+	displayName = "Progress Texture",
+	description = "A linear texture that fills from a progress value.",
+	defaults = {
+		foregroundTexture = PROGTEX_DEFAULT,
+		backgroundTexture = PROGTEX_DEFAULT,
+		sameTexture = true,
+		foregroundColor = { 1, 1, 1, 1 },
+		backgroundColor = { 0.5, 0.5, 0.5, 0.5 },
+		desaturateForeground = false,
+		desaturateBackground = false,
+		width = 200, height = 32, alpha = 1,
+		orientation = "HORIZONTAL", inverse = false, mirror = false, rotation = 0,
+		cropX = 0, cropY = 0,
+		progressSource = -1, progressSourceManualValue = 0, progressSourceManualTotal = 100,
+		anchorFrameType = "SCREEN", selfPoint = "CENTER", anchorPoint = "CENTER",
+		xOffset = 0, yOffset = 0, frameStrata = 1,
+	},
+	icon = PROGTEX_DEFAULT,
+	getSubRegionAnchors = function() return TEXTURE_SUB_ANCHORS end,
+	properties = WA.regionPrototype.AddProgressProperties(WA.regionPrototype.AddProperties({
+		foregroundColor = { display = "Foreground Color", setter = "Color", type = "color" },
+		backgroundColor = { display = "Background Color", setter = "SetBackgroundColor", type = "color" },
+		desaturateForeground = { display = "Desaturate Foreground", setter = "SetForegroundDesaturated", type = "bool" },
+		desaturateBackground = { display = "Desaturate Background", setter = "SetBackgroundDesaturated", type = "bool" },
+		orientation = { display = "Orientation", setter = "SetOrientation", type = "list", values = PROGTEX_ORIENTATION_LABELS },
+		inverse = { display = "Inverse", setter = "SetInverse", type = "bool" },
+		mirror = { display = "Mirror", setter = "SetMirror", type = "bool" },
+		rotation = { display = "Texture Rotation", setter = "SetTexRotation", type = "number", min = 0, max = 360, step = 1 },
+		cropX = { display = "Crop X", setter = "SetCropX", type = "number", min = 0, max = 0.5, step = 0.01 },
+		cropY = { display = "Crop Y", setter = "SetCropY", type = "number", min = 0, max = 0.5, step = 0.01 },
+		userX = { display = "Re-center X", setter = "SetUserX", type = "number", min = -0.5, max = 0.5, step = 0.01 },
+		userY = { display = "Re-center Y", setter = "SetUserY", type = "number", min = -0.5, max = 0.5, step = 0.01 },
+		foregroundTexture = { display = "Foreground Texture", setter = "SetForegroundTexture", type = "texture" },
+		backgroundTexture = { display = "Background Texture", setter = "SetBackgroundTexture", type = "texture" },
+	})),
+	createThumbnail = function(parent)
+		local frame = CreateFrame("Frame", nil, parent)
+		frame.bg = frame:CreateTexture(nil, "BACKGROUND")
+		frame.fg = frame:CreateTexture(nil, "ARTWORK")
+		return frame
+	end,
+	modifyThumbnail = function(frame, data)
+		local size = frame:GetHeight() or 32
+		local o = data.orientation or "HORIZONTAL"
+		local vertical = isVertical(o)
+		local long, thick = size * 0.82, size * 0.35
+		frame.bg:SetWidth(vertical and thick or long); frame.bg:SetHeight(vertical and long or thick)
+		frame.bg:SetPoint("CENTER", frame, "CENTER")
+		frame.bg:SetTexture((data.backgroundColor or { 0.5, 0.5, 0.5, 0.5})[1], (data.backgroundColor or { 0.5, 0.5, 0.5, 0.5})[2], (data.backgroundColor or { 0.5, 0.5, 0.5, 0.5})[3], (data.backgroundColor or { 0.5, 0.5, 0.5, 0.5})[4])
+		frame.fg:SetTexture(data.foregroundTexture or PROGTEX_DEFAULT)
+		local c = data.foregroundColor or { 1, 1, 1, 1 }
+		frame.fg:SetVertexColor(c[1], c[2], c[3], c[4] or 1)
+		local p = 0.6
+		frame.fg:SetWidth(vertical and thick or long * p); frame.fg:SetHeight(vertical and long * p or thick)
+		frame.fg:SetPoint(vertical and "BOTTOM" or "LEFT", frame.bg, vertical and "BOTTOM" or "LEFT")
+		frame.fg:Show()
+	end,
+	options = function(data)
+		local fields = {
+			{ type = "header", name = "Progress Texture" },
+			{ type = "texture", name = "Foreground texture", key = "foregroundTexture", get = function() return data.foregroundTexture end, set = function(v) data.foregroundTexture = v; WA.Add(data, true); WA.RefreshList() end },
+			{ type = "toggle", name = "Same texture", key = "sameTexture", get = function() return data.sameTexture end, set = function(v) data.sameTexture = v; WA.Add(data, true); WA.RefreshOptions() end },
+			{ type = "color", name = "Foreground color", key = "foregroundColor", half = true, get = function() return data.foregroundColor end, set = function(v) data.foregroundColor = v; WA.Add(data, true) end },
+			{ type = "color", name = "Background color", key = "backgroundColor", half = true, get = function() return data.backgroundColor end, set = function(v) data.backgroundColor = v; WA.Add(data, true) end },
+			{ type = "toggle", name = "Desaturate foreground", key = "desaturateForeground", half = true, get = function() return data.desaturateForeground end, set = function(v) data.desaturateForeground = v; WA.Add(data, true) end },
+			{ type = "toggle", name = "Desaturate background", key = "desaturateBackground", half = true, get = function() return data.desaturateBackground end, set = function(v) data.desaturateBackground = v; WA.Add(data, true) end },
+			{ type = "select", name = "Orientation", key = "orientation", get = function() return data.orientation end, set = function(v) data.orientation = v; WA.Add(data, true); WA.RefreshOptions() end, values = PROGTEX_ORIENTATIONS, labels = PROGTEX_ORIENTATION_LABELS },
+			{ type = "toggle", name = "Inverse", key = "inverse", half = true, get = function() return data.inverse end, set = function(v) data.inverse = v; WA.Add(data, true) end },
+			{ type = "toggle", name = "Mirror", key = "mirror", half = true, get = function() return data.mirror end, set = function(v) data.mirror = v; WA.Add(data, true) end },
+			{ type = "range", name = "Texture rotation", key = "rotation", min = 0, max = 360, step = 1, half = true, get = function() return data.rotation end, set = function(v) data.rotation = v; WA.Add(data, true) end },
+			{ type = "range", name = "Alpha", key = "alpha", min = 0, max = 1, step = 0.05, half = true, get = function() return data.alpha end, set = function(v) data.alpha = v; WA.Add(data, true) end },
+			{ type = "range", name = "Crop X", key = "cropX", min = 0, max = 0.5, step = 0.01, half = true, get = function() return data.cropX end, set = function(v) data.cropX = v; WA.Add(data, true) end },
+			{ type = "range", name = "Crop Y", key = "cropY", min = 0, max = 0.5, step = 0.01, half = true, get = function() return data.cropY end, set = function(v) data.cropY = v; WA.Add(data, true) end },
+			{ type = "range", name = "Re-center X", key = "userX", min = -0.5, max = 0.5, step = 0.01, half = true, get = function() return data.userX end, set = function(v) data.userX = v; WA.Add(data, true) end },
+			{ type = "range", name = "Re-center Y", key = "userY", min = -0.5, max = 0.5, step = 0.01, half = true, get = function() return data.userY end, set = function(v) data.userY = v; WA.Add(data, true) end },
+			{ type = "header", name = "Size" },
+			{ type = "range", name = "Width", key = "width", min = 8, max = 512, step = 1, half = true, get = function() return data.width end, set = function(v) data.width = v; WA.Add(data, true) end },
+			{ type = "range", name = "Height", key = "height", min = 8, max = 512, step = 1, half = true, get = function() return data.height end, set = function(v) data.height = v; WA.Add(data, true) end },
+		}
+		if not data.sameTexture then
+			table.insert(fields, 3, { type = "texture", name = "Background texture", key = "backgroundTexture", get = function() return data.backgroundTexture end, set = function(v) data.backgroundTexture = v; WA.Add(data, true); WA.RefreshList() end })
+		end
+		for _, f in ipairs(WA.regionPrototype.ProgressOptions(data)) do table.insert(fields, f) end
+		for _, f in ipairs(WA.regionPrototype.PositionOptions(data)) do table.insert(fields, f) end
+		return fields
+	end,
+	create = function(parent)
+		local region = CreateFrame("Frame", nil, parent)
+		local bg = region:CreateTexture(nil, "BACKGROUND")
+		-- The fill is a plain texture anchored to the region and resized, not a
+		-- clipped viewport onto a full-size one: a ScrollFrame clips to a
+		-- rectangle, which is the shape the resize already gives, so it bought
+		-- nothing but a second coordinate space to keep in step.
+		local fg = region:CreateTexture(nil, "ARTWORK")
+		bg:SetAllPoints(region)
+		region.background, region.foreground = bg, fg
+		WA.regionPrototype.create(region)
+		function region:Update()
+			if self.state then WA.regionPrototype.UpdateProgress(self) end
+		end
+		function region:SetProgress(p)
+			self.progress = clampProgress(self, p)
+			progTexFill(self)
+		end
+		function region:UpdateValue()
+			local total = self.total or 0
+			self:SetProgress(total > 0 and (self.value or 0) / total or 1)
+		end
+		-- The fill is this region's own animation and has to be recomputed from
+		-- the clock every frame, exactly as the progressbar's does -- deriving
+		-- the fraction once per state change leaves a timed aura frozen at
+		-- whatever fraction it held when the state arrived.
+		function region:UpdateTime()
+			if self.duration and self.duration > 0 then
+				self:SetScript("OnUpdate", function()
+					if not this:IsShown() then this:SetScript("OnUpdate", nil); return end
+					local remain = this.expirationTime - GetTime()
+					this:SetProgress(remain / this.duration)
+					if remain <= 0 then this:SetScript("OnUpdate", nil) end
+				end)
+			else
+				self:SetProgress(1)
+				self:SetScript("OnUpdate", nil)
+			end
+		end
+		region:Hide()
+		return region
+	end,
+	modify = function(region, data)
+		function region:SetRegionWidth(v) self.regionWidth = v; self:SetWidth(v); progTexFill(self) end
+		function region:SetRegionHeight(v) self.regionHeight = v; self:SetHeight(v); progTexFill(self) end
+		function region:SetForegroundTexture(v) self.foreground:SetTexture(v or PROGTEX_DEFAULT); progTexFill(self) end
+		function region:SetBackgroundTexture(v) self.background:SetTexture(v or PROGTEX_DEFAULT); progTexBackground(self) end
+		function region:Color(r, g, b, a) self.foreground:SetVertexColor(r, g, b, a or 1) end
+		function region:SetBackgroundColor(r, g, b, a) self.background:SetVertexColor(r, g, b, a or 1) end
+		function region:SetForegroundDesaturated(v) self.foreground:SetDesaturated(v and true or false) end
+		function region:SetBackgroundDesaturated(v) self.background:SetDesaturated(v and true or false) end
+		function region:SetOrientation(v) self.orientation = v; progTexBackground(self); progTexFill(self) end
+		function region:SetInverse(v) self.inverse = v and true or false; if self.state then WA.regionPrototype.UpdateProgress(self) end end
+		function region:SetMirror(v) self.mirror = v and true or false; progTexBackground(self); progTexFill(self) end
+		function region:SetTexRotation(v) self.rotation = v or 0; progTexBackground(self); progTexFill(self) end
+		function region:SetCropX(v) self.cropX = math.max(0, math.min(0.5, v or 0)); progTexBackground(self); progTexFill(self) end
+		function region:SetCropY(v) self.cropY = math.max(0, math.min(0.5, v or 0)); progTexBackground(self); progTexFill(self) end
+		function region:SetUserX(v) self.userX = math.max(-0.5, math.min(0.5, v or 0)); progTexBackground(self); progTexFill(self) end
+		function region:SetUserY(v) self.userY = math.max(-0.5, math.min(0.5, v or 0)); progTexBackground(self); progTexFill(self) end
+		region:SetRegionWidth(data.width); region:SetRegionHeight(data.height)
+		region:SetRegionAlpha(data.alpha)
+		region:SetForegroundTexture(data.foregroundTexture); region:SetBackgroundTexture(data.sameTexture and data.foregroundTexture or data.backgroundTexture)
+		local fc = data.foregroundColor or { 1, 1, 1, 1 }; region:Color(fc[1], fc[2], fc[3], fc[4])
+		local bc = data.backgroundColor or { 0.5, 0.5, 0.5, 0.5 }; region:SetBackgroundColor(bc[1], bc[2], bc[3], bc[4])
+		region:SetForegroundDesaturated(data.desaturateForeground); region:SetBackgroundDesaturated(data.desaturateBackground)
+		region.orientation = data.orientation; region.inverse = data.inverse
+		region.rotation = data.rotation; region.mirror = data.mirror and true or false
+		region.cropX = data.cropX or 0; region.cropY = data.cropY or 0
+		region.userX = data.userX or 0; region.userY = data.userY or 0
+		region.progress = region.progress or 1
+		progTexBackground(region)
+		progTexFill(region)
+		WA.regionPrototype.ApplyPosition(region, data); WA.regionPrototype.ApplyFrameStrata(region, data)
+		WA.regionPrototype.ApplyProgressConfig(region, data); WA.regionPrototype.modifyFinish(region, data)
+	end,
+})
+
 WA.RegisterRegionType("text", {
 	displayName = "Text",
 	description = "A line of text on its own, driven by the same placeholders.",
@@ -2270,8 +2735,12 @@ WA.RegisterRegionType("fallback", {
 		region.textFrame:SetFrameLevel(region:GetFrameLevel() + 1)
 		WA.regionPrototype.modifyFinish(region, data)
 
-		WA.textCore.SetText(region.text,
-			"Region type " .. tostring(data.regionType) .. " not supported")
+		local requested = data.regionType
+		if requested == "progresstexture"
+			and (data.orientation == "CLOCKWISE" or data.orientation == "ANTICLOCKWISE") then
+			requested = requested .. " orientation " .. tostring(data.orientation)
+		end
+		WA.textCore.SetText(region.text, "Region type " .. tostring(requested) .. " not supported")
 		region:SetWidth(math.max(region.text:GetStringWidth() or 0, MIN_TEXT_DIM))
 		region:SetHeight(math.max(region.text:GetHeight() or 0, MIN_TEXT_DIM))
 	end,
