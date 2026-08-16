@@ -201,6 +201,33 @@ function WA.IsGroup(data)
 	return region ~= nil and region.isGroup == true
 end
 
+-- A texture value this client can actually draw, or nil for one it cannot --
+-- every caller already has a placeholder for nil, so an unusable value falls
+-- back to it instead of painting the engine's missing-texture block.
+--
+-- Two forms reach us from a WeakAuras export and neither is a file here:
+--
+-- * A **fileID** (a bare number, e.g. 135274). Modern clients keep a numeric
+--   handle per texture and `SetTexture` accepts it; this one has no such table
+--   and nothing can map it back to a path. 125 of the 160 manual icons in the
+--   corpus are fileIDs, so this is the common case, not an edge one.
+-- * An **atlas name** (`Legionfall_BarSpark`, `GarrMission_EncounterBar-Spark`).
+--   Atlases are a retail concept with no 1.12 equivalent, and they are
+--   recognisable by having no path separator -- a real texture path here always
+--   has one.
+--
+-- A path we *can* form may still be missing (someone else's addon folder), and
+-- nothing offline can tell: `SetTexture` reports nothing and `GetTexture` hands
+-- back whatever string it was given. That case still draws the block.
+function WA.DrawableTexture(value)
+	if type(value) == "number" then return nil end
+	if type(value) ~= "string" or value == "" then return nil end
+	if not string.find(value, "\\", 1, true) and not string.find(value, "/", 1, true) then
+		return nil
+	end
+	return value
+end
+
 -- Resolves the icon a leaf display currently shows: Manual mode uses
 -- data.displayIcon outright; Automatic asks the first trigger that can name
 -- one (WA.GetTriggerSystem's GetNameAndIcon), falling back to displayIcon.
@@ -210,16 +237,17 @@ end
 function WA.ResolveDisplayIcon(data)
 	if WA.IsGroup(data) then return nil end
 	if data.iconSource == 0 then
-		return (data.displayIcon and data.displayIcon ~= "" and data.displayIcon) or nil
+		return WA.DrawableTexture(data.displayIcon)
 	end
 	for n = 1, table.getn(data.triggers or {}) do
 		local system = WA.GetTriggerSystem and WA.GetTriggerSystem(data, n)
 		if system and system.GetNameAndIcon then
 			local _, icon = system.GetNameAndIcon(data, n)
+			icon = WA.DrawableTexture(icon)
 			if icon then return icon end
 		end
 	end
-	return (data.displayIcon and data.displayIcon ~= "" and data.displayIcon) or nil
+	return WA.DrawableTexture(data.displayIcon)
 end
 
 -- A table-valued default (e.g. a group's controlledChildren = {}) must be
@@ -242,13 +270,88 @@ local function mergeMissing(target, defaults)
 	end
 end
 
+local function renameField(target, oldKey, newKey)
+	if target[oldKey] ~= nil then
+		target[newKey] = target[oldKey]
+		target[oldKey] = nil
+	end
+end
+
+local TEXT_REGION_RENAMES = {
+	text_font = "font",
+	text_size = "fontSize",
+	text_flags = "outline",
+	text_color = "color",
+	text_justifyH = "justify",
+	text_justifyV = "justifyV",
+	text_spacing = "spacing",
+	text_shadowColor = "shadowColor",
+	text_shadowX = "shadowXOffset",
+	text_shadowY = "shadowYOffset",
+}
+local SUBTEXT_RENAMES = {
+	text_size = "text_fontSize",
+	text_flags = "text_fontType",
+	text_justifyH = "text_justify",
+	text_shadowX = "text_shadowXOffset",
+	text_shadowY = "text_shadowYOffset",
+	text_anchorPoint = "anchor_point",
+	text_x = "anchorXOffset",
+	text_y = "anchorYOffset",
+}
+
+local function migrateConditionProperties(data)
+	local conditions = data.conditions or {}
+	for i = 1, table.getn(conditions) do
+		local changes = conditions[i].changes or {}
+		for j = 1, table.getn(changes) do
+			local property = changes[j].property
+			if property == "text_size" then
+				changes[j].property = "fontSize"
+			elseif property == "text_color" then
+				changes[j].property = "color"
+			else
+				local _, _, prefix, suffix = string.find(property or "", "^(sub%.[0-9]+%.)(.*)$")
+				if suffix == "text_size" then
+					changes[j].property = prefix .. "text_fontSize"
+				end
+			end
+		end
+	end
+end
+
+local function migrateSchemaV3(data)
+	if data.regionType == "text" then
+		for oldKey, newKey in pairs(TEXT_REGION_RENAMES) do
+			renameField(data, oldKey, newKey)
+		end
+	end
+	for i = 1, table.getn(data.subRegions or {}) do
+		local subData = data.subRegions[i]
+		if subData then
+			for oldKey, newKey in pairs(SUBTEXT_RENAMES) do
+				renameField(subData, oldKey, newKey)
+			end
+			if subData.tick_placement ~= nil then
+				subData.tick_placements = { subData.tick_placement }
+				subData.tick_placement = nil
+			end
+		end
+	end
+	if data.regionType == "progresstexture" then
+		renameField(data, "cropX", "crop_x")
+		renameField(data, "cropY", "crop_y")
+		renameField(data, "userX", "user_x")
+		renameField(data, "userY", "user_y")
+	end
+	migrateConditionProperties(data)
+end
+
 -- Fills in missing fields from the aura's regionType/trigger.type defaults, and
--- migrates saved data to the schema v2 shape (upstream's `triggers` array +
--- combination metadata, §1). Safe to call repeatedly (e.g. after
+-- migrates saved data through the local schema versions (upstream's `triggers`
+-- array + combination metadata, §1). Safe to call repeatedly (e.g. after
 -- switching regionType, or normalizing older saved data) -- never overwrites a
--- field the user already set. One-way migration, no internalVersion field yet:
--- add one the first time a *second* migration is needed (upstream's Modernize
--- pattern), rather than building the versioning speculatively.
+-- field the user already set.
 function WA.MergeDefaults(data)
 	local region = WA.regionTypes[data.regionType]
 	mergeMissing(data, region and region.defaults)
@@ -276,6 +379,7 @@ function WA.MergeDefaults(data)
 		for i = 1, table.getn(data.triggers) do
 			local entry = data.triggers[i]
 			entry.trigger = entry.trigger or {}
+			entry.untrigger = entry.untrigger or {}
 			entry.trigger.type = entry.trigger.type or "aura"
 			local ttype = WA.triggerTypes[entry.trigger.type]
 			if ttype and ttype.migrate then ttype.migrate(entry.trigger) end
@@ -298,6 +402,20 @@ function WA.MergeDefaults(data)
 	data.subRegions = data.subRegions or {}
 	data.conditions = data.conditions or {}
 	data.load = data.load or {}
+	data.authorOptions = data.authorOptions or {}
+	data.config = data.config or {}
+	WA.ValidateUserConfig(data)
+	data.actions = data.actions or {}
+	data.actions.init = data.actions.init or {}
+	data.actions.start = data.actions.start or {}
+	data.actions.finish = data.actions.finish or {}
+	data.animation = data.animation or {}
+	data.animation.start = data.animation.start or { type = "none" }
+	data.animation.main = data.animation.main or { type = "none" }
+	data.animation.finish = data.animation.finish or { type = "none" }
+	data.animation.start.duration_type = data.animation.start.duration_type or "seconds"
+	data.animation.main.duration_type = data.animation.main.duration_type or "seconds"
+	data.animation.finish.duration_type = data.animation.finish.duration_type or "seconds"
 
 	-- Second migration (upstream's internalVersion/Modernize pattern): seed the
 	-- default sub-region texts exactly once. internalVersion < 1 covers both a
@@ -323,6 +441,11 @@ function WA.MergeDefaults(data)
 		data.x = nil
 		data.y = nil
 		data.internalVersion = 2
+	end
+
+	if data.internalVersion < 3 then
+		migrateSchemaV3(data)
+		data.internalVersion = 3
 	end
 end
 
@@ -571,12 +694,15 @@ function WA.Rename(oldId, newId) end
 
 -- Hook points for the conditions engine (Conditions.lua overrides these):
 -- LoadConditions (re)compiles a display's condition list at WA.Add time,
--- UnloadConditions tears it down at WA.Remove, and RunConditions evaluates it
--- against the just-applied states. No-ops until Conditions.lua loads, so the
--- state machine (StateMachine.lua) can call them unconditionally. RunConditions
--- is declared in StateMachine.lua (its apply path is the primary caller).
+-- UnloadConditions tears it down at WA.Remove, RunConditions evaluates it
+-- against the just-applied states, and ReleaseConditionsForClone discards
+-- activation/timer bookkeeping when a pooled clone leaves a display. No-ops
+-- until Conditions.lua loads, so the state machine can call them unconditionally.
+-- RunConditions is declared in StateMachine.lua (its apply path is the primary
+-- caller).
 function WA.LoadConditions(data) end
 function WA.UnloadConditions(data) end
+function WA.ReleaseConditionsForClone(uid, cloneId) end
 
 -- Hook points for the load system (Load.lua overrides these): EvalLoad returns
 -- whether a display's data.load conditions currently pass (class/level/zone/

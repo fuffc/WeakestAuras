@@ -60,9 +60,9 @@ function WA.GetProperties(data)
 	local rt = WA.regionTypes[data.regionType]
 	if rt and rt.properties then
 		for key, spec in pairs(rt.properties) do
-			out[key] = { display = spec.display or key, setter = spec.setter, type = spec.type,
+			out[key] = { display = spec.display or key, setter = spec.setter, action = spec.action, type = spec.type,
 				min = spec.min, max = spec.max, step = spec.step, values = spec.values,
-				base = spec.base, dataKey = key }
+				base = spec.base, baseIndex = spec.baseIndex, dataKey = spec.dataKey or key }
 		end
 	end
 	local subs = data.subRegions or {}
@@ -71,8 +71,9 @@ function WA.GetProperties(data)
 		if sspec and sspec.properties then
 			for key, pspec in pairs(sspec.properties) do
 				out["sub." .. i .. "." .. key] = { display = "Text " .. i .. " " .. (pspec.display or key),
-					setter = pspec.setter, type = pspec.type, min = pspec.min, max = pspec.max,
-					step = pspec.step, values = pspec.values, isSub = true, subIndex = i, subKey = key }
+					setter = pspec.setter, action = pspec.action, type = pspec.type, min = pspec.min, max = pspec.max,
+					step = pspec.step, values = pspec.values, base = pspec.base, baseIndex = pspec.baseIndex,
+					isSub = true, subIndex = i, subKey = pspec.dataKey or key }
 			end
 		end
 	end
@@ -103,10 +104,14 @@ end
 local function getBase(data, entry)
 	if entry.isSub then
 		local sub = data.subRegions and data.subRegions[entry.subIndex]
-		return sub and sub[entry.subKey]
+		local value = sub and sub[entry.subKey]
+		if entry.baseIndex and type(value) == "table" then return value[entry.baseIndex] end
+		return value
 	end
 	if entry.base ~= nil then return entry.base end
-	return data[entry.dataKey]
+	local value = data[entry.dataKey]
+	if entry.baseIndex and type(value) == "table" then return value[entry.baseIndex] end
+	return value
 end
 
 local function applyProperty(region, entry, value)
@@ -115,6 +120,11 @@ local function applyProperty(region, entry, value)
 		target = region.subRegions and region.subRegions[entry.subIndex]
 	end
 	if not target or not entry.setter or not target[entry.setter] then return end
+	-- A number setter does arithmetic on what it is handed, so a nil takes the
+	-- aura down. Two things produce one: a change the author never filled in, and
+	-- a deactivating condition restoring a property that has no base to restore
+	-- to. Leaving the property where it stands beats erroring in a paint.
+	if value == nil and entry.type == "number" then return end
 	if entry.type == "color" then
 		local c = value or { 1, 1, 1, 1 }
 		target[entry.setter](target, c[1] or 1, c[2] or 1, c[3] or 1, c[4] or 1)
@@ -277,7 +287,15 @@ runFor = function(region, uid, hideRegion)
 			for c = 1, table.getn(changes) do
 				local prop = changes[c].property
 				local pentry = prop and entry.properties[prop]
-				if pentry then propertyChanges[prop] = { entry = pentry, value = getBase(data, pentry) } end
+				if pentry and not pentry.action then
+					propertyChanges[prop] = { entry = pentry, value = getBase(data, pentry) }
+				elseif pentry and pentry.action == "SoundPlay"
+					and type(changes[c].value) == "table"
+					and changes[c].value.sound_type == "Loop" then
+					local target = region
+					if pentry.isSub then target = region.subRegions and region.subRegions[pentry.subIndex] end
+					if target and target.SoundRepeatStop then target:SoundRepeatStop() end
+				end
 			end
 		end
 	end
@@ -287,7 +305,27 @@ runFor = function(region, uid, hideRegion)
 			for c = 1, table.getn(changes) do
 				local prop = changes[c].property
 				local pentry = prop and entry.properties[prop]
-				if pentry then propertyChanges[prop] = { entry = pentry, value = changes[c].value } end
+				if pentry and pentry.action then
+					if not prev[i] then
+						local target = region
+						if pentry.isSub then target = region.subRegions and region.subRegions[pentry.subIndex] end
+						if target and target[pentry.action] then
+							local value = changes[c].value
+							if pentry.type == "customcode" and type(value) == "string" then
+								value = WA.LoadFunction(value, uid .. ": condition custom code", true)
+							end
+							if pentry.type == "sound" then
+								target[pentry.action](target, value)
+							elseif pentry.type == "chat" then
+								target[pentry.action](target, value)
+							else
+								target[pentry.action](target, value)
+							end
+						end
+					end
+				elseif pentry then
+					propertyChanges[prop] = { entry = pentry, value = changes[c].value }
+				end
 			end
 		end
 	end
@@ -308,6 +346,15 @@ end
 WA.RunConditions = function(region, uid, hideRegion)
 	if not uid then return end
 	WA.safecall(uid, runFor, region, uid, hideRegion)
+end
+
+function WA.ReleaseConditionsForClone(uid, cloneId)
+	if not uid then return end
+	local byClone = activated[uid]
+	if byClone then byClone[cloneId] = nil end
+	local key = uid .. "\0" .. cloneId
+	local timer = scheduled[key]
+	if timer then timer:Cancel(); scheduled[key] = nil end
 end
 
 function WA.LoadConditions(data)

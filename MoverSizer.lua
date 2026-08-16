@@ -39,13 +39,17 @@ local SNAP_THRESHOLD = 8
 
 local mover
 local overlay -- holds the two alignment-line textures (screen-space, TOOLTIP strata)
+local updateHandles
+local ANCHOR_ICON_TEXTURE = "Interface\\GLUES\\CharacterSelect\\Glues-AddOn-Icons.blp"
 
 local function ensureDot(m, i)
 	if m.dots[i] then return m.dots[i] end
 	local dot = m:CreateTexture(nil, "OVERLAY")
-	dot:SetWidth(6)
-	dot:SetHeight(6)
-	dot:SetTexture(0.9, 0.9, 0.2, 0.7)
+	dot:SetWidth(16)
+	dot:SetHeight(16)
+	dot:SetTexture(ANCHOR_ICON_TEXTURE)
+	dot:SetTexCoord(0, 0.25, 0, 1)
+	dot:SetVertexColor(1, 1, 1, 0.25)
 	m.dots[i] = dot
 	return dot
 end
@@ -137,6 +141,8 @@ local function moverOnUpdate()
 	if region ~= m.region then
 		m.region = region
 		anchorToRegion(m, region)
+		m.resizable = (not m.isGroup) and m.data and m.data.width ~= nil and region.SetRegionWidth ~= nil
+		updateHandles(m)
 	elseif m.isGroup then
 		anchorToRegion(m, region)
 	end
@@ -166,6 +172,7 @@ end
 function M.SetLocked(v)
 	M.locked = v and true or false
 	WA.Options().locked = M.locked
+	if mover then updateHandles(mover) end
 end
 
 local function ensureOverlay()
@@ -344,6 +351,7 @@ end
 local function startDragging()
 	local m = mover
 	local region, data = m.region, m.data
+	if region and WA.CancelAnimation then WA.CancelAnimation(region, true, true, true, true, true, false) end
 	if not region or not data then return end
 	if M.locked then return end
 	-- A dynamicgroup owns its children's positions; dragging one is meaningless.
@@ -361,7 +369,10 @@ local function stopDragging()
 	m.dragging = false
 	m:SetScript("OnUpdate", moverOnUpdate)
 	hideLines()
-	if m.data then WA.Add(m.data, true) end -- persist + relayout any parent group
+	if m.data then
+		WA.Add(m.data, true)
+		if WA.Animate and m.region then WA.Animate("display", m.data.uid, "main", m.data.animation and m.data.animation.main, m.region, false, nil, true, m.region.cloneId) end
+	end
 end
 
 -- ---------------------------------------------------------------------------
@@ -376,6 +387,34 @@ end
 
 local MIN_DIM = 4
 local HANDLE_POINTS = { "TOPLEFT", "TOP", "TOPRIGHT", "RIGHT", "BOTTOMRIGHT", "BOTTOM", "BOTTOMLEFT", "LEFT" }
+local HANDLE_TEXTURE = "Interface\\AddOns\\WeakestAuras\\textures\\UI-Listbox-Highlight.tga"
+local CORNER_SIZE = 16
+local EDGE_SIZE = 8
+
+local function resizeSnap(m, region, width, height, hasL, hasR, hasT, hasB, scale)
+	local l, r, t, b = regionBoundsPhys(region)
+	if not l then hideLines(); return width, height end
+	local xEdge = hasL and l or (hasR and r)
+	local yEdge = hasB and b or (hasT and t)
+	local xDelta, xCoord
+	local yDelta, yCoord
+	if xEdge then xDelta, xCoord = nearestGuide(m.xGuides or {}, { xEdge }) end
+	if yEdge then yDelta, yCoord = nearestGuide(m.yGuides or {}, { yEdge }) end
+	if not xDelta and not yDelta then hideLines(); return width, height, false end
+	local useX = xDelta and (not yDelta or math.abs(xDelta) <= math.abs(yDelta))
+	if useX then
+		width = round(width + (hasR and xDelta or -xDelta) / scale)
+		if m.preserveAspect then height = width / m.aspectRatio end
+	elseif yDelta then
+		height = round(height + (hasT and yDelta or -yDelta) / scale)
+		if m.preserveAspect then width = height * m.aspectRatio end
+	end
+	if width < MIN_DIM then width = MIN_DIM end
+	if height < MIN_DIM then height = MIN_DIM end
+	if useX then drawVLine(xCoord) elseif xDelta then hideLines() end
+	if not m.preserveAspect and yDelta and not useX then drawHLine(yCoord) end
+	return width, height, true
+end
 
 local function onSizeUpdate()
 	local m = mover
@@ -398,8 +437,30 @@ local function onSizeUpdate()
 	if newW < MIN_DIM then newW = MIN_DIM end
 	local newH = m.startH
 	if hasT then newH = m.startH + dy elseif hasB then newH = m.startH - dy end
-	newH = round(newH)
-	if newH < MIN_DIM then newH = MIN_DIM end
+	if m.preserveAspect then
+		local ratio = m.aspectRatio
+		local dW, dH = newW - m.startW, newH - m.startH
+		if math.abs(dW) >= math.abs(dH * ratio) then
+			newW = round(newW)
+			newH = newW / ratio
+		else
+			newH = round(newH)
+			newW = newH * ratio
+		end
+		if newW < MIN_DIM then
+			newW = MIN_DIM
+			newH = newW / ratio
+		elseif newH < MIN_DIM then
+			newH = MIN_DIM
+			newW = newH * ratio
+		end
+	end
+	if not m.preserveAspect then
+		newH = round(newH)
+		if newH < MIN_DIM then newH = MIN_DIM end
+	elseif newW < MIN_DIM or newH < MIN_DIM then
+		newW, newH = MIN_DIM, MIN_DIM / m.aspectRatio
+	end
 
 	data.width, data.height = newW, newH
 	region:SetRegionWidth(newW)
@@ -435,20 +496,56 @@ local function onSizeUpdate()
 	xoff, yoff = round(xoff), round(yoff)
 	data.xOffset, data.yOffset = xoff, yoff
 	region:SetOffset(xoff, yoff)
+
+	if M.magnetism and (m.preserveAspect or not IsShiftKeyDown()) then
+		local snapW, snapH, snapped = resizeSnap(m, region, newW, newH, hasL, hasR, hasT, hasB, scale)
+		if snapped then
+			newW, newH = snapW, snapH
+			data.width, data.height = newW, newH
+			region:SetRegionWidth(newW)
+			region:SetRegionHeight(newH)
+			local ndW, ndH = newW - m.startW, newH - m.startH
+			if string.find(asp, "LEFT") then
+				if hasL then xoff = m.startXOff - ndW end
+			elseif string.find(asp, "RIGHT") then
+				if hasR then xoff = m.startXOff + ndW end
+			else
+				if hasL then xoff = m.startXOff - ndW / 2 elseif hasR then xoff = m.startXOff + ndW / 2 end
+			end
+			if string.find(asp, "BOTTOM") then
+				if hasB then yoff = m.startYOff - ndH end
+			elseif string.find(asp, "TOP") then
+				if hasT then yoff = m.startYOff + ndH end
+			else
+				if hasB then yoff = m.startYOff - ndH / 2 elseif hasT then yoff = m.startYOff + ndH / 2 end
+			end
+			xoff, yoff = round(xoff), round(yoff)
+			data.xOffset, data.yOffset = xoff, yoff
+			region:SetOffset(xoff, yoff)
+		end
+	else
+		hideLines()
+	end
 end
 
 local function startSizing(point)
 	local m = mover
 	local region, data = m.region, m.data
+	if region and WA.CancelAnimation then WA.CancelAnimation(region, true, true, true, true, true, false) end
 	if not region or not data then return end
 	if M.locked then return end
 	m.sizing = true
 	m.sizePoint = point
+	m.preserveAspect = (string.find(point, "LEFT") or string.find(point, "RIGHT"))
+		and (string.find(point, "TOP") or string.find(point, "BOTTOM"))
+		and IsShiftKeyDown() and true or false
 	m.startCx, m.startCy = GetCursorPosition()
 	m.startW = data.width or (region:GetWidth() or 8)
 	m.startH = data.height or (region:GetHeight() or 8)
+	m.aspectRatio = m.startW > 0 and m.startH > 0 and m.startW / m.startH or 1
 	m.startXOff = data.xOffset or 0
 	m.startYOff = data.yOffset or 0
+	buildGuides(m)
 	m:SetScript("OnUpdate", function() onSizeUpdate(); moverOnUpdate() end)
 end
 
@@ -457,7 +554,116 @@ local function stopSizing()
 	if not m.sizing then return end
 	m.sizing = false
 	m:SetScript("OnUpdate", moverOnUpdate)
-	if m.data then WA.Add(m.data, true) end
+	if m.data then
+		WA.Add(m.data, true)
+		if WA.Animate and m.region then WA.Animate("display", m.data.uid, "main", m.data.animation and m.data.animation.main, m.region, false, nil, true, m.region.cloneId) end
+	end
+end
+
+local function makeHandleTexture(handle, coords)
+	local tex = handle:CreateTexture(nil, "OVERLAY")
+	tex:SetTexture(HANDLE_TEXTURE)
+	tex:SetBlendMode("ADD")
+	if coords then tex:SetTexCoord(unpack(coords)) end
+	tex:Hide()
+	return tex
+end
+
+local function hideHandleVisuals(handle)
+	for i = 1, table.getn(handle.visuals or {}) do handle.visuals[i]:Hide() end
+end
+
+local function showHandleVisuals(handle)
+	if not handle._active then return end
+	for i = 1, table.getn(handle.visuals or {}) do handle.visuals[i]:Show() end
+end
+
+updateHandles = function(m)
+	local active = m.resizable and not M.locked
+	for i = 1, table.getn(m.handles or {}) do
+		local handle = m.handles[i]
+		handle._active = active
+		if active then handle:Show() else handle:Hide() end
+		hideHandleVisuals(handle)
+	end
+end
+
+local function addCorner(handle, firstCoords, firstPoints, secondCoords, secondPoints)
+	local first = makeHandleTexture(handle, firstCoords)
+	first:SetPoint(unpack(firstPoints[1]))
+	first:SetPoint(unpack(firstPoints[2]))
+	local second = makeHandleTexture(handle, secondCoords)
+	second:SetPoint(unpack(secondPoints[1]))
+	second:SetPoint(unpack(secondPoints[2]))
+	handle.visuals = { first, second }
+end
+
+local function addEdge(handle, coords, firstPoint, secondPoint)
+	local tex = makeHandleTexture(handle, coords)
+	tex:SetPoint(unpack(firstPoint))
+	tex:SetPoint(unpack(secondPoint))
+	handle.visuals = { tex }
+end
+
+local function configureCorner(handle, parent, point, firstCoords, secondCoords)
+	handle:SetWidth(CORNER_SIZE)
+	handle:SetHeight(CORNER_SIZE)
+	handle:SetPoint(point, parent, point)
+	local first, second
+	if point == "TOPRIGHT" then
+		first = makeHandleTexture(handle, firstCoords)
+		first:SetPoint("TOPRIGHT", handle, "TOPRIGHT", -3, -3)
+		first:SetPoint("BOTTOMLEFT", handle, "BOTTOM")
+		second = makeHandleTexture(handle, secondCoords)
+		second:SetPoint("TOPRIGHT", first, "TOPLEFT")
+		second:SetPoint("BOTTOMLEFT", handle, "LEFT")
+	elseif point == "BOTTOMRIGHT" then
+		first = makeHandleTexture(handle, firstCoords)
+		first:SetPoint("BOTTOMRIGHT", handle, "BOTTOMRIGHT", -3, 3)
+		first:SetPoint("TOPLEFT", handle, "TOP")
+		second = makeHandleTexture(handle, secondCoords)
+		second:SetPoint("BOTTOMRIGHT", first, "BOTTOMLEFT")
+		second:SetPoint("TOPLEFT", handle, "LEFT")
+	elseif point == "BOTTOMLEFT" then
+		first = makeHandleTexture(handle, firstCoords)
+		first:SetPoint("BOTTOMLEFT", handle, "BOTTOMLEFT", 3, 3)
+		first:SetPoint("TOPRIGHT", handle, "TOP")
+		second = makeHandleTexture(handle, secondCoords)
+		second:SetPoint("BOTTOMLEFT", first, "BOTTOMRIGHT")
+		second:SetPoint("TOPRIGHT", handle, "RIGHT")
+	else
+		first = makeHandleTexture(handle, firstCoords)
+		first:SetPoint("TOPLEFT", handle, "TOPLEFT", 3, -3)
+		first:SetPoint("BOTTOMRIGHT", handle, "BOTTOM")
+		second = makeHandleTexture(handle, secondCoords)
+		second:SetPoint("TOPLEFT", first, "TOPRIGHT")
+		second:SetPoint("BOTTOMRIGHT", handle, "RIGHT")
+	end
+	handle.visuals = { first, second }
+end
+
+local function configureEdge(handle, point, leftOrTop, rightOrBottom, coords)
+	if point == "TOP" then
+		handle:SetHeight(EDGE_SIZE)
+		handle:SetPoint("TOPRIGHT", rightOrBottom, "TOPLEFT")
+		handle:SetPoint("TOPLEFT", leftOrTop, "TOPRIGHT")
+		addEdge(handle, coords, { "TOPRIGHT", rightOrBottom, "TOPRIGHT", -3, -3 }, { "BOTTOMLEFT", leftOrTop, "LEFT", 3, 0 })
+	elseif point == "RIGHT" then
+		handle:SetWidth(EDGE_SIZE)
+		handle:SetPoint("BOTTOMRIGHT", rightOrBottom, "TOPRIGHT")
+		handle:SetPoint("TOPRIGHT", leftOrTop, "BOTTOMRIGHT")
+		addEdge(handle, coords, { "BOTTOMRIGHT", rightOrBottom, "BOTTOMRIGHT", -3, 3 }, { "TOPLEFT", leftOrTop, "TOP", 0, -3 })
+	elseif point == "BOTTOM" then
+		handle:SetHeight(EDGE_SIZE)
+		handle:SetPoint("BOTTOMLEFT", leftOrTop, "BOTTOMRIGHT")
+		handle:SetPoint("BOTTOMRIGHT", rightOrBottom, "BOTTOMLEFT")
+		addEdge(handle, coords, { "BOTTOMLEFT", leftOrTop, "BOTTOMLEFT", 3, 3 }, { "TOPRIGHT", rightOrBottom, "RIGHT", -3, 0 })
+	else
+		handle:SetWidth(EDGE_SIZE)
+		handle:SetPoint("TOPLEFT", leftOrTop, "BOTTOMLEFT")
+		handle:SetPoint("BOTTOMLEFT", rightOrBottom, "TOPLEFT")
+		addEdge(handle, coords, { "BOTTOMLEFT", rightOrBottom, "BOTTOMLEFT", 3, 3 }, { "TOPRIGHT", leftOrTop, "TOP", 0, -3 })
+	end
 end
 
 local function ensureMover()
@@ -474,40 +680,76 @@ local function ensureMover()
 	m.dots = {}
 
 	local selfIcon = m:CreateTexture(nil, "OVERLAY")
-	selfIcon:SetWidth(12); selfIcon:SetHeight(12)
-	selfIcon:SetTexture(0.3, 1, 0.3, 0.9)
+	selfIcon:SetWidth(16); selfIcon:SetHeight(16)
+	selfIcon:SetTexture(ANCHOR_ICON_TEXTURE)
+	selfIcon:SetTexCoord(0, 0.25, 0, 1)
 	m.selfIcon = selfIcon
 
 	local anchorIcon = m:CreateTexture(nil, "OVERLAY")
-	anchorIcon:SetWidth(12); anchorIcon:SetHeight(12)
-	anchorIcon:SetTexture(1, 0.82, 0, 0.9)
+	anchorIcon:SetWidth(16); anchorIcon:SetHeight(16)
+	anchorIcon:SetTexture(ANCHOR_ICON_TEXTURE)
+	anchorIcon:SetTexCoord(0, 0.25, 0, 1)
 	m.anchorIcon = anchorIcon
 
 	local label = m:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
 	label:Hide()
 	m.label = label
 
-	-- Eight resize handles, one per edge/corner. Each is a small button anchored
-	-- to the matching point of the mover (which tracks the region), so it sits on
-	-- that edge; its OnMouseDown starts a sizing drag for that point. Children of
-	-- the mover, so they catch the click before the body's move drag.
+	-- Eight resize handles, one per edge/corner. The buttons remain the hit areas;
+	-- their child textures carry WA2's L-shaped visual treatment and stay hidden
+	-- until the pointer enters a live handle.
 	m.handles = {}
+	local corners = {}
+	local cornerCoords = {
+		TOPLEFT = { { 0.5, 0, 0, 0, 0.5, 1, 0, 1 }, { 0.5, 0, 0.5, 1, 1, 0, 1, 1 } },
+		TOPRIGHT = { { 0.5, 0, 0, 0, 0.5, 1, 0, 1 }, { 0, 0, 0, 1, 0.5, 0, 0.5, 1 } },
+		BOTTOMRIGHT = { { 1, 0, 0.5, 0, 1, 1, 0.5, 1 }, { 0, 0, 0, 1, 0.5, 0, 0.5, 1 } },
+		BOTTOMLEFT = { { 1, 0, 0.5, 0, 1, 1, 0.5, 1 }, { 0.5, 0, 0.5, 1, 1, 0, 1, 1 } },
+	}
 	for i = 1, table.getn(HANDLE_POINTS) do
 		local point = HANDLE_POINTS[i]
 		local h = CreateFrame("Button", nil, m)
-		h:SetWidth(10); h:SetHeight(10)
-		h:SetPoint("CENTER", m, point)
-		local tex = h:CreateTexture(nil, "OVERLAY")
-		tex:SetAllPoints(h)
-		tex:SetTexture(1, 0.82, 0, 0.9)
+		h:SetWidth(CORNER_SIZE)
+		h:SetHeight(CORNER_SIZE)
+		if point == "TOPLEFT" then
+			corners[point] = h
+			configureCorner(h, m, point, cornerCoords[point][1], cornerCoords[point][2])
+		elseif point == "TOPRIGHT" then
+			corners[point] = h
+			configureCorner(h, m, point, cornerCoords[point][1], cornerCoords[point][2])
+		elseif point == "BOTTOMRIGHT" then
+			corners[point] = h
+			configureCorner(h, m, point, cornerCoords[point][1], cornerCoords[point][2])
+		elseif point == "BOTTOMLEFT" then
+			corners[point] = h
+			configureCorner(h, m, point, cornerCoords[point][1], cornerCoords[point][2])
+		end
+		m.handles[i] = h
+	end
+	for i = 1, table.getn(HANDLE_POINTS) do
+		local point = HANDLE_POINTS[i]
+		local h = m.handles[i]
+		if point == "TOP" then
+			configureEdge(h, point, corners.TOPLEFT, corners.TOPRIGHT, nil)
+		elseif point == "RIGHT" then
+			configureEdge(h, point, corners.TOPRIGHT, corners.BOTTOMRIGHT, nil)
+		elseif point == "BOTTOM" then
+			configureEdge(h, point, corners.BOTTOMLEFT, corners.BOTTOMRIGHT, { 1, 0, 0, 0, 1, 1, 0, 1 })
+		elseif point == "LEFT" then
+			configureEdge(h, point, corners.TOPLEFT, corners.BOTTOMLEFT, { 1, 0, 0, 0, 1, 1, 0, 1 })
+		end
+		h:EnableMouse(true)
+		h:SetScript("OnEnter", function() showHandleVisuals(h) end)
+		h:SetScript("OnLeave", function() hideHandleVisuals(h) end)
 		h:SetScript("OnMouseDown", function() startSizing(point) end)
 		h:SetScript("OnMouseUp", stopSizing)
-		m.handles[i] = h
+		hideHandleVisuals(h)
 	end
 
 	m:SetScript("OnMouseDown", startDragging)
 	m:SetScript("OnMouseUp", stopDragging)
 	m:Hide()
+	m.resizable = false
 	mover = m
 	return m
 end
@@ -542,10 +784,8 @@ function M.Attach(id)
 	-- Resize handles show for a leaf that carries width/height + the setters
 	-- (icon/progressbar) -- including a dynamicgroup child (its size is its own);
 	-- a group's box is derived from its children, so it isn't resizable.
-	local resizable = (not m.isGroup) and data.width ~= nil and region.SetRegionWidth ~= nil
-	for i = 1, table.getn(m.handles) do
-		if resizable then m.handles[i]:Show() else m.handles[i]:Hide() end
-	end
+	m.resizable = (not m.isGroup) and data.width ~= nil and region.SetRegionWidth ~= nil
+	updateHandles(m)
 	m:SetScript("OnUpdate", moverOnUpdate)
 	m:Show()
 end
@@ -556,6 +796,8 @@ function M.Detach()
 	mover.id = nil
 	mover.region = nil
 	mover.data = nil
+	mover.resizable = false
+	updateHandles(mover)
 	mover:SetScript("OnUpdate", nil)
 	mover:Hide()
 	hideLines()

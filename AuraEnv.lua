@@ -60,8 +60,10 @@ local stack, depth = {}, 0
 -- variables that way, but nothing here can make them agree either.
 function WA.ActivateAuraEnv(id, cloneId, state, states)
 	local env = id and environments[id]
+	local created = false
 	if not env then
 		env = {}
+		created = true
 		-- An id-less caller is a bug, but one whose blast radius is a repaint that
 		-- dies rather than an aura_env that doesn't persist. Take the second.
 		if id then environments[id] = env end
@@ -70,6 +72,12 @@ function WA.ActivateAuraEnv(id, cloneId, state, states)
 	env.cloneId = cloneId
 	env.state = state
 	env.states = states
+	if created then
+		local data = id and WeakestAurasDB.displays[id]
+		if data and not WA.IsGroup(data) then
+			env.config = WA.DeepCopy(data.config)
+		end
+	end
 	-- Peek, not Ensure: filling this in must not spin up a frame for an aura
 	-- nothing has drawn yet.
 	env.region = WA.PeekRegion and WA.PeekRegion(id, cloneId) or nil
@@ -108,6 +116,17 @@ end
 function WA.RenameAuraEnv(oldId, newId)
 	environments[newId] = environments[oldId]
 	environments[oldId] = nil
+end
+
+function WA.RefreshAuraEnvConfig(id)
+	local env = id and environments[id]
+	local data = id and WeakestAurasDB.displays[id]
+	if not env or not data then return end
+	if WA.IsGroup(data) then
+		env.config = nil
+	else
+		env.config = WA.DeepCopy(data.config)
+	end
 end
 
 -- ---------------------------------------------------------------------------
@@ -181,8 +200,9 @@ end
 --
 -- `who` is a region -- id, cloneId, state and states are read off it -- or a
 -- bare aura id, for a caller with no region to hand. The id form leaves
--- aura_env.state nil, as upstream does around a trigger scan: a trigger function
--- already receives its state as its first argument.
+-- aura_env.state nil, as upstream does around a trigger scan: generated trigger
+-- functions receive their state directly, while custom functions receive the
+-- event payload.
 --
 -- Returns safecall's (ok, result) and decides nothing else. The failure policy
 -- is the caller's, because the call sites genuinely disagree about it -- a

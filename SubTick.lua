@@ -4,10 +4,9 @@
 -- its field names.
 -- Upstream section refs (§N) point at design/architecture/weakauras2-reference.md
 --
--- One marker per instance (subData.tick_placement is a plain number, not
--- upstream's tick_placements array -- our sub-region list already supports N
--- instances, so a second marker is a second subRegions entry). The marker rides
--- the four doors the progressbar region exposes: GetBarGeometry, PlaceOnBar,
+-- One marker per instance; a second marker is a second subRegions entry. The
+-- marker rides the four doors the progressbar region exposes: GetBarGeometry,
+-- PlaceOnBar,
 -- GetInverse and GetProgress, and is drawn on the bar frame itself rather than
 -- the region, the same way the spark is.
 --
@@ -63,7 +62,7 @@ WA.RegisterSubRegionType("subtick", {
 		tick_visible = true,
 		tick_color = { 1, 1, 1, 1 },
 		tick_placement_mode = "AtValue",
-		tick_placement = 50,
+		tick_placements = { 50 },
 		tick_progressSource = -2,
 		tick_thickness = 2,
 		tick_length = 30,
@@ -83,7 +82,7 @@ WA.RegisterSubRegionType("subtick", {
 	properties = {
 		tick_visible = { display = "Visible", setter = "SetVisible", type = "bool" },
 		tick_color = { display = "Color", setter = "SetTickColor", type = "color" },
-		tick_placement = { display = "Placement", setter = "SetTickPlacement", type = "number", min = -1000, max = 1000, step = 1 },
+		tick_placements = { display = "Placement", setter = "SetTickPlacement", type = "number", min = -1000, max = 1000, step = 1, baseIndex = 1 },
 	},
 	create = function(parent)
 		local _, _, _, bar = parent:GetBarGeometry()
@@ -189,7 +188,7 @@ WA.RegisterSubRegionType("subtick", {
 	modify = function(parent, region, parentData, subData)
 		region.visible = subData.tick_visible ~= false
 		region.placementMode = subData.tick_placement_mode or "AtValue"
-		region.placement = tonumber(subData.tick_placement) or 0
+		region.placement = tonumber((subData.tick_placements or {})[1]) or 0
 		region.progressSource = tonumber(subData.tick_progressSource) or -2
 		region.xOffset = subData.tick_xOffset or 0
 		region.yOffset = subData.tick_yOffset or 0
@@ -273,9 +272,13 @@ WA.RegisterSubRegionType("subtick", {
 			})
 		else
 			table.insert(fields, {
-				type = "input", name = "Placement", key = "tick_placement",
-				get = function() return tostring(subData.tick_placement or 0) end,
-				set = function(v) subData.tick_placement = tonumber(v) or 0; WA.Add(parentData, true) end,
+				type = "input", name = "Placement", key = "tick_placements",
+				get = function() return tostring((subData.tick_placements or {})[1] or 0) end,
+				set = function(v)
+					subData.tick_placements = subData.tick_placements or {}
+					subData.tick_placements[1] = tonumber(v) or 0
+					WA.Add(parentData, true)
+				end,
 			})
 		end
 

@@ -37,6 +37,30 @@ local loaded_events = {}
 -- loaded). Keeps Load/Unload idempotent.
 local activeIds = {}
 
+-- The tis a Delete just retired, kept only until the next Add compares its
+-- sourceKey against them (see GenericTrigger.Delete).
+local lastCompiled = {}
+
+-- The display being compiled, and the ids whose compile could not resolve a
+-- spell or item name. A name resolves to an id baked into the generated source,
+-- so an unresolved one leaves that trigger dead until something recompiles it --
+-- which is the entire reason the addon recompiles on spell/item cache traffic
+-- (OptionsFrame.lua's debounced sweep). Nothing else about a compile depends on
+-- the caches, so once every name has an id that sweep has nothing left to fix.
+local compilingId
+local unresolvedIds = {}
+
+local function noteUnresolved()
+	if compilingId then unresolvedIds[compilingId] = true end
+end
+
+-- Whether any compiled display is still waiting on a name the client cannot
+-- resolve yet.
+function WA.HasUnresolvedNames()
+	for _ in pairs(unresolvedIds) do return true end
+	return false
+end
+
 -- Internal (WA-generated) event names never handed to Frame:RegisterEvent -- a
 -- watcher re-dispatches them through WA.ScanEvents instead (§4.4).
 local INTERNAL_EVENTS = {
@@ -46,6 +70,8 @@ local INTERNAL_EVENTS = {
 	ITEM_COOLDOWN_READY = true,
 	EQUIPSLOT_COOLDOWN_CHANGED = true,
 	EQUIPSLOT_COOLDOWN_READY = true,
+	GCD_UPDATE = true,
+	GCD_END = true,
 	-- Re-emitted by the threat watcher after parsing a TWThreat addon-message
 	-- broadcast (there's no threat game event; see the watcher below).
 	WA_THREAT_CHANGED = true,
@@ -62,9 +88,17 @@ local INTERNAL_EVENTS = {
 	-- A shared 0.1s heartbeat for status prototypes that track a fast-moving
 	-- value (range to a unit). Started lazily by WA.EnsureFastTick.
 	WA_FAST_TICK = true,
+	-- Fired after the player's login/loading-screen state has settled. Native
+	-- status APIs such as GetMoney can return their usable value only after the
+	-- initial PLAYER_ENTERING_WORLD burst.
+	WA_DELAYED_PLAYER_ENTERING_WORLD = true,
 	-- Re-emitted by the power-tick watcher when a regen tick is inferred or the
 	-- timer stops (power type change, full power).
 	WA_POWERTICK_UPDATE = true,
+	-- Upstream's per-frame custom-trigger pulse, carrying the frame's elapsed
+	-- time. Driven by an OnUpdate rather than C_Timer, which cannot schedule
+	-- per-frame; per-trigger onUpdateThrottle is what keeps it affordable.
+	FRAME_UPDATE = true,
 }
 
 -- ---------------------------------------------------------------------------
@@ -98,6 +132,122 @@ local function parseEventList(str)
 		if not a then break end
 	end
 	return out
+end
+
+local COMMON_CUSTOM_EVENTS = {
+	"PLAYER_ENTERING_WORLD", "PLAYER_TARGET_CHANGED", "PLAYER_REGEN_DISABLED",
+	"PLAYER_REGEN_ENABLED", "UNIT_AURA", "UNIT_HEALTH", "UNIT_MANA",
+	"UNIT_ENERGY", "UNIT_RAGE", "BAG_UPDATE", "SPELLS_CHANGED",
+	"SPELL_UPDATE_COOLDOWN", "ACTIONBAR_UPDATE_COOLDOWN", "READY_CHECK",
+	"PARTY_MEMBERS_CHANGED", "RAID_ROSTER_UPDATE", "CHAT_MSG_SAY",
+	"CHAT_MSG_PARTY", "CHAT_MSG_RAID", "CHAT_MSG_WHISPER", "UNIT_CASTEVENT",
+}
+local customEventSearch = {}
+
+-- One "EVENT:a:b" token's colon-separated parts.
+local function splitEventToken(token)
+	local parts = {}
+	for part in string.gfind(token, "[^:]+") do table.insert(parts, part) end
+	return parts
+end
+
+-- A custom trigger's event list in upstream's extended syntax, resolved into the
+-- three things this client can act on: the events to register, a per-event set of
+-- unit tokens to filter arg1 against, and the trigger numbers to watch.
+--
+-- "UNIT_AURA:player:target" is a filter rather than a narrower registration --
+-- RegisterUnitEvent does not exist on this client (gotchas.md), so the general
+-- event is registered and dispatch drops payloads whose unit is not listed.
+-- "TRIGGER:2" names another of the display's triggers and registers no game
+-- event at all. A "CLEU:"/"COMBAT_LOG_EVENT_UNFILTERED:" token resolves to
+-- nothing: this client's combat log is SuperWoW's RAW_COMBATLOG, whose adapter
+-- does not exist, and registering the modern name would silently never fire.
+local function parseCustomEventList(str)
+	local eventList, unitFilters, watched = {}, nil, nil
+	local tokens = parseEventList(str)
+	for i = 1, table.getn(tokens) do
+		local token = tokens[i]
+		local parts = splitEventToken(token)
+		local base = parts[1]
+		local upper = base and string.upper(base) or ""
+		if upper == "CLEU" or upper == "COMBAT_LOG_EVENT_UNFILTERED" then
+			-- no adapter
+		elseif upper == "TRIGGER" then
+			for p = 2, table.getn(parts) do
+				local num = tonumber(parts[p])
+				if num then
+					watched = watched or {}
+					watched[num] = true
+				end
+			end
+		elseif table.getn(parts) > 1 and string.find(upper, "^UNIT_") then
+			table.insert(eventList, base)
+			unitFilters = unitFilters or {}
+			local set = unitFilters[base] or {}
+			unitFilters[base] = set
+			for p = 2, table.getn(parts) do
+				set[string.lower(parts[p])] = true
+			end
+		else
+			table.insert(eventList, base or token)
+		end
+	end
+	return eventList, unitFilters, watched
+end
+
+local function isClientEvent(name)
+	if INTERNAL_EVENTS[name] then return true end
+	if not (C_EventUtils and C_EventUtils.IsEventValid) then return true end
+	return C_EventUtils.IsEventValid(name) and true or false
+end
+
+-- Names the editor should warn about. A token carrying the extended syntax is
+-- judged on its base event, and the two forms that name no game event at all are
+-- exempt rather than reported as unregisterable.
+local function invalidEventList(str)
+	local invalid = {}
+	local names = parseEventList(str)
+	for i = 1, table.getn(names) do
+		local parts = splitEventToken(names[i])
+		local base = parts[1] or names[i]
+		local upper = string.upper(base)
+		if upper == "TRIGGER" or upper == "CLEU" or upper == "COMBAT_LOG_EVENT_UNFILTERED" then
+			-- resolves to no game event
+		elseif not isClientEvent(base) then
+			table.insert(invalid, names[i])
+		end
+	end
+	return invalid
+end
+
+local function eventPickerValues(query)
+	local values, labels = {}, {}
+	local needle = string.upper(query or "")
+	local source = needle == "" and COMMON_CUSTOM_EVENTS or (WA.customEventCatalog or {})
+	for i = 1, table.getn(source) do
+		local name = source[i]
+		if isClientEvent(name)
+			and (needle == "" or string.find(name, needle, 1, true)) then
+			table.insert(values, name)
+			labels[name] = name
+			if table.getn(values) >= 40 then break end
+		end
+	end
+	if table.getn(values) == 0 then
+		table.insert(values, "__NO_EVENT_MATCH__")
+		labels.__NO_EVENT_MATCH__ = "No matching events"
+	end
+	return values, labels
+end
+
+local function appendEventName(str, name)
+	if name == "__NO_EVENT_MATCH__" then return str or "" end
+	local names = parseEventList(str)
+	for i = 1, table.getn(names) do
+		if names[i] == name then return str or "" end
+	end
+	if not str or not string.find(str, "%S") then return name end
+	return str .. " " .. name
 end
 
 local VALID_OPS = { ["=="] = true, ["~="] = true, ["<"] = true,
@@ -188,10 +338,18 @@ local function constructFunction(proto, trigger, errTag)
 	end
 	local cond = table.getn(tests) > 0 and table.concat(tests, " and ") or "true"
 
+	for i = 1, table.getn(proto.args) do
+		local arg = proto.args[i]
+		if arg.store and arg.storeAlways then
+			table.insert(lines, string.format(
+				"if state.%s ~= %s then state.%s = %s state.changed = true end",
+				arg.name, arg.name, arg.name, arg.name))
+		end
+	end
 	table.insert(lines, "if (" .. cond .. ") then")
 	for i = 1, table.getn(proto.args) do
 		local arg = proto.args[i]
-		if arg.store then
+		if arg.store and not arg.storeAlways then
 			table.insert(lines, string.format(
 				"if state.%s ~= %s then state.%s = %s state.changed = true end",
 				arg.name, arg.name, arg.name, arg.name))
@@ -208,15 +366,30 @@ local function constructFunction(proto, trigger, errTag)
 	return fn, source, err
 end
 
--- Compiles a custom *status* trigger's user text into f(state, event) -> show.
--- The text is a whole function expression ("function(state, event) ... end");
+-- Compiles a custom trigger's user text into a function.
+-- The text is a whole function expression ("function(event, ...) ... end");
 -- WA.LoadFunction owns the wrapper, the sandbox and the error report. Shape
 -- mirrors constructFunction's return contract (fn, source, err).
 local function constructCustomFunction(trigger, errTag)
-	local body = trigger.customTrigger or ""
+	local body = trigger.custom or ""
 	local fn, err = WA.LoadFunction(body, errTag)
 	return fn, body, err
 end
+
+local function compileCustomField(source, errTag)
+	if not source or not string.find(source, "%S") then return nil end
+	return WA.LoadFunction(source, errTag)
+end
+
+-- A Trigger State Updater's `customVariables` text is a table *expression*, not a
+-- function, so it is wrapped into one that returns it. The newlines around the
+-- body keep a trailing comment from swallowing the closing `end`.
+local function compileTsuVariables(source, errTag)
+	if not source or not string.find(source, "%S") then return nil end
+	return WA.LoadFunction("function() return \n" .. source .. "\n end", errTag)
+end
+
+local function trueFunction() return true end
 
 -- Resolves a "spell" field's stored value -- a numeric spellID, or a name the
 -- user typed -- to a numeric spellID, or nil if it doesn't resolve to
@@ -237,6 +410,7 @@ function WA.ResolveSpellID(input)
 		local info = C_Spell.GetSpellInfo(input)
 		if info and info.spellID then return info.spellID end
 	end
+	noteUnresolved()
 	return nil
 end
 
@@ -247,6 +421,73 @@ end
 -- >ID API exists, so a name resolves through GetItemInfo's link return and a
 -- string.find capture (this client's Lua 5.0 has no string.match, ref
 -- TextReplace.lua).
+-- ---------------------------------------------------------------------------
+-- The spellbook, indexed by name. The global cooldown is read off a slot because
+-- there is no GCD spellID to query, and Debug.lua's /wa cdprobe reads slots to
+-- show what each rank of a name reports. Ranks of a name occupy consecutive
+-- ascending slots, so the last write wins and the index holds the highest rank
+-- (the same rank walk DoiteAuras does before its own GetSpellCooldown calls).
+-- ---------------------------------------------------------------------------
+local spellSlotByName, spellSlotById
+
+local function buildSpellSlotIndex()
+	spellSlotByName, spellSlotById = {}, {}
+	if not (GetNumSpellTabs and GetSpellTabInfo and GetSpellName) then return end
+	for tab = 1, (GetNumSpellTabs() or 0) do
+		local _, _, offset, numSlots = GetSpellTabInfo(tab)
+		if offset and numSlots then
+			for i = offset + 1, offset + numSlots do
+				local name = GetSpellName(i, BOOKTYPE_SPELL or "spell")
+				if name then spellSlotByName[name] = i end
+			end
+		end
+	end
+end
+
+function WA.InvalidateSpellSlots()
+	spellSlotByName, spellSlotById = nil, nil
+end
+
+-- Slot numbers shift as the book grows, so every cached one stops meaning
+-- anything. Registered here rather than on a consumer's frame: the per-spell
+-- cooldown watcher depends on this index whether or not anything is watching the
+-- global cooldown.
+local spellBookFrame = CreateFrame("Frame")
+pcall(spellBookFrame.RegisterEvent, spellBookFrame, "SPELLS_CHANGED")
+pcall(spellBookFrame.RegisterEvent, spellBookFrame, "LEARNED_SPELL_IN_TAB")
+spellBookFrame:SetScript("OnEvent", WA.InvalidateSpellSlots)
+
+function WA.SpellSlotByName(name)
+	if not name then return nil end
+	if not spellSlotByName then buildSpellSlotIndex() end
+	return spellSlotByName[name]
+end
+
+-- Slot for a spellID, via its name -- so a specific rank's ID still lands on the
+-- book's highest rank, which is what actually goes on cooldown.
+function WA.SpellSlotByID(spellId)
+	if not spellId or spellId == 0 then return nil end
+	if not spellSlotById then
+		if not spellSlotByName then buildSpellSlotIndex() end
+		spellSlotById = {}
+	end
+	local hit = spellSlotById[spellId]
+	if hit ~= nil then return hit or nil end
+	local name = C_Spell and C_Spell.GetSpellName and C_Spell.GetSpellName(spellId)
+	local slot = name and spellSlotByName[name]
+	spellSlotById[spellId] = slot or false
+	return slot
+end
+
+-- (start, duration) off a spellbook slot, or nil. pcall'd: a slot that has gone
+-- out of range (the book shrank) raises rather than answering.
+function WA.SpellSlotCooldown(slot)
+	if not slot or not GetSpellCooldown then return nil end
+	local ok, start, duration = pcall(GetSpellCooldown, slot, BOOKTYPE_SPELL or "spell")
+	if not ok or not start or not duration then return nil end
+	return start, duration
+end
+
 -- itemID for a name the user typed, found by walking the player's own
 -- containers. Nothing on this client resolves a name: C_Item.GetItemCount and
 -- C_Item.GetItemInfo both take an id, an "item:N" string or a link, and say so
@@ -303,6 +544,32 @@ function WA.ItemIDByName(name)
 	return nil
 end
 
+-- A name that missed can only start resolving once the player is carrying one,
+-- and the id a miss baked into a trigger's compiled source is not revisited on
+-- its own. GET_ITEM_INFO_RECEIVED (OptionsFrame.lua's recompile hook) covers an
+-- item whose *static data* had not arrived; it does not fire for an item already
+-- in the client's cache that simply was not in a bag yet, which is what this
+-- covers. Shaped after upstream's itemDataLoadFrame: the retry only walks while
+-- a name is outstanding, and a name that starts resolving recompiles.
+local itemNameRetryFrame = CreateFrame("Frame")
+pcall(itemNameRetryFrame.RegisterEvent, itemNameRetryFrame, "BAG_UPDATE")
+itemNameRetryFrame:SetScript("OnEvent", function()
+	local retry
+	for lname in pairs(itemNameMissAt) do
+		retry = retry or {}
+		table.insert(retry, lname)
+	end
+	if not retry then return end
+	local resolved = false
+	for i = 1, table.getn(retry) do
+		-- Clear the rate-limit stamp: a bag change is exactly the event that can
+		-- make this walk succeed, so it should not be waited out.
+		itemNameMissAt[retry[i]] = nil
+		if WA.ItemIDByName(retry[i]) then resolved = true end
+	end
+	if resolved and WA.AddAllDisplays then WA.AddAllDisplays() end
+end)
+
 function WA.ResolveItemID(input)
 	if input == nil or input == "" then return nil end
 	local id = tonumber(input)
@@ -317,7 +584,130 @@ function WA.ResolveItemID(input)
 		local id2 = capturedId and tonumber(capturedId)
 		if id2 then return id2 end
 	end
-	return WA.ItemIDByName(input)
+	local byName = WA.ItemIDByName(input)
+	if byName == nil then noteUnresolved() end
+	return byName
+end
+
+-- Inspect the player's equipment and return the first matching item's details.
+-- GetItemInfoInstant is cache-only: an ID can be present while its class data
+-- is unavailable, so an uncached item is equipped but cannot match a type.
+function WA.ItemTypeEquipped(wantedClassID, wantedSubclassID, selectedSlot)
+	local firstSeen
+	local firstID, firstName, firstIcon, firstClass, firstSubclass
+	local firstClassID, firstSubclassID, firstKnown
+	local matchingID, matchingName, matchingIcon, matchingClass, matchingSubclass
+	local matchingClassID, matchingSubclassID
+	local equipped = false
+	local startSlot, endSlot = 1, 19
+	if selectedSlot and tonumber(selectedSlot) and tonumber(selectedSlot) > 0 then
+		startSlot, endSlot = tonumber(selectedSlot), tonumber(selectedSlot)
+	end
+	for slot = startSlot, endSlot do
+		local id = GetInventoryItemID and GetInventoryItemID("player", slot)
+		if id then
+			equipped = true
+			local itemID, itemClass, itemSubclass, _, itemIcon, classID, subclassID
+			if C_Item and C_Item.GetItemInfoInstant then
+				itemID, itemClass, itemSubclass, _, itemIcon, classID, subclassID = C_Item.GetItemInfoInstant(id)
+			end
+			local known = itemID and classID ~= nil and subclassID ~= nil
+			if not firstSeen then firstID = itemID or id end
+			if known then
+				local itemName, cachedIcon
+				if C_Item and C_Item.GetItemInfo then
+					itemName, _, _, _, _, _, _, _, _, cachedIcon = C_Item.GetItemInfo(itemID)
+				end
+				itemIcon = itemIcon or cachedIcon
+				if not firstKnown and not firstSeen then
+					firstName, firstIcon = itemName, itemIcon
+					firstClass, firstSubclass = itemClass, itemSubclass
+					firstClassID, firstSubclassID, firstKnown = classID, subclassID, true
+				end
+				if not matchingID and classID == tonumber(wantedClassID) and subclassID == tonumber(wantedSubclassID) then
+					matchingID, matchingName, matchingIcon = itemID, itemName, itemIcon
+					matchingClass, matchingSubclass = itemClass, itemSubclass
+					matchingClassID, matchingSubclassID = classID, subclassID
+				end
+			elseif not firstSeen then
+				firstID = itemID or id
+			end
+			firstSeen = true
+		end
+	end
+	if matchingID then
+		return matchingID, matchingName, matchingIcon, matchingClass, matchingSubclass,
+			matchingClassID, matchingSubclassID, equipped, true, true
+	end
+	return firstID, firstName, firstIcon, firstClass, firstSubclass,
+		firstClassID, firstSubclassID, equipped, false, firstKnown and true or false
+end
+
+function WA.ItemSetEquipped(setID)
+	local targetID = tonumber(setID) or 0
+	local total = 18
+	local count = 0
+	local setName
+	local known = false
+	if C_Item and C_Item.GetItemSetInfo then
+		local info = C_Item.GetItemSetInfo(targetID)
+		if info then
+			setName = info.name
+			known = true
+		end
+	end
+	if targetID > 0 and C_Item and C_Item.GetItemSetIDByID and GetInventoryItemID then
+		for slot = 1, 18 do
+			local itemID = GetInventoryItemID("player", slot)
+			local equippedSetID = itemID and C_Item.GetItemSetIDByID(itemID)
+			if equippedSetID == targetID then count = count + 1 end
+		end
+	end
+	return count, total, setName, known
+end
+
+function WA.EquipmentSetInfo(setName, partial)
+	setName = setName or ""
+	if C_EquipmentSet and C_EquipmentSet.GetEquipmentSetID
+		and C_EquipmentSet.GetEquipmentSetInfo then
+		local setID = C_EquipmentSet.GetEquipmentSetID(setName)
+		if setID then
+			local name, icon, _, isEquipped, numItems, numEquipped, _, _, numIgnored =
+				C_EquipmentSet.GetEquipmentSetInfo(setID)
+			if name then
+				numItems = tonumber(numItems) or 0
+				numEquipped = tonumber(numEquipped) or 0
+				numIgnored = tonumber(numIgnored) or 0
+				local active = (partial and numItems > 0 and numEquipped > 0)
+					or ((not partial) and isEquipped and true or false)
+				return name, icon, numEquipped, numItems, active and true or false, setID, numIgnored
+			end
+		end
+	end
+
+	-- ItemRack is name-keyed and has no numeric set ID. Prefer the
+	-- ClassicAPI/pfUI set when both systems contain the same name.
+	if ItemRack_GetUserSets then
+		local sets = ItemRack_GetUserSets()
+		local set = sets and sets[setName]
+		if set then
+			local total, count = 0, 0
+			for slot = 0, 19 do
+				local entry = set[slot]
+				if entry then
+					total = total + 1
+					local equippedID = GetInventoryItemID and GetInventoryItemID("player", slot)
+					if equippedID and tonumber(entry.id) == tonumber(equippedID) then count = count + 1 end
+				end
+			end
+			local active
+			if partial then active = total > 0 and count > 0
+			elseif ItemRack_IsSetEquipped then active = ItemRack_IsSetEquipped(setName) and true or false
+			else active = total > 0 and count == total end
+			return setName, set.icon, count, total, active and true or false, nil, 0
+		end
+	end
+	return nil, nil, 0, 0, false
 end
 
 -- How many of an item the player holds, plus whether the item was identified at
@@ -510,6 +900,423 @@ end
 
 local PROTOTYPES = {}
 
+-- A saved trigger field written under an older name, moved in place. Reached
+-- through the trigger type's `migrate` hook, which MergeDefaults runs on every
+-- load before seeding defaults -- so it has to stay idempotent and must not
+-- overwrite a value already stored under the new name.
+local function renameArg(trigger, old, new)
+	if trigger[old] == nil then return end
+	if trigger[new] == nil then trigger[new] = trigger[old] end
+	trigger[old] = nil
+end
+
+local COMBAT_EVENT_VALUES = { "PLAYER_REGEN_DISABLED", "PLAYER_REGEN_ENABLED" }
+local COMBAT_EVENT_LABELS = {
+	PLAYER_REGEN_DISABLED = "Entering Combat",
+	PLAYER_REGEN_ENABLED = "Leaving Combat",
+}
+local CHAT_MESSAGE_VALUES = {
+	"CHAT_MSG_SAY", "CHAT_MSG_PARTY", "CHAT_MSG_RAID", "CHAT_MSG_GUILD",
+	"CHAT_MSG_OFFICER", "CHAT_MSG_YELL", "CHAT_MSG_WHISPER", "CHAT_MSG_EMOTE",
+	"CHAT_MSG_SYSTEM", "CHAT_MSG_MONSTER_SAY",
+	"CHAT_MSG_MONSTER_YELL", "CHAT_MSG_MONSTER_WHISPER", "CHAT_MSG_MONSTER_EMOTE",
+	"CHAT_MSG_CHANNEL", "CHAT_MSG_LOOT", "CHAT_MSG_RAID_WARNING",
+	"CHAT_MSG_BG_SYSTEM_NEUTRAL", "CHAT_MSG_BG_SYSTEM_ALLIANCE", "CHAT_MSG_BG_SYSTEM_HORDE",
+}
+local CHAT_MESSAGE_LABELS = {}
+for i = 1, table.getn(CHAT_MESSAGE_VALUES) do
+	local value = CHAT_MESSAGE_VALUES[i]
+	CHAT_MESSAGE_LABELS[value] = string.sub(value, 10)
+end
+local CHAT_MESSAGE_ALL_EVENTS = {}
+for i = 1, table.getn(CHAT_MESSAGE_VALUES) do table.insert(CHAT_MESSAGE_ALL_EVENTS, CHAT_MESSAGE_VALUES[i]) end
+table.insert(CHAT_MESSAGE_ALL_EVENTS, "CHAT_MSG_PARTY_LEADER")
+table.insert(CHAT_MESSAGE_ALL_EVENTS, "CHAT_MSG_RAID_LEADER")
+table.insert(CHAT_MESSAGE_ALL_EVENTS, "CHAT_MSG_TEXT_EMOTE")
+
+local function chatMessageEvents(trigger)
+	if trigger and trigger.use_messageType and trigger.messageType and CHAT_MESSAGE_LABELS[trigger.messageType] then
+		local events = { trigger.messageType }
+		if trigger.messageType == "CHAT_MSG_PARTY" then table.insert(events, "CHAT_MSG_PARTY_LEADER") end
+		if trigger.messageType == "CHAT_MSG_RAID" then table.insert(events, "CHAT_MSG_RAID_LEADER") end
+		if trigger.messageType == "CHAT_MSG_EMOTE" then table.insert(events, "CHAT_MSG_TEXT_EMOTE") end
+		return events
+	end
+	return CHAT_MESSAGE_ALL_EVENTS
+end
+
+function WA.TalentInfo(wanted, wantedTab, wantedTier, wantedColumn)
+	if not (GetNumTalentTabs and GetNumTalents and GetTalentInfo) then return false, false, 0, 0, 0, 0, 0, nil, nil end
+	if not wanted or wanted == "" then return false, false, 0, 0, 0, 0, 0, nil, nil end
+	local tabs = tonumber(GetNumTalentTabs()) or 0
+	for tab = 1, tabs do
+		if wantedTab == 0 or wantedTab == tab then
+			local count = tonumber(GetNumTalents(tab)) or 0
+			for index = 1, count do
+				local name, icon, tier, column, rank, maxRank = GetTalentInfo(tab, index)
+				if name == wanted
+					and (wantedTier == 0 or tier == wantedTier)
+					and (wantedColumn == 0 or column == wantedColumn) then
+					return true, (tonumber(rank) or 0) > 0, tonumber(rank) or 0,
+						tonumber(maxRank) or 0, tab, tonumber(tier) or 0, tonumber(column) or 0, icon
+				end
+			end
+		end
+	end
+	return false, false, 0, 0, 0, 0, 0, nil, nil
+end
+
+function WA.PetBehavior()
+	if not GetPetActionInfo then return nil, nil end
+	local slots = NUM_PET_ACTION_SLOTS or 10
+	for index = 1, slots do
+		local name, _, texture, token, active = GetPetActionInfo(index)
+		if active and name then
+			local behavior
+			if name == "PET_MODE_AGGRESSIVE" then behavior = "aggressive"
+			elseif name == "PET_MODE_ASSIST" then behavior = "assist"
+			elseif name == "PET_MODE_DEFENSIVEASSIST" or name == "PET_MODE_DEFENSIVE" then behavior = "defensive"
+			elseif name == "PET_MODE_PASSIVE" then behavior = "passive" end
+			if behavior then
+				if token and texture then texture = _G[texture] end
+				return behavior, texture
+			end
+		end
+	end
+	return nil, nil
+end
+
+local TALENT_TAB_VALUES = { 0, 1, 2, 3 }
+local TALENT_TAB_LABELS = { [0] = "Any Tab", [1] = "Tab 1", [2] = "Tab 2", [3] = "Tab 3" }
+
+local TALENT_RANK_VALUES = { "ignore", "known", "maxed" }
+local TALENT_RANK_LABELS = { ignore = "Any Rank", known = "Known (rank > 0)", maxed = "Max Rank" }
+
+PROTOTYPES["talentknown"] = {
+	displayName = "Talent Known",
+	wa2Event = "Talent Known",
+	category = "unit",
+	progressType = "static",
+	progressValue = "rank",
+	progressTotal = "maxRank",
+	events = function() return { "CHARACTER_POINTS_CHANGED", "SPELLS_CHANGED", "PLAYER_ENTERING_WORLD" } end,
+	force_events = true,
+	icon = "Interface\\Icons\\INV_Misc_Book_09",
+	iconFunc = function() return "Interface\\Icons\\INV_Misc_Book_09" end,
+	nameFunc = function(trigger) return trigger.talentName or "Talent Known" end,
+	iconFunc = function(trigger)
+		local _, _, _, _, _, _, _, icon = WA.TalentInfo(trigger.talentName,
+			(trigger.usePlacement and tonumber(trigger.talentTab)) or 0,
+			(trigger.usePlacement and tonumber(trigger.talentTier)) or 0,
+			(trigger.usePlacement and tonumber(trigger.talentColumn)) or 0)
+		return icon or "Interface\\Icons\\INV_Misc_Book_09"
+	end,
+	init = function(trigger)
+		return "local talentFoundValue, knownValue, rankValue, maxRankValue, talentTabFoundValue, talentTierFoundValue, talentColumnFoundValue, talentIconValue = WeakestAuras.TalentInfo("
+			.. fmt(trigger.talentName or "") .. ", " .. tostring(tonumber(trigger.talentTab) or 0) .. ", "
+			.. tostring(tonumber(trigger.talentTier) or 0) .. ", " .. tostring(tonumber(trigger.talentColumn) or 0) .. ")"
+	end,
+	args = {
+		{ name = "talentName", type = "talent", display = "Talent Name", required = true },
+		{ name = "usePlacement", type = "toggle", display = "Advanced Placement Filters", default = false, reloadOptions = true },
+		{ name = "talentTab", type = "select", required = true, display = "Talent Tab",
+			valueList = TALENT_TAB_VALUES, valueLabels = TALENT_TAB_LABELS, default = 0,
+			enable = function(trigger) return trigger.usePlacement end,
+			reloadOptions = true, test = function() return nil end },
+		{ name = "talentTier", type = "range", display = "Tier", min = 0, max = 10, step = 1, default = 0,
+			enable = function(trigger) return trigger.usePlacement end,
+			reloadOptions = true, test = function() return nil end },
+		{ name = "talentColumn", type = "range", display = "Column", min = 0, max = 4, step = 1, default = 0,
+			enable = function(trigger) return trigger.usePlacement end,
+			reloadOptions = true, test = function() return nil end },
+		{ name = "rankMode", type = "select", required = true, display = "Rank",
+			valueList = TALENT_RANK_VALUES, valueLabels = TALENT_RANK_LABELS, default = "ignore", reloadOptions = true,
+			test = function(trigger)
+				if trigger.rankMode == "known" then return "(talentFound and known)" end
+				if trigger.rankMode == "maxed" then return "(known and rank >= maxRank)" end
+				return "talentFound"
+			end },
+		{ name = "talentFound", type = "hidden", init = "talentFoundValue", store = true, conditionType = "bool", display = "Talent Found" },
+		{ name = "known", type = "hidden", init = "knownValue", store = true, conditionType = "bool", display = "Known" },
+		{ name = "rank", type = "hidden", init = "rankValue", store = true, conditionType = "number", display = "Rank" },
+		{ name = "maxRank", type = "hidden", init = "maxRankValue", store = true, conditionType = "number", display = "Max Rank" },
+		{ name = "talentTabFound", type = "hidden", init = "talentTabFoundValue", store = true, conditionType = "number", display = "Tab" },
+		{ name = "talentTierFound", type = "hidden", init = "talentTierFoundValue", store = true, conditionType = "number", display = "Tier" },
+		{ name = "talentColumnFound", type = "hidden", init = "talentColumnFoundValue", store = true, conditionType = "number", display = "Column" },
+		{ name = "icon", type = "hidden", init = "talentIconValue", store = true },
+	},
+}
+
+local CONDITION_STATUS_LABELS = { ignore = "Ignore", ["true"] = "Yes", ["false"] = "No" }
+local CONDITION_STATUS_VALUES = { "ignore", "true", "false" }
+
+local function conditionStatusTest(name)
+	return function(trigger)
+		local value = trigger[name] or "ignore"
+		if value == "ignore" then return nil end
+		return value == "true" and name or "not " .. name
+	end
+end
+
+local function addConditionEvent(events, seen, eventName)
+	if not seen[eventName] then
+		seen[eventName] = true
+		table.insert(events, eventName)
+	end
+end
+
+local function conditionEvents(trigger)
+	local out, seen = {}, {}
+	addConditionEvent(out, seen, "PLAYER_ENTERING_WORLD")
+	if trigger.incombat ~= "ignore" then
+		addConditionEvent(out, seen, "PLAYER_REGEN_ENABLED")
+		addConditionEvent(out, seen, "PLAYER_REGEN_DISABLED")
+	end
+	if trigger.alive ~= "ignore" then
+		addConditionEvent(out, seen, "PLAYER_DEAD")
+		addConditionEvent(out, seen, "PLAYER_ALIVE")
+		addConditionEvent(out, seen, "PLAYER_UNGHOST")
+	end
+	if trigger.onTaxi ~= "ignore" then
+		addConditionEvent(out, seen, "PLAYER_CONTROL_LOST")
+		addConditionEvent(out, seen, "PLAYER_CONTROL_GAINED")
+	end
+	if trigger.resting ~= "ignore" then
+		addConditionEvent(out, seen, "PLAYER_UPDATE_RESTING")
+	end
+	if trigger.mounted ~= "ignore" then
+		addConditionEvent(out, seen, "PLAYER_AURAS_CHANGED")
+		addConditionEvent(out, seen, "PLAYER_MOUNT_DISPLAY_CHANGED")
+	end
+	if trigger.hasPet ~= "ignore" then
+		addConditionEvent(out, seen, "UNIT_PET")
+	end
+	if trigger.isMoving ~= "ignore" then
+		addConditionEvent(out, seen, "WA_FAST_TICK")
+	end
+	if trigger.afk ~= "ignore" or trigger.pvpFlagged ~= "ignore" then
+		addConditionEvent(out, seen, "PLAYER_FLAGS_CHANGED")
+	end
+	if trigger.groupType ~= "ignore" then
+		addConditionEvent(out, seen, "GROUP_ROSTER_UPDATE")
+		addConditionEvent(out, seen, "PARTY_MEMBERS_CHANGED")
+		addConditionEvent(out, seen, "RAID_ROSTER_UPDATE")
+	end
+	if trigger.instanceType ~= "ignore" then
+		addConditionEvent(out, seen, "ZONE_CHANGED")
+		addConditionEvent(out, seen, "ZONE_CHANGED_INDOORS")
+		addConditionEvent(out, seen, "ZONE_CHANGED_NEW_AREA")
+	end
+	return out
+end
+
+local function conditionStatusArg(name, display, init)
+	return { name = name, type = "select", required = true, display = display,
+		valueList = CONDITION_STATUS_VALUES, valueLabels = CONDITION_STATUS_LABELS,
+		default = "ignore", init = init, store = true, conditionType = "bool",
+		test = conditionStatusTest(name) }
+end
+
+local CONDITION_VALUE_LABELS = {
+	groupType = { ignore = "Ignore", any = "Any Group (Party/Raid)", solo = "Solo", party = "Party", raid = "Raid" },
+	instanceType = { ignore = "Ignore", none = "Outside Instance", dungeon = "Dungeon",
+		raid = "Raid", pvp = "Battleground", arena = "Arena" },
+}
+
+local function conditionValueTest(name)
+	return function(trigger)
+		local value = trigger[name] or "ignore"
+		if value == "ignore" then return nil end
+		if name == "groupType" and value == "any" then return "groupType ~= \"solo\"" end
+		return string.format("%s == %q", name, value)
+	end
+end
+
+function WA.ConditionGroupType()
+	if GetNumRaidMembers and (GetNumRaidMembers() or 0) > 0 then return "raid" end
+	if GetNumPartyMembers and (GetNumPartyMembers() or 0) > 0 then return "party" end
+	return "solo"
+end
+
+function WA.ConditionInstanceType()
+	if not IsInInstance then return "none" end
+	local inside, raw = IsInInstance()
+	if not inside then return "none" end
+	if raw == "party" then return "dungeon" end
+	return raw or "none"
+end
+
+local function conditionValueArg(name, display, values, labels, init)
+	return { name = name, type = "select", required = true, display = display,
+		valueList = values, valueLabels = labels, default = "ignore", init = init,
+		test = conditionValueTest(name), store = true, conditionType = "string" }
+end
+
+PROTOTYPES["conditions"] = {
+	displayName = "Conditions",
+	wa2Event = "Conditions",
+	category = "unit",
+	progressType = "none",
+	events = conditionEvents,
+	force_events = true,
+	loadFunc = function(trigger)
+		if trigger.isMoving ~= "ignore" then WA.EnsureFastTick() end
+	end,
+	icon = "Interface\\Icons\\Spell_Holy_PowerInfusion",
+	iconFunc = function() return "Interface\\Icons\\Spell_Holy_PowerInfusion" end,
+	nameFunc = function() return "Conditions" end,
+	init = function() return "" end,
+	args = {
+		conditionStatusArg("alwaystrue", "Always Active", "true"),
+		conditionStatusArg("incombat", "In Combat", "UnitAffectingCombat(\"player\") and true or false"),
+		conditionStatusArg("alive", "Alive", "(not UnitIsDeadOrGhost(\"player\")) and true or false"),
+		conditionStatusArg("onTaxi", "On Taxi", "(UnitOnTaxi and UnitOnTaxi(\"player\")) and true or false"),
+		conditionStatusArg("resting", "Resting", "(IsResting and IsResting()) and true or false"),
+		conditionStatusArg("mounted", "Mounted", "(IsMounted and IsMounted()) and true or false"),
+		conditionStatusArg("hasPet", "Has Pet", "(UnitExists(\"pet\") and not UnitIsDeadOrGhost(\"pet\")) and true or false"),
+		conditionStatusArg("isMoving", "Is Moving", "((GetUnitSpeed and GetUnitSpeed(\"player\")) or 0) > 0"),
+		conditionStatusArg("afk", "AFK", "(UnitIsAFK and UnitIsAFK(\"player\")) and true or false"),
+		conditionStatusArg("pvpFlagged", "PvP Flagged", "((UnitIsPVP and UnitIsPVP(\"player\")) or (UnitIsPVPFreeForAll and UnitIsPVPFreeForAll(\"player\"))) and true or false"),
+		conditionValueArg("groupType", "Group Type", { "ignore", "any", "solo", "party", "raid" }, CONDITION_VALUE_LABELS.groupType, "WeakestAuras.ConditionGroupType()"),
+		conditionValueArg("instanceType", "Instance Type", { "ignore", "none", "dungeon", "raid", "pvp", "arena" }, CONDITION_VALUE_LABELS.instanceType, "WeakestAuras.ConditionInstanceType()"),
+	},
+}
+
+local LOCATION_INSTANCE_VALUES = { "ignore", "none", "party", "raid", "pvp", "arena" }
+local LOCATION_INSTANCE_LABELS = { ignore = "Ignore", none = "Outside Instance", party = "Dungeon", raid = "Raid", pvp = "Battleground", arena = "Arena" }
+
+PROTOTYPES["location"] = {
+	displayName = "Location",
+	wa2Event = "Location",
+	category = "unit",
+	progressType = "none",
+	events = function() return { "ZONE_CHANGED", "ZONE_CHANGED_INDOORS", "ZONE_CHANGED_NEW_AREA", "MINIMAP_ZONE_CHANGED", "PLAYER_ENTERING_WORLD" } end,
+	force_events = true,
+	icon = "Interface\\Icons\\INV_Misc_Map_01",
+	iconFunc = function() return "Interface\\Icons\\INV_Misc_Map_01" end,
+	nameFunc = function() return "Location" end,
+	init = function()
+		return "local zoneValue = (GetRealZoneText and GetRealZoneText()) or (GetZoneText and GetZoneText()) or \"\"\n"
+			.. "local subzoneValue = (GetSubZoneText and GetSubZoneText()) or \"\"\n"
+			.. "local instanceNameValue, _, _, _, instanceTypeValue\n"
+			.. "if GetInstanceInfo then instanceNameValue, _, _, _, instanceTypeValue = GetInstanceInfo() end\n"
+			.. "instanceNameValue = instanceNameValue or \"\"\n"
+			.. "instanceTypeValue = instanceTypeValue or \"none\""
+	end,
+	args = {
+		{ name = "zone", type = "hidden", display = "Zone", init = "zoneValue", store = true, conditionType = "string" },
+		{ name = "subzone", type = "hidden", display = "Subzone", init = "subzoneValue", store = true, conditionType = "string" },
+		{ name = "instanceName", type = "hidden", display = "Instance Name", init = "instanceNameValue", store = true, conditionType = "string" },
+		{ name = "zoneFilter", type = "text", display = "Zone Filter", default = "", test = function(trigger)
+			if not trigger.zoneFilter or trigger.zoneFilter == "" then return nil end
+			return "string.lower(zoneValue) == string.lower(" .. fmt(trigger.zoneFilter) .. ")"
+		end },
+		{ name = "subzoneFilter", type = "text", display = "Subzone Filter", default = "", test = function(trigger)
+			if not trigger.subzoneFilter or trigger.subzoneFilter == "" then return nil end
+			return "string.lower(subzoneValue) == string.lower(" .. fmt(trigger.subzoneFilter) .. ")"
+		end },
+		{ name = "instanceNameFilter", type = "text", display = "Instance Name Filter", default = "", test = function(trigger)
+			if not trigger.instanceNameFilter or trigger.instanceNameFilter == "" then return nil end
+			return "string.lower(instanceNameValue) == string.lower(" .. fmt(trigger.instanceNameFilter) .. ")"
+		end },
+		{ name = "instanceType", type = "hidden", init = "instanceTypeValue", store = true, conditionType = "string", display = "Instance Type" },
+		{ name = "instanceTypeFilter", type = "select", display = "Instance Type", valueList = LOCATION_INSTANCE_VALUES, valueLabels = LOCATION_INSTANCE_LABELS,
+			default = "ignore", test = function(trigger)
+				if not trigger.use_instanceTypeFilter or trigger.instanceTypeFilter == "ignore" then return nil end
+				return "instanceTypeValue == " .. fmt(trigger.instanceTypeFilter)
+			end },
+	},
+}
+
+PROTOTYPES["money"] = {
+	displayName = "Money",
+	wa2Event = "Money",
+	category = "unit",
+	progressType = "none",
+	events = function() return { "PLAYER_MONEY", "WA_DELAYED_PLAYER_ENTERING_WORLD" } end,
+	force_events = true,
+	icon = "Interface\\Icons\\INV_Misc_Coin_01",
+	iconFunc = function() return "Interface\\Icons\\INV_Misc_Coin_01" end,
+	nameFunc = function() return "Money" end,
+	init = function()
+		return "local money = GetMoney() or 0\n"
+			.. "local gold = math.floor(money / 10000)\n"
+			.. "local silver = math.mod(math.floor(money / 100), 100)\n"
+			.. "local copper = math.mod(money, 100)"
+	end,
+	args = {
+		{ name = "money", type = "hidden", required = true, init = "money",
+			store = true, conditionType = "number", display = "Money" },
+		{ name = "gold", type = "hidden", required = true, init = "gold",
+			store = true, conditionType = "number", display = "Gold" },
+		{ name = "silver", type = "hidden", required = true, init = "silver",
+			store = true, conditionType = "number", display = "Silver" },
+		{ name = "copper", type = "hidden", required = true, init = "copper",
+			store = true, conditionType = "number", display = "Copper" },
+	},
+}
+
+local PET_BEHAVIOR_VALUES = { "aggressive", "assist", "defensive", "passive" }
+local PET_BEHAVIOR_LABELS = { aggressive = "Aggressive", assist = "Assist", defensive = "Defensive", passive = "Passive" }
+
+PROTOTYPES["petbehavior"] = {
+	displayName = "Pet Behavior",
+	wa2Event = "Pet Behavior",
+	category = "unit",
+	progressType = "none",
+	events = function() return { "PET_BAR_UPDATE", "UNIT_PET", "WA_DELAYED_PLAYER_ENTERING_WORLD" } end,
+	force_events = true,
+	icon = "Interface\\Icons\\Ability_Hunter_MendPet",
+	iconFunc = function() return "Interface\\Icons\\Ability_Hunter_MendPet" end,
+	nameFunc = function() return "Pet" end,
+	init = function()
+		return "local petBehaviorValue, petIconValue = WeakestAuras.PetBehavior()"
+	end,
+	args = {
+		{ name = "behavior", type = "select", required = true, display = "Pet Behavior",
+			valueList = PET_BEHAVIOR_VALUES, valueLabels = PET_BEHAVIOR_LABELS, default = "aggressive",
+			test = function(trigger)
+				if trigger.inverse then return "petBehaviorValue ~= " .. fmt(trigger.behavior) end
+				return "petBehaviorValue == " .. fmt(trigger.behavior)
+			end },
+		{ name = "inverse", type = "toggle", display = "Inverse" },
+		{ name = "petExists", type = "hidden", required = true, init = "UnitExists(\"pet\") and true or false",
+			store = true, conditionType = "bool", display = "Has Pet", test = "petExists" },
+		{ name = "behaviorValue", type = "hidden", init = "petBehaviorValue",
+			store = true, conditionType = "string", display = "Current Behavior" },
+		{ name = "icon", type = "hidden", init = "petIconValue", store = true },
+	},
+}
+
+PROTOTYPES["queuedaction"] = {
+	displayName = "Queued Action",
+	wa2Event = "Queued Action",
+	category = "spell",
+	progressType = "none",
+	events = function() return { "ACTIONBAR_UPDATE_STATE", "ACTIONBAR_SLOT_CHANGED", "CURRENT_SPELL_CAST_CHANGED", "PLAYER_ENTERING_WORLD" } end,
+	force_events = true,
+	icon = "Interface\\Icons\\INV_Misc_QuestionMark",
+	iconFunc = function(trigger)
+		local id = WA.ResolveSpellID(trigger.spellName)
+		if id then
+			local _, _, icon = GetSpellInfo(id)
+			return icon or "Interface\\Icons\\INV_Misc_QuestionMark"
+		end
+		return "Interface\\Icons\\INV_Misc_QuestionMark"
+	end,
+	nameFunc = function(trigger) return trigger.spellName or "Queued Action" end,
+	init = function(trigger)
+		local id = WA.ResolveSpellID(trigger.spellName) or 0
+		return "local spellId = " .. fmt(id) .. "\n"
+			.. "local queuedValue = C_Spell and C_Spell.IsCurrentSpell and C_Spell.IsCurrentSpell(spellId) and true or false"
+	end,
+	args = {
+		{ name = "spellName", type = "spell", display = "Spell", required = true },
+		{ name = "queued", type = "hidden", required = true, init = "queuedValue", test = "queued",
+			store = true, conditionType = "bool", display = "Queued" },
+	},
+}
+
 -- Combat status: shown while the player is in combat. No user config.
 PROTOTYPES["combat"] = {
 	displayName = "In Combat",
@@ -536,24 +1343,62 @@ PROTOTYPES["combat"] = {
 	},
 }
 
+-- A `statesParameter = "unit"` prototype offers WA.multi_unit_tokens beside the
+-- single tokens: one clone per member, keyed by GUID rather than by upstream's
+-- positional token (§4.3).
+local multiUnitFamily = WA.MultiUnitFamily
+
+-- Membership churn for a family, appended to whatever unit events the prototype
+-- reads: those say a member changed, these say which members there are.
+local function appendMultiUnitEvents(trigger, out)
+	local family = multiUnitFamily(trigger)
+	if not family then return out end
+	if family == "nameplate" then
+		table.insert(out, "NAME_PLATE_UNIT_ADDED")
+		table.insert(out, "NAME_PLATE_UNIT_REMOVED")
+	else
+		table.insert(out, "PARTY_MEMBERS_CHANGED")
+		table.insert(out, "RAID_ROSTER_UPDATE")
+	end
+	table.insert(out, "PLAYER_ENTERING_WORLD")
+	return out
+end
+
+-- Multi-unit init: the runner hands the member's live token in as arg1, so the
+-- generated source reads it instead of a compile-time constant.
+local function multiUnitInit(trigger, fallback)
+	if multiUnitFamily(trigger) then return "local unit = arg1" end
+	return "local unit = " .. fmt(WA.TriggerUnit(trigger, fallback))
+end
+
+local function multiUnitName(trigger, fallback)
+	local family = multiUnitFamily(trigger)
+	if family then return WA.multi_unit_labels[family] end
+	local unit = WA.TriggerUnit(trigger, fallback)
+	return UnitName(unit) or unit
+end
+
 -- Unit health, static progress (value/total = health/maxhealth).
 PROTOTYPES["health"] = {
 	displayName = "Health",
+	wa2Event = "Health",
 	category = "unit",
 	progressType = "static",
 	progressValue = "health",
 	progressTotal = "maxhealth",
-	events = function() return { "UNIT_HEALTH", "UNIT_MAXHEALTH" } end,
+	events = function(trigger)
+		return appendMultiUnitEvents(trigger, { "UNIT_HEALTH", "UNIT_MAXHEALTH" })
+	end,
 	force_events = true,
+	statesParameter = "unit",
 	icon = "Interface\\Icons\\INV_Potion_54",
 	iconFunc = function() return "Interface\\Icons\\INV_Potion_54" end,
-	nameFunc = function(trigger)
-		local unit = WA.TriggerUnit(trigger, "player")
-		return UnitName(unit) or unit
-	end,
-	init = function(trigger) return "local unit = " .. fmt(WA.TriggerUnit(trigger, "player")) end,
+	nameFunc = function(trigger) return multiUnitName(trigger, "player") end,
+	init = function(trigger) return multiUnitInit(trigger, "player") end,
 	args = {
-		{ name = "unit", type = "unit", display = "Unit" },
+		{ name = "unit", type = "unit", display = "Unit",
+			valueList = WA.unit_tokens_multi, valueLabels = WA.unit_labels_multi,
+			store = true, conditionType = "string" },
 		{ name = "exists", type = "hidden", required = true, test = "UnitExists(unit)" },
 		{ name = "health", type = "number", display = "Health", init = "UnitHealth(unit)",
 			multiEntry = true, store = true, conditionType = "number" },
@@ -586,21 +1431,25 @@ PROTOTYPES["health"] = {
 -- progress. UnitPowerType select filters which resource must be active.
 PROTOTYPES["power"] = {
 	displayName = "Power",
+	wa2Event = "Power",
 	category = "unit",
 	progressType = "static",
 	progressValue = "power",
 	progressTotal = "maxpower",
-	events = function() return { "UNIT_MANA", "UNIT_RAGE", "UNIT_ENERGY", "UNIT_FOCUS", "UNIT_MAXMANA", "UNIT_MAXRAGE", "UNIT_MAXENERGY", "UNIT_DISPLAYPOWER" } end,
+	events = function(trigger)
+		return appendMultiUnitEvents(trigger, { "UNIT_MANA", "UNIT_RAGE", "UNIT_ENERGY", "UNIT_FOCUS",
+			"UNIT_MAXMANA", "UNIT_MAXRAGE", "UNIT_MAXENERGY", "UNIT_DISPLAYPOWER" })
+	end,
 	force_events = true,
+	statesParameter = "unit",
 	icon = "Interface\\Icons\\Spell_Nature_Lightning",
 	iconFunc = function() return "Interface\\Icons\\Spell_Nature_Lightning" end,
-	nameFunc = function(trigger)
-		local unit = WA.TriggerUnit(trigger, "player")
-		return UnitName(unit) or unit
-	end,
-	init = function(trigger) return "local unit = " .. fmt(WA.TriggerUnit(trigger, "player")) end,
+	nameFunc = function(trigger) return multiUnitName(trigger, "player") end,
+	init = function(trigger) return multiUnitInit(trigger, "player") end,
 	args = {
-		{ name = "unit", type = "unit", display = "Unit" },
+		{ name = "unit", type = "unit", display = "Unit",
+			valueList = WA.unit_tokens_multi, valueLabels = WA.unit_labels_multi,
+			store = true, conditionType = "string" },
 		{ name = "exists", type = "hidden", required = true, test = "UnitExists(unit)" },
 		{ name = "powertype", type = "select", display = "Power Type",
 			init = "UnitPowerType(unit)",
@@ -620,6 +1469,15 @@ PROTOTYPES["power"] = {
 			store = true, conditionType = "string", display = "Name" },
 	},
 }
+
+-- "Is a real cooldown running", shared by the three cooldown prototypes. The
+-- global cooldown passes over every spell and item, so unless `showgcd` asks to
+-- keep it, a window no longer than the GCD is not a cooldown of this spell's
+-- own. The comparison is against the *measured* GCD (WA.IsGcdCooldown).
+local function onCooldownExpr(showgcd)
+	local notGcd = showgcd and "" or "not WeakestAuras.IsGcdCooldown(duration) and "
+	return "(duration ~= nil and duration > 0 and " .. notGcd .. "expirationTime > GetTime())"
+end
 
 -- Spell cooldown, timed progress. Fed by the central cooldown watcher (below):
 -- its init reads the watcher's cache rather than polling GetSpellCooldown
@@ -642,6 +1500,7 @@ local function cooldownRemainingArg()
 end
 PROTOTYPES["spellcooldown"] = {
 	displayName = "Cooldown Progress (Spell)",
+	wa2Event = "Cooldown Progress (Spell)",
 	category = "spell",
 	progressType = "timed",
 	-- SPELL_UPDATE_USABLE keeps the usable / insufficient-resources stores live
@@ -675,12 +1534,11 @@ PROTOTYPES["spellcooldown"] = {
 		return GetSpellInfo(id) or trigger.spellName or "?"
 	end,
 	init = function(trigger)
-		local floor = trigger.showgcd and "0" or "1.5"
 		return "local spellId = " .. fmt(WA.ResolveSpellID(trigger.spellName) or 0) .. "\n"
 			.. "local startTime, duration = WeakestAuras.SpellCdInfo(spellId)\n"
 			.. "local expirationTime = (startTime and duration and (startTime + duration)) or 0\n"
 			.. "local remaining = (expirationTime > 0 and (expirationTime - GetTime())) or 0\n"
-			.. "local onCooldown = (duration ~= nil and duration > " .. floor .. " and expirationTime > GetTime()) and true or false\n"
+			.. "local onCooldown = " .. onCooldownExpr(trigger.showgcd) .. " and true or false\n"
 			.. "local name, _, icon = GetSpellInfo(spellId)\n"
 			.. "local spellUsable, insufficientResources = false, false\n"
 			.. "if IsUsableSpell then local _u, _m = IsUsableSpell(spellId) spellUsable = _u and true or false insufficientResources = _m and true or false end\n"
@@ -688,16 +1546,12 @@ PROTOTYPES["spellcooldown"] = {
 	end,
 	args = {
 		{ name = "spellName", type = "spell", display = "Spell" },
-		-- Show mode. `duration > floor` filters the GCD (floor 1.5) unless
-		-- showgcd keeps GCD-length cooldowns (floor 0). 1.5 is a stand-in for a
-		-- real GCD reference.
 		{ name = "genericShowOn", type = "select", required = true, display = "Show",
 			valueList = { "showOnCooldown", "showOnReady", "showAlways" },
 			valueLabels = { showOnCooldown = "On Cooldown", showOnReady = "Ready", showAlways = "Always" },
 			default = "showOnCooldown", reloadOptions = true,
 			test = function(trigger)
-				local floor = trigger.showgcd and "0" or "1.5"
-				local onCd = "(duration ~= nil and duration > " .. floor .. " and expirationTime > GetTime())"
+				local onCd = onCooldownExpr(trigger.showgcd)
 				local mode = trigger.genericShowOn or "showOnCooldown"
 				if mode == "showOnReady" then return "not " .. onCd
 				elseif mode == "showAlways" then return "true"
@@ -726,6 +1580,7 @@ PROTOTYPES["spellcooldown"] = {
 -- same way).
 PROTOTYPES["itemcooldown"] = {
 	displayName = "Cooldown Progress (Item)",
+	wa2Event = "Cooldown Progress (Item)",
 	category = "item",
 	progressType = "timed",
 	events = function() return { "ITEM_COOLDOWN_CHANGED", "ITEM_COOLDOWN_READY" } end,
@@ -748,7 +1603,7 @@ PROTOTYPES["itemcooldown"] = {
 			.. "local startTime, duration = WeakestAuras.ItemCdInfo(itemId)\n"
 			.. "local expirationTime = (startTime and duration and (startTime + duration)) or 0\n"
 			.. "local remaining = (expirationTime > 0 and (expirationTime - GetTime())) or 0\n"
-			.. "local onCooldown = (duration ~= nil and duration > 1.5 and expirationTime > GetTime()) and true or false"
+			.. "local onCooldown = " .. onCooldownExpr() .. " and true or false"
 	end,
 	args = {
 		{ name = "itemName", type = "item", display = "Item" },
@@ -757,7 +1612,7 @@ PROTOTYPES["itemcooldown"] = {
 			valueLabels = { showOnCooldown = "On Cooldown", showOnReady = "Ready", showAlways = "Always" },
 			default = "showOnCooldown", reloadOptions = true,
 			test = function(trigger)
-				local onCd = "(duration ~= nil and duration > 1.5 and expirationTime > GetTime())"
+				local onCd = onCooldownExpr()
 				local mode = trigger.genericShowOn or "showOnCooldown"
 				if mode == "showOnReady" then return "not " .. onCd
 				elseif mode == "showAlways" then return "true"
@@ -795,32 +1650,34 @@ end
 
 PROTOTYPES["equipslotcooldown"] = {
 	displayName = "Cooldown Progress (Equipment Slot)",
+	wa2Event = "Cooldown Progress (Equipment Slot)",
 	category = "item",
 	progressType = "timed",
 	events = function() return { "EQUIPSLOT_COOLDOWN_CHANGED", "EQUIPSLOT_COOLDOWN_READY" } end,
 	force_events = true,
 	loadFunc = function(trigger)
-		if trigger.equipSlot then WA.WatchEquipSlotCooldown(trigger.equipSlot, trigger.use_remaining and (trigger.genericShowOn or "showOnCooldown") ~= "showOnReady") end
+		if trigger.itemSlot then WA.WatchEquipSlotCooldown(trigger.itemSlot, trigger.use_remaining and (trigger.genericShowOn or "showOnCooldown") ~= "showOnReady") end
 	end,
+	migrate = function(trigger) renameArg(trigger, "equipSlot", "itemSlot") end,
 	icon = "Interface\\Icons\\INV_Misc_Bag_09",
 	iconFunc = function(trigger)
-		local slot = trigger.equipSlot
+		local slot = trigger.itemSlot
 		local link = slot and GetInventoryItemLink and GetInventoryItemLink("player", slot)
 		local _, ic = itemNameIcon(link)
 		return ic or "Interface\\Icons\\INV_Misc_Bag_09"
 	end,
 	nameFunc = function(trigger)
-		return EQUIP_SLOT_LABELS[trigger.equipSlot] or "?"
+		return EQUIP_SLOT_LABELS[trigger.itemSlot] or "?"
 	end,
 	init = function(trigger)
-		return "local equipSlot = " .. fmt(trigger.equipSlot or 0) .. "\n"
-			.. "local startTime, duration = WeakestAuras.EquipSlotCdInfo(equipSlot)\n"
+		return "local itemSlot = " .. fmt(trigger.itemSlot or 0) .. "\n"
+			.. "local startTime, duration = WeakestAuras.EquipSlotCdInfo(itemSlot)\n"
 			.. "local expirationTime = (startTime and duration and (startTime + duration)) or 0\n"
 			.. "local remaining = (expirationTime > 0 and (expirationTime - GetTime())) or 0\n"
-			.. "local onCooldown = (duration ~= nil and duration > 1.5 and expirationTime > GetTime()) and true or false"
+			.. "local onCooldown = " .. onCooldownExpr() .. " and true or false"
 	end,
 	args = {
-		{ name = "equipSlot", type = "select", required = true, display = "Slot",
+		{ name = "itemSlot", type = "select", required = true, display = "Slot",
 			valueList = EQUIP_SLOT_IDS, valueLabels = EQUIP_SLOT_LABELS,
 			default = EQUIP_SLOT_IDS[1] },
 		{ name = "genericShowOn", type = "select", required = true, display = "Show",
@@ -828,7 +1685,7 @@ PROTOTYPES["equipslotcooldown"] = {
 			valueLabels = { showOnCooldown = "On Cooldown", showOnReady = "Ready", showAlways = "Always" },
 			default = "showOnCooldown", reloadOptions = true,
 			test = function(trigger)
-				local onCd = "(duration ~= nil and duration > 1.5 and expirationTime > GetTime())"
+				local onCd = onCooldownExpr()
 				local mode = trigger.genericShowOn or "showOnCooldown"
 				if mode == "showOnReady" then return "not " .. onCd
 				elseif mode == "showAlways" then return "true"
@@ -838,6 +1695,221 @@ PROTOTYPES["equipslotcooldown"] = {
 		{ name = "duration", type = "hidden", store = true, conditionType = "number", display = "Duration" },
 		{ name = "expirationTime", type = "hidden", store = true, conditionType = "timer", display = "Remaining Time" },
 		{ name = "onCooldown", type = "hidden", store = true, conditionType = "bool", display = "On Cooldown" },
+	},
+}
+
+-- The watcher's own edges only. It already reads the client's cooldown events
+-- and emits GCD_UPDATE/GCD_END on the transitions that mean something, so
+-- listening to the raw events here as well would re-evaluate on every unrelated
+-- actionbar cooldown change and learn nothing.
+PROTOTYPES["globalcooldown"] = {
+	displayName = "Global Cooldown",
+	wa2Event = "Global Cooldown",
+	category = "spell",
+	progressType = "timed",
+	events = function() return { "GCD_UPDATE", "GCD_END", "PLAYER_ENTERING_WORLD" } end,
+	force_events = true,
+	loadFunc = function() WA.WatchGCD() end,
+	icon = "Interface\\Icons\\Spell_Holy_SealOfMight",
+	iconFunc = function() return "Interface\\Icons\\Spell_Holy_SealOfMight" end,
+	nameFunc = function() return "Global Cooldown" end,
+	init = function(trigger)
+		return "local startTime, duration = WeakestAuras.GcdInfo()\n"
+			.. "local expirationTime = (startTime and duration and (startTime + duration)) or 0\n"
+			.. "local remaining = (expirationTime > 0 and (expirationTime - GetTime())) or 0\n"
+			.. "local active = duration ~= nil and duration > 0 and expirationTime > GetTime()"
+	end,
+	args = {
+		{ name = "inverse", type = "toggle", display = "Inverse" },
+		{ name = "active", type = "hidden", required = true, store = true,
+			conditionType = "bool", display = "On Global Cooldown",
+			test = function(trigger) return trigger.inverse and "not active" or "active" end },
+		{ name = "duration", type = "hidden", store = true, conditionType = "number", display = "Duration" },
+		{ name = "expirationTime", type = "hidden", store = true, conditionType = "timer", display = "Remaining Time" },
+		{ name = "remaining", type = "hidden", store = true, conditionType = "number", display = "Time Remaining" },
+	},
+}
+
+-- "Ready" is the absence of a cooldown of the thing's own: an expired window, no
+-- window, or a window that is only the global cooldown passing over it.
+local function cooldownReadyInit(infoFunc, keySource, knownSource)
+	return "local cooldownKey = " .. keySource .. "\n"
+		.. "local startTime, duration = " .. infoFunc .. "(cooldownKey)\n"
+		.. "local expirationTime = (startTime and duration and (startTime + duration)) or 0\n"
+		.. "local ready = (" .. knownSource .. ") and (duration == nil or WeakestAuras.IsGcdCooldown(duration) or duration <= 0 or expirationTime <= GetTime())"
+end
+
+-- Whether an item is the on-use kind a cooldown can belong to at all. Gear with
+-- a passive or on-proc effect has no cooldown to be ready from, so a trigger
+-- pointed at one should stay dark rather than claim to be permanently ready.
+-- C_Item.GetItemSpell answers nil for an item not yet in the local cache and
+-- requests it in the background, which is why the prototypes reading this also
+-- listen for GET_ITEM_INFO_RECEIVED -- without that a cold-cached item would
+-- read as passive until something else happened to re-evaluate the trigger.
+local function itemHasUseSpell(itemId)
+	if not itemId or itemId == 0 then return false end
+	if C_Item and C_Item.GetItemSpell then
+		local spellName, spellId = C_Item.GetItemSpell(itemId)
+		return (spellId and spellId > 0) or (spellName and spellName ~= "")
+	end
+	if GetItemSpell then
+		local spellName = GetItemSpell(itemId)
+		return spellName and spellName ~= ""
+	end
+	return false
+end
+WA.ItemHasUseSpell = itemHasUseSpell
+
+local function cooldownReadyArgs(kind, selector)
+	local args = {
+		{ name = "ready", type = "hidden", required = true, store = true,
+			conditionType = "bool", display = "Ready", test = "ready" },
+		{ name = "duration", type = "hidden", store = true, conditionType = "number", display = "Duration" },
+		{ name = "expirationTime", type = "hidden", store = true, conditionType = "timer", display = "Ready Since" },
+		{ name = "name", type = "hidden", store = true, conditionType = "string", display = kind .. " Name" },
+		{ name = "icon", type = "hidden", store = true },
+	}
+	table.insert(args, 1, selector)
+	return args
+end
+
+PROTOTYPES["spellcooldownready"] = {
+	displayName = "Cooldown Ready (Spell)",
+	wa2Event = "Cooldown Ready (Spell)",
+	category = "spell",
+	progressType = "timed",
+	events = function() return { "SPELL_COOLDOWN_CHANGED", "SPELL_COOLDOWN_READY", "SPELL_UPDATE_COOLDOWN" } end,
+	force_events = true,
+	loadFunc = function(trigger)
+		local id = WA.ResolveSpellID(trigger.spellName)
+		if id then WA.WatchSpellCooldown(id) end
+	end,
+	icon = "Interface\\Icons\\Spell_Holy_BorrowedTime",
+	iconFunc = function(trigger)
+		local id = WA.ResolveSpellID(trigger.spellName)
+		if not id then return "Interface\\Icons\\Spell_Holy_BorrowedTime" end
+		local _, _, icon = GetSpellInfo(id)
+		return icon or "Interface\\Icons\\Spell_Holy_BorrowedTime"
+	end,
+	nameFunc = function(trigger) return trigger.spellName or "Cooldown Ready" end,
+	init = function(trigger)
+		local id = WA.ResolveSpellID(trigger.spellName) or 0
+		return cooldownReadyInit("WeakestAuras.SpellCdInfo", fmt(id),
+			"cooldownKey ~= 0 and WeakestAuras.SpellCdKnown(cooldownKey)")
+			.. "\nlocal name, _, icon = GetSpellInfo(cooldownKey)"
+	end,
+	args = cooldownReadyArgs("Spell", { name = "spellName", type = "spell", required = true, display = "Spell" }),
+}
+
+PROTOTYPES["itemcooldownready"] = {
+	displayName = "Cooldown Ready (Item)",
+	wa2Event = "Cooldown Ready (Item)",
+	category = "item",
+	progressType = "timed",
+	events = function() return { "ITEM_COOLDOWN_CHANGED", "ITEM_COOLDOWN_READY", "BAG_UPDATE_COOLDOWN", "GET_ITEM_INFO_RECEIVED" } end,
+	force_events = true,
+	loadFunc = function(trigger)
+		local id = WA.ResolveItemID(trigger.itemName)
+		if id then WA.WatchItemCooldown(id) end
+	end,
+	icon = "Interface\\Icons\\INV_Misc_Bag_08",
+	iconFunc = function(trigger)
+		local _, icon = itemNameIcon(WA.ResolveItemID(trigger.itemName))
+		return icon or "Interface\\Icons\\INV_Misc_Bag_08"
+	end,
+	nameFunc = function(trigger)
+		local name = itemNameIcon(WA.ResolveItemID(trigger.itemName))
+		return name or trigger.itemName or "Cooldown Ready"
+	end,
+	init = function(trigger)
+		local id = WA.ResolveItemID(trigger.itemName) or 0
+		return cooldownReadyInit("WeakestAuras.ItemCdInfo", fmt(id), "cooldownKey ~= 0 and WeakestAuras.ItemHasUseSpell(cooldownKey)")
+			.. "\nlocal name, _, _, _, _, _, _, _, _, icon = C_Item.GetItemInfo(cooldownKey)"
+	end,
+	args = cooldownReadyArgs("Item", { name = "itemName", type = "item", required = true, display = "Item" }),
+}
+
+PROTOTYPES["equipslotcooldownready"] = {
+	displayName = "Cooldown Ready (Equipment Slot)",
+	wa2Event = "Cooldown Ready (Equipment Slot)",
+	category = "item",
+	progressType = "timed",
+	events = function() return { "EQUIPSLOT_COOLDOWN_CHANGED", "EQUIPSLOT_COOLDOWN_READY", "BAG_UPDATE_COOLDOWN", "PLAYER_EQUIPMENT_CHANGED", "GET_ITEM_INFO_RECEIVED" } end,
+	force_events = true,
+	loadFunc = function(trigger)
+		if trigger.itemSlot then WA.WatchEquipSlotCooldown(trigger.itemSlot) end
+	end,
+	migrate = function(trigger) renameArg(trigger, "equipSlot", "itemSlot") end,
+	icon = "Interface\\Icons\\INV_Misc_Bag_09",
+	iconFunc = function(trigger)
+		local slot = trigger.itemSlot
+		local link = slot and GetInventoryItemLink and GetInventoryItemLink("player", slot)
+		local _, icon = itemNameIcon(link)
+		return icon or "Interface\\Icons\\INV_Misc_Bag_09"
+	end,
+	nameFunc = function(trigger) return EQUIP_SLOT_LABELS[trigger.itemSlot] or "Cooldown Ready" end,
+	init = function(trigger)
+		return "local cooldownKey = " .. fmt(trigger.itemSlot or 0) .. "\n"
+			.. "local startTime, duration = WeakestAuras.EquipSlotCdInfo(cooldownKey)\n"
+			.. "local expirationTime = (startTime and duration and (startTime + duration)) or 0\n"
+			.. "local itemSlot = cooldownKey\n"
+			.. "local item = GetInventoryItemID and GetInventoryItemID(\"player\", cooldownKey)\n"
+			.. "local hasUseSpell = WeakestAuras.ItemHasUseSpell(item)\n"
+			.. "local ready = (cooldownKey ~= 0 and hasUseSpell) and (duration == nil or WeakestAuras.IsGcdCooldown(duration) or duration <= 0 or expirationTime <= GetTime())\n"
+			.. "local name, _, _, _, _, _, _, _, _, icon = item and C_Item.GetItemInfo(item) or nil"
+	end,
+	args = cooldownReadyArgs("Equipment", {
+		name = "itemSlot", type = "select", required = true, display = "Equipment Slot",
+		valueList = EQUIP_SLOT_IDS, valueLabels = EQUIP_SLOT_LABELS, default = EQUIP_SLOT_IDS[1],
+	}),
+}
+
+PROTOTYPES["actionusable"] = {
+	displayName = "Action Usable",
+	wa2Event = "Action Usable",
+	category = "spell",
+	progressType = "none",
+	events = function() return { "SPELL_UPDATE_USABLE", "SPELL_COOLDOWN_CHANGED", "PLAYER_TARGET_CHANGED" } end,
+	force_events = true,
+	loadFunc = function(trigger)
+		local id = WA.ResolveSpellID(trigger.spellName)
+		if id then WA.WatchSpellCooldown(id) end
+	end,
+	icon = "Interface\\Icons\\Spell_Holy_BorrowedTime",
+	iconFunc = function(trigger)
+		local id = WA.ResolveSpellID(trigger.spellName)
+		if not id then return "Interface\\Icons\\Spell_Holy_BorrowedTime" end
+		local _, _, icon = GetSpellInfo(id)
+		return icon or "Interface\\Icons\\Spell_Holy_BorrowedTime"
+	end,
+	nameFunc = function(trigger) return trigger.spellName or "Action Usable" end,
+	init = function(trigger)
+		local id = WA.ResolveSpellID(trigger.spellName) or 0
+		return "local spellId = " .. fmt(id) .. "\n"
+			.. "local usable, insufficientResources = false, false\n"
+			.. "if IsUsableSpell then local _u, _m = IsUsableSpell(spellId) usable = _u and true or false insufficientResources = _m and true or false end\n"
+			.. "local startTime, duration = WeakestAuras.SpellCdInfo(spellId)\n"
+			.. "local ready = (duration == nil or WeakestAuras.IsGcdCooldown(duration) or duration <= 0 or not startTime or startTime == 0 or (startTime + duration) <= GetTime())\n"
+			.. "local active = usable and ready\n"
+			.. "local spellInRange = WeakestAuras.SpellInRange(spellId)"
+	end,
+	args = {
+		{ name = "spellName", type = "spell", display = "Spell", required = true },
+		{ name = "targetRequired", type = "toggle", display = "Require Valid Target", reloadOptions = true },
+		{ name = "ignoreSpellCooldown", type = "toggle", display = "Ignore Spell Cooldown", reloadOptions = true },
+		{ name = "inverse", type = "toggle", display = "Inverse", reloadOptions = true },
+		{ name = "active", type = "hidden", required = true, store = true, conditionType = "bool",
+			display = "Usable", test = function(trigger)
+				local test = trigger.ignoreSpellCooldown and "usable" or "active"
+				if trigger.targetRequired then test = test .. " and spellInRange" end
+				if trigger.inverse then return "not (" .. test .. ")" end
+				return test
+			end },
+		{ name = "usable", type = "hidden", store = true, conditionType = "bool", display = "Spell Usable" },
+		{ name = "insufficientResources", type = "hidden", store = true, conditionType = "bool", display = "Insufficient Resources" },
+		{ name = "spellInRange", type = "hidden", store = true, conditionType = "bool", display = "In Range" },
+		{ name = "duration", type = "hidden", store = true, conditionType = "number", display = "Cooldown Duration" },
+		{ name = "expirationTime", type = "hidden", store = true, conditionType = "timer", display = "Cooldown End" },
 	},
 }
 
@@ -852,15 +1924,29 @@ PROTOTYPES["equipslotcooldown"] = {
 -- be confused with each other.
 PROTOTYPES["cast"] = {
 	displayName = "Cast",
+	wa2Event = "Cast",
 	category = "unit",
 	progressType = "timed",
-	events = function() return { "SPELLCAST_START", "SPELLCAST_STOP", "SPELLCAST_CHANNEL_START", "SPELLCAST_CHANNEL_STOP", "SPELLCAST_FAILED", "SPELLCAST_INTERRUPTED", "PLAYER_TARGET_CHANGED" } end,
+	-- Vanilla's arg-less SPELLCAST_* only reports the player's own casts; the
+	-- ClassicAPI UNIT_SPELLCAST_* layer carries arg1 = the casting unit and is
+	-- what makes any unit but the player -- and every member of a multi-unit
+	-- family -- report a cast at all. Only the six all-unit events are listed:
+	-- DELAYED/FAILED/CHANNEL_UPDATE are player-only there and already covered.
+	events = function(trigger)
+		return appendMultiUnitEvents(trigger, { "SPELLCAST_START", "SPELLCAST_STOP",
+			"SPELLCAST_CHANNEL_START", "SPELLCAST_CHANNEL_STOP", "SPELLCAST_FAILED",
+			"SPELLCAST_INTERRUPTED", "PLAYER_TARGET_CHANGED",
+			"UNIT_SPELLCAST_START", "UNIT_SPELLCAST_STOP", "UNIT_SPELLCAST_SUCCEEDED",
+			"UNIT_SPELLCAST_INTERRUPTED", "UNIT_SPELLCAST_CHANNEL_START",
+			"UNIT_SPELLCAST_CHANNEL_STOP" })
+	end,
 	force_events = true,
+	statesParameter = "unit",
 	icon = "Interface\\Icons\\Spell_Nature_WispSplode",
 	iconFunc = function() return "Interface\\Icons\\Spell_Nature_WispSplode" end,
-	nameFunc = function(trigger) return "Cast (" .. WA.TriggerUnit(trigger, "player") .. ")" end,
+	nameFunc = function(trigger) return "Cast (" .. (multiUnitFamily(trigger) or WA.TriggerUnit(trigger, "player")) .. ")" end,
 	init = function(trigger)
-		return "local unit = " .. fmt(WA.TriggerUnit(trigger, "player")) .. "\n"
+		return multiUnitInit(trigger, "player") .. "\n"
 			.. "local castName, castIcon, startMs, endMs, notInterruptible, castingSpellID\n"
 			.. "if C_Spell and C_Spell.UnitCastingInfo then\n"
 			.. "\tlocal _n, _d, _i, _s, _e, _t, _c, _ni, _sid = C_Spell.UnitCastingInfo(unit)\n"
@@ -883,7 +1969,11 @@ PROTOTYPES["cast"] = {
 			.. "local duration = (expirationTime > 0 and startTime > 0) and (expirationTime - startTime) or 0"
 	end,
 	args = {
-		{ name = "unit", type = "unit", display = "Unit" },
+		{ name = "unit", type = "unit", display = "Unit",
+			valueList = WA.unit_tokens_multi, valueLabels = WA.unit_labels_multi,
+			store = true, conditionType = "string" },
+		{ name = "unitName", type = "hidden", init = "UnitName(unit)",
+			store = true, conditionType = "string", display = "Unit Name" },
 		{ name = "active", type = "hidden", required = true, test = "active" },
 		{ name = "casting", type = "hidden", store = true, conditionType = "bool", display = "Casting" },
 		{ name = "channeling", type = "hidden", store = true, conditionType = "bool", display = "Channeling" },
@@ -907,6 +1997,7 @@ PROTOTYPES["cast"] = {
 -- the player's own cast. Hence: your casts only, and no unit arg.
 PROTOTYPES["castsucceeded"] = {
 	displayName = "Spell Cast Succeeded",
+	wa2Event = "Spell Cast Succeeded",
 	category = "spell",
 	autoHide = true,
 	enable = function() return WA.hasNampower end,
@@ -939,10 +2030,74 @@ PROTOTYPES["castsucceeded"] = {
 	},
 }
 
+PROTOTYPES["readycheck"] = {
+	displayName = "Ready Check",
+	wa2Event = "Ready Check",
+	category = "event",
+	eventMode = true,
+	autoHide = true,
+	events = function() return { "READY_CHECK" } end,
+	icon = "Interface\\Icons\\Spell_Holy_DivineIllumination",
+	iconFunc = function() return "Interface\\Icons\\Spell_Holy_DivineIllumination" end,
+	args = {
+		{ name = "duration", type = "range", display = "Show For (s)",
+			min = 0.5, max = 10, step = 0.5, default = 1 },
+	},
+}
+
+PROTOTYPES["combatevents"] = {
+	displayName = "Combat Events",
+	category = "event",
+	eventMode = true,
+	autoHide = true,
+	events = function() return COMBAT_EVENT_VALUES end,
+	icon = "Interface\\Icons\\Ability_Warrior_Charge",
+	iconFunc = function() return "Interface\\Icons\\Ability_Warrior_Charge" end,
+	args = {
+		{ name = "eventtype", type = "select", display = "Type", required = true,
+			valueList = COMBAT_EVENT_VALUES, valueLabels = COMBAT_EVENT_LABELS,
+			default = "PLAYER_REGEN_DISABLED", store = true, conditionType = "string",
+			init = "event",
+			test = function(trigger) return "event == " .. fmt(trigger.eventtype or "") end },
+		{ name = "duration", type = "range", display = "Show For (s)",
+			min = 0.5, max = 10, step = 0.5, default = 1 },
+	},
+}
+
+PROTOTYPES["chatmessage"] = {
+	displayName = "Chat Message",
+	wa2Event = "Chat Message",
+	category = "event",
+	eventMode = true,
+	autoHide = true,
+	events = chatMessageEvents,
+	icon = "Interface\\Icons\\INV_Misc_Note_01",
+	iconFunc = function() return "Interface\\Icons\\INV_Misc_Note_01" end,
+	init = function(trigger)
+		local base = trigger and trigger.messageType
+		return "if event == 'CHAT_MSG_PARTY_LEADER' then event = 'CHAT_MSG_PARTY' elseif event == 'CHAT_MSG_RAID_LEADER' then event = 'CHAT_MSG_RAID' elseif event == 'CHAT_MSG_TEXT_EMOTE' then event = 'CHAT_MSG_EMOTE' end"
+	end,
+	args = {
+		{ name = "messageType", type = "select", display = "Message Type", init = "event",
+			valueList = CHAT_MESSAGE_VALUES, valueLabels = CHAT_MESSAGE_LABELS,
+			default = "CHAT_MSG_SAY" },
+		{ name = "message", type = "string", display = "Message", init = "arg1",
+			store = true, conditionType = "string" },
+		{ name = "sourceName", type = "string", display = "Source Name", init = "arg2",
+			store = true, conditionType = "string" },
+		{ name = "destName", type = "string", display = "Destination Name", init = "arg5",
+			store = true, conditionType = "string" },
+		{ name = "use_cloneId", type = "toggle", display = "Clone per Event", default = false },
+		{ name = "duration", type = "range", display = "Show For (s)",
+			min = 0.5, max = 10, step = 0.5, default = 1 },
+	},
+}
+
 -- Status bool: has the player learned this spell. IsSpellKnown is a native
 -- global taking a numeric spellID (3.3.5 semantics).
 PROTOTYPES["spellknown"] = {
 	displayName = "Spell Known",
+	wa2Event = "Spell Known",
 	category = "spell",
 	progressType = "none",
 	events = function() return { "SPELLS_CHANGED", "LEARNED_SPELL_IN_TAB" } end,
@@ -976,6 +2131,7 @@ PROTOTYPES["spellknown"] = {
 -- in-game and filters on them directly.
 PROTOTYPES["stance"] = {
 	displayName = "Stance/Form",
+	wa2Event = "Stance/Form/Aura",
 	category = "unit",
 	progressType = "none",
 	events = function() return { "UPDATE_SHAPESHIFT_FORM" } end,
@@ -998,6 +2154,7 @@ PROTOTYPES["stance"] = {
 -- value (no multi-return truncation risk from the `and`-chain below).
 PROTOTYPES["itemcount"] = {
 	displayName = "Item Count",
+	wa2Event = "Item Count",
 	category = "item",
 	progressType = "none",
 	events = function() return { "BAG_UPDATE", "BANKFRAME_OPENED", "BANKFRAME_CLOSED" } end,
@@ -1035,6 +2192,7 @@ PROTOTYPES["itemcount"] = {
 -- resolved to an ID first.
 PROTOTYPES["itemequipped"] = {
 	displayName = "Item Equipped",
+	wa2Event = "Item Equipped",
 	category = "item",
 	progressType = "none",
 	events = function() return { "UNIT_INVENTORY_CHANGED", "PLAYER_EQUIPMENT_CHANGED" } end,
@@ -1058,12 +2216,175 @@ PROTOTYPES["itemequipped"] = {
 	},
 }
 
+local ITEM_EQUIP_SLOTS = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19 }
+local ITEM_EQUIP_SLOT_LABELS = {
+	[0] = "Any Slot", [1] = "Head", [2] = "Neck", [3] = "Shoulder", [4] = "Shirt",
+	[5] = "Chest", [6] = "Waist", [7] = "Legs", [8] = "Feet", [9] = "Wrist",
+	[10] = "Hands", [11] = "Finger 1", [12] = "Finger 2", [13] = "Trinket 1",
+	[14] = "Trinket 2", [15] = "Back", [16] = "Main Hand", [17] = "Off Hand",
+	[18] = "Ranged", [19] = "Tabard",
+}
+
+local ITEM_CLASS_IDS, ITEM_CLASS_LABELS = {}, {}
+local ITEM_SUBCLASS_IDS, ITEM_SUBCLASS_LABELS = {}, {}
+local fallbackItemClasses = {
+	[0] = "Consumable", [1] = "Container", [2] = "Weapon", [3] = "Gem",
+	[4] = "Armor", [5] = "Reagent", [6] = "Projectile", [7] = "Trade Goods",
+	[8] = "Item Enhancement", [9] = "Recipe", [10] = "Currency",
+	[11] = "Quiver", [12] = "Quest", [13] = "Key", [14] = "Permanent",
+	[15] = "Miscellaneous",
+}
+for classID = 0, 15 do
+	local label = C_Item and C_Item.GetItemClassInfo and C_Item.GetItemClassInfo(classID)
+	if not label or label == "" then label = fallbackItemClasses[classID] end
+	if label then
+		table.insert(ITEM_CLASS_IDS, classID)
+		ITEM_CLASS_LABELS[classID] = label
+		ITEM_SUBCLASS_IDS[classID] = {}
+		ITEM_SUBCLASS_LABELS[classID] = {}
+		for subclassID = 0, 31 do
+			local subclass = C_Item and C_Item.GetItemSubClassInfo and
+				C_Item.GetItemSubClassInfo(classID, subclassID)
+			if subclass and subclass ~= "" then
+				table.insert(ITEM_SUBCLASS_IDS[classID], subclassID)
+				ITEM_SUBCLASS_LABELS[classID][subclassID] = subclass
+			end
+		end
+	end
+end
+
+local function itemSubclassValues(classID)
+	local ids = ITEM_SUBCLASS_IDS[tonumber(classID) or -1]
+	local labels = ITEM_SUBCLASS_LABELS[tonumber(classID) or -1]
+	if ids and table.getn(ids) > 0 then return ids, labels end
+	return { 0 }, { [0] = "Unknown" }
+end
+
+PROTOTYPES["itemtypeequipped"] = {
+	displayName = "Item Type Equipped",
+	wa2Event = "Item Type Equipped",
+	category = "item",
+	progressType = "none",
+	events = function() return { "PLAYER_EQUIPMENT_CHANGED", "UNIT_INVENTORY_CHANGED", "WA_DELAYED_PLAYER_ENTERING_WORLD" } end,
+	force_events = true,
+	icon = "Interface\\Icons\\INV_Misc_Bag_10",
+	iconFunc = function() return "Interface\\Icons\\INV_Misc_Bag_10" end,
+	nameFunc = function() return "Item Type Equipped" end,
+	migrate = function(trigger)
+		if trigger.itemClassID ~= nil then trigger.itemClassID = tonumber(trigger.itemClassID) or trigger.itemClassID end
+		if trigger.itemSubclassID ~= nil then trigger.itemSubclassID = tonumber(trigger.itemSubclassID) or trigger.itemSubclassID end
+	end,
+	init = function(trigger)
+		return "local wantedClassID = tonumber(" .. fmt(trigger.itemClassID or "") .. ") or -1\n"
+			.. "local wantedSubclassID = tonumber(" .. fmt(trigger.itemSubclassID or "") .. ") or -1\n"
+			.. "local selectedSlot = " .. fmt(tonumber(trigger.itemSlot) or 0) .. "\n"
+			.. "local inverse = " .. fmt(trigger.inverse and true or false) .. "\n"
+			.. "local itemIDValue, itemNameValue, itemIconValue, itemClassValue, itemSubclassValue, itemClassIDValue, itemSubclassIDValue, equippedValue, matchingValue, itemKnownValue = WeakestAuras.ItemTypeEquipped(wantedClassID, wantedSubclassID, selectedSlot)"
+	end,
+	args = {
+		{ name = "itemClassID", type = "select", display = "Item Class", required = true,
+			valueList = ITEM_CLASS_IDS, valueLabels = ITEM_CLASS_LABELS, default = 2,
+			test = function() return nil end, reloadOptions = true },
+		{ name = "itemSubclassID", type = "select", display = "Item Subclass", required = true,
+			valueList = function(trigger) return itemSubclassValues(trigger.itemClassID) end,
+			valueLabels = function(trigger) return ITEM_SUBCLASS_LABELS[tonumber(trigger.itemClassID) or -1] end,
+			default = 0, test = function() return nil end },
+		{ name = "itemSlot", type = "select", required = true, init = "selectedSlot", display = "Equipment Slot",
+			valueList = ITEM_EQUIP_SLOTS, valueLabels = ITEM_EQUIP_SLOT_LABELS, default = 0 },
+		{ name = "inverse", type = "toggle", display = "Inverse" },
+		{ name = "itemID", type = "hidden", init = "itemIDValue", store = true, storeAlways = true, conditionType = "number", display = "Item ID" },
+		{ name = "itemName", type = "hidden", init = "itemNameValue", store = true, storeAlways = true, conditionType = "string", display = "Item Name" },
+		{ name = "name", type = "hidden", init = "itemNameValue", store = true, storeAlways = true, conditionType = "string", display = "Name" },
+		{ name = "icon", type = "hidden", init = "itemIconValue", store = true, storeAlways = true, display = "Icon" },
+		{ name = "itemClassName", type = "hidden", init = "itemClassValue", store = true, storeAlways = true, conditionType = "string", display = "Item Class" },
+		{ name = "itemSubclassName", type = "hidden", init = "itemSubclassValue", store = true, storeAlways = true, conditionType = "string", display = "Item Subclass" },
+		{ name = "foundClassID", type = "hidden", init = "itemClassIDValue", store = true, storeAlways = true, conditionType = "number", display = "Found Item Class ID" },
+		{ name = "foundSubclassID", type = "hidden", init = "itemSubclassIDValue", store = true, storeAlways = true, conditionType = "number", display = "Found Item Subclass ID" },
+		{ name = "equipped", type = "hidden", init = "equippedValue", store = true, storeAlways = true, conditionType = "bool", display = "Equipped" },
+		{ name = "matching", type = "hidden", required = true, init = "matchingValue", store = true, storeAlways = true, conditionType = "bool", display = "Matching Type",
+			test = function(trigger) return trigger.inverse and "not matching" or "matching" end },
+		{ name = "itemKnown", type = "hidden", init = "itemKnownValue", store = true, storeAlways = true, conditionType = "bool", display = "Item Metadata Available" },
+	},
+}
+
+PROTOTYPES["itemset"] = {
+	displayName = "Item Set Equipped",
+	wa2Event = "Item Set",
+	category = "item",
+	progressType = "static",
+	progressValue = "count",
+	progressTotal = "total",
+	events = function() return { "PLAYER_EQUIPMENT_CHANGED", "GET_ITEM_INFO_RECEIVED", "WA_DELAYED_PLAYER_ENTERING_WORLD" } end,
+	force_events = true,
+	icon = "Interface\\Icons\\INV_Chest_Cloth_17",
+	iconFunc = function() return "Interface\\Icons\\INV_Chest_Cloth_17" end,
+	migrate = function(trigger) renameArg(trigger, "itemSetID", "itemSetId") end,
+	nameFunc = function(trigger)
+		local _, _, name = WA.ItemSetEquipped(trigger.itemSetId)
+		return name or "Item Set Equipped"
+	end,
+	init = function(trigger)
+		return "local countValue, totalValue, setNameValue, setKnownValue = WeakestAuras.ItemSetEquipped("
+			.. fmt(trigger.itemSetId or 0) .. ")"
+	end,
+	args = {
+		{ name = "itemSetId", type = "text", display = "Item Set ID", required = true, default = "0" },
+		{ name = "inverse", type = "toggle", display = "Inverse" },
+		{ name = "count", type = "hidden", init = "countValue", store = true, conditionType = "number", display = "Equipped Pieces" },
+		{ name = "total", type = "hidden", init = "totalValue", store = true, conditionType = "number", display = "Set Pieces" },
+		{ name = "setName", type = "hidden", init = "setNameValue", store = true, conditionType = "string", display = "Set Name" },
+		{ name = "setKnown", type = "hidden", init = "setKnownValue", store = true, conditionType = "bool", display = "Set Identified" },
+		{ name = "active", type = "hidden", required = true, test = function(trigger)
+			return trigger.inverse and "count == 0" or "count > 0"
+		end, store = true, init = "countValue > 0", conditionType = "bool", display = "Active" },
+	},
+}
+
+PROTOTYPES["equipmentset"] = {
+	displayName = "Equipment Set Equipped",
+	wa2Event = "Equipment Set",
+	category = "item",
+	progressType = "static",
+	progressValue = "count",
+	progressTotal = "total",
+	events = function() return { "PLAYER_EQUIPMENT_CHANGED", "WEAR_EQUIPMENT_SET", "EQUIPMENT_SETS_CHANGED", "EQUIPMENT_SWAP_FINISHED", "WA_DELAYED_PLAYER_ENTERING_WORLD" } end,
+	force_events = true,
+	migrate = function(trigger) renameArg(trigger, "equipmentSetName", "itemSetName") end,
+	icon = "Interface\\Icons\\INV_Misc_Gear_03",
+	iconFunc = function(trigger)
+		local _, icon = WA.EquipmentSetInfo(trigger.itemSetName, trigger.partial)
+		return icon or "Interface\\Icons\\INV_Misc_Gear_03"
+	end,
+	nameFunc = function(trigger)
+		local name = WA.EquipmentSetInfo(trigger.itemSetName, trigger.partial)
+		return name or "Equipment Set Equipped"
+	end,
+	init = function(trigger)
+		return "local setNameValue, setIconValue, countValue, totalValue, activeValue, setIDValue, ignoredValue = WeakestAuras.EquipmentSetInfo("
+			.. fmt(trigger.itemSetName or "") .. ", " .. fmt(trigger.partial and true or false) .. ")"
+	end,
+	args = {
+		{ name = "itemSetName", type = "text", display = "Equipment Set", required = true },
+		{ name = "partial", type = "toggle", display = "Allow Partial Matches" },
+		{ name = "inverse", type = "toggle", display = "Inverse" },
+		{ name = "name", type = "hidden", init = "setNameValue", store = true, conditionType = "string", display = "Set Name" },
+		{ name = "icon", type = "hidden", init = "setIconValue", store = true, display = "Icon" },
+		{ name = "count", type = "hidden", init = "countValue", store = true, conditionType = "number", display = "Equipped Pieces" },
+		{ name = "total", type = "hidden", init = "totalValue", store = true, conditionType = "number", display = "Set Pieces" },
+		{ name = "setID", type = "hidden", init = "setIDValue", store = true, conditionType = "number", display = "Set ID" },
+		{ name = "ignored", type = "hidden", init = "ignoredValue", store = true, conditionType = "number", display = "Ignored Slots" },
+		{ name = "active", type = "hidden", required = true, init = "activeValue", store = true, conditionType = "bool", display = "Active",
+			test = function(trigger) return trigger.inverse and "not active" or "active" end },
+	},
+}
+
 -- Status: static facts about a unit. UnitClassBase (ClassicAPI backport)
 -- returns two values -- captured through pre-declared locals set inside an
 -- if-block rather than an `and`-chain, for the same multi-return-truncation
 -- reason documented above the itemcooldown prototype.
 PROTOTYPES["unitcharacteristics"] = {
 	displayName = "Unit Characteristics",
+	wa2Event = "Unit Characteristics",
 	category = "unit",
 	progressType = "none",
 	events = function() return { "UNIT_LEVEL", "PLAYER_TARGET_CHANGED", "PLAYER_ENTERING_WORLD" } end,
@@ -1098,33 +2419,42 @@ PROTOTYPES["unitcharacteristics"] = {
 	},
 }
 
--- Custom status trigger. Unlike every prototype above, its test function, events
--- and progress come from user text, not an `args` list -- GenericTrigger.Add
--- compiles trigger.customTrigger via constructCustomFunction (not
--- constructFunction) and reads its events from trigger.customEvents whenever
--- proto.custom is set. Only WA2's `status` custom mode is supported: the user's
--- f(state, event) is re-run on each listed event, show follows the returned bool,
--- and the function writes its own name/icon/progress/condition fields onto the
--- persistent `state` table (setting state.changed = true when it mutates them, so
--- the change propagates -- same contract WA2 custom triggers carry). A custom
--- trigger declares no condition variables, so GetTriggerConditions returns an
--- empty table for it.
+-- Custom status and event triggers use upstream's saved field names. Legacy
+-- local status records keep their state-first call signature; upstream-shaped
+-- functions receive event first.
 PROTOTYPES["custom"] = {
 	displayName = "Custom",
 	category = "custom",
 	custom = true,
-	-- Fallback only; Add sets ti.progressType per-trigger from customProgressType
-	-- and activateEvent reads that (not this) for a custom ti.
 	progressType = "none",
-	events = function(trigger) return parseEventList(trigger and trigger.customEvents) end,
+	events = function(trigger) return parseEventList(trigger and trigger.events) end,
 	force_events = true,
 	icon = "Interface\\Icons\\INV_Misc_Gear_08",
 	iconFunc = function() return "Interface\\Icons\\INV_Misc_Gear_08" end,
 	nameFunc = function() return "Custom" end,
+	migrate = function(trigger)
+		if trigger.customTrigger ~= nil then
+			if trigger.custom == nil then
+				trigger.custom = trigger.customTrigger
+				trigger.weakestAurasLegacyStateArgs = true
+			end
+			trigger.customTrigger = nil
+		end
+		if trigger.customEvents ~= nil then
+			if trigger.events == nil then trigger.events = trigger.customEvents end
+			trigger.customEvents = nil
+		end
+	end,
 	defaults = {
-		customTrigger = "function(state, event)\n    return true\nend",
-		customEvents = "",
-		customProgressType = "none",
+		custom_type = "status",
+		check = "event",
+		events = "",
+		custom = "function(event, ...)\n    return true\nend",
+		custom_hide = "timed",
+		duration = 1,
+		customDuration = "",
+		customName = "",
+		customIcon = "",
 	},
 	args = {},
 }
@@ -1162,6 +2492,7 @@ PROTOTYPES["combopoints"] = {
 -- flip. name comes from the enchant record when resolvable.
 PROTOTYPES["weaponenchant"] = {
 	displayName = "Weapon Enchant (Temporary)",
+	wa2Event = "Weapon Enchant",
 	category = "item",
 	progressType = "timed",
 	events = function() return { "UNIT_INVENTORY_CHANGED", "PLAYER_ENTERING_WORLD", "WA_SLOW_TICK" } end,
@@ -1169,18 +2500,20 @@ PROTOTYPES["weaponenchant"] = {
 	loadFunc = function() WA.EnsureSlowTick() end,
 	icon = "Interface\\Icons\\INV_Potion_105",
 	iconFunc = function() return "Interface\\Icons\\INV_Potion_105" end,
+	migrate = function(trigger) renameArg(trigger, "hand", "weapon") end,
 	nameFunc = function(trigger)
-		local h = trigger.hand or "main"
+		local h = trigger.weapon or "main"
 		return (h == "off" and "Off Hand Enchant") or (h == "ranged" and "Ranged Enchant") or "Main Hand Enchant"
 	end,
 	init = function(trigger)
-		return "local has, expirationTime, duration, enchantId = WeakestAuras.WeaponEnchantInfo(" .. fmt(trigger.hand or "main") .. ")\n"
+		return "local weapon = " .. fmt(trigger.weapon or "main") .. "\n"
+			.. "local has, expirationTime, duration, enchantId = WeakestAuras.WeaponEnchantInfo(weapon)\n"
 			.. "local name = \"Weapon Enchant\"\n"
 			.. "if enchantId and C_Item and C_Item.GetEnchantInfo then local ei = C_Item.GetEnchantInfo(enchantId) if ei and ei.name then name = ei.name end end\n"
 			.. "local remaining = (expirationTime > 0 and (expirationTime - GetTime())) or 0"
 	end,
 	args = {
-		{ name = "hand", type = "select", required = true, display = "Weapon",
+		{ name = "weapon", type = "select", required = true, display = "Weapon",
 			valueList = { "main", "off", "ranged" },
 			valueLabels = { main = "Main Hand", off = "Off Hand", ranged = "Ranged" },
 			default = "main" },
@@ -1197,6 +2530,7 @@ PROTOTYPES["weaponenchant"] = {
 -- the list for it). standingID 1..8 = Hated..Exalted.
 PROTOTYPES["reputation"] = {
 	displayName = "Reputation",
+	wa2Event = "Faction Reputation",
 	category = "unit",
 	progressType = "static",
 	progressValue = "repValue",
@@ -1229,6 +2563,7 @@ PROTOTYPES["reputation"] = {
 -- level (UnitXPMax 0). restedXP is the bonus-rest pool (nil off rested).
 PROTOTYPES["experience"] = {
 	displayName = "Experience",
+	wa2Event = "Experience",
 	category = "unit",
 	progressType = "static",
 	progressValue = "xp",
@@ -1258,6 +2593,7 @@ PROTOTYPES["experience"] = {
 -- conditions/text, no required gate.
 PROTOTYPES["charstats"] = {
 	displayName = "Character Stats",
+	wa2Event = "Character Stats",
 	category = "unit",
 	progressType = "none",
 	events = function() return { "UNIT_STATS", "UNIT_ATTACK_POWER", "UNIT_AURA", "PLAYER_ENTERING_WORLD" } end,
@@ -1292,6 +2628,7 @@ PROTOTYPES["charstats"] = {
 -- off at expiry; UNIT_AURA catches a new/removed debuff immediately.
 PROTOTYPES["crowdcontrol"] = {
 	displayName = "Crowd Control",
+	wa2Event = "Crowd Controlled",
 	category = "unit",
 	progressType = "timed",
 	events = function() return { "UNIT_AURA", "PLAYER_AURAS_CHANGED", "WA_SLOW_TICK" } end,
@@ -1336,6 +2673,7 @@ PROTOTYPES["crowdcontrol"] = {
 -- multi-returns to one value here).
 PROTOTYPES["rangecheck"] = {
 	displayName = "Range Check",
+	wa2Event = "Range Check",
 	category = "unit",
 	progressType = "none",
 	events = function() return { "PLAYER_TARGET_CHANGED", "WA_FAST_TICK", "PLAYER_ENTERING_WORLD" } end,
@@ -1424,6 +2762,7 @@ PROTOTYPES["rangecheck"] = {
 -- as a percentage of the tank's / aggro threshold).
 PROTOTYPES["threat"] = {
 	displayName = "Threat (TWThreat)",
+	wa2Event = "Threat Situation",
 	category = "unit",
 	progressType = "static",
 	progressValue = "threatpct",
@@ -1463,17 +2802,19 @@ local TOTEM_SLOT_ICONS = {
 }
 PROTOTYPES["totem"] = {
 	displayName = "Totem",
+	wa2Event = "Totem",
 	category = "spell",
 	progressType = "timed",
 	events = function() return { "WA_TOTEM_UPDATE", "WA_SLOW_TICK", "PLAYER_ENTERING_WORLD" } end,
 	force_events = true,
 	loadFunc = function() WA.WatchTotems(); WA.EnsureSlowTick() end,
 	icon = "Interface\\Icons\\Spell_Nature_SearingTotem",
-	iconFunc = function(trigger) return TOTEM_SLOT_ICONS[trigger.totemSlot or 1] or "Interface\\Icons\\Spell_Nature_SearingTotem" end,
-	nameFunc = function(trigger) return (TOTEM_SLOT_LABELS[trigger.totemSlot or 1] or "Totem") .. " Totem" end,
+	migrate = function(trigger) renameArg(trigger, "totemSlot", "totemType") end,
+	iconFunc = function(trigger) return TOTEM_SLOT_ICONS[trigger.totemType or 1] or "Interface\\Icons\\Spell_Nature_SearingTotem" end,
+	nameFunc = function(trigger) return (TOTEM_SLOT_LABELS[trigger.totemType or 1] or "Totem") .. " Totem" end,
 	init = function(trigger)
-		return "local slot = " .. fmt(trigger.totemSlot or 1) .. "\n"
-			.. "local active, name, icon, startTime, duration = WeakestAuras.TotemInfo(slot)\n"
+		return "local totemType = " .. fmt(trigger.totemType or 1) .. "\n"
+			.. "local active, name, icon, startTime, duration = WeakestAuras.TotemInfo(totemType)\n"
 			.. "active = active and true or false\n"
 			.. "startTime = startTime or 0\n"
 			.. "duration = duration or 0\n"
@@ -1481,7 +2822,7 @@ PROTOTYPES["totem"] = {
 			.. "local remaining = (expirationTime > 0 and (expirationTime - GetTime())) or 0"
 	end,
 	args = {
-		{ name = "totemSlot", type = "select", required = true, display = "Element",
+		{ name = "totemType", type = "select", required = true, display = "Element",
 			valueList = { 1, 2, 3, 4 }, valueLabels = TOTEM_SLOT_LABELS, default = 1 },
 		{ name = "active", type = "hidden", required = true, test = "active",
 			store = true, conditionType = "bool", display = "Active" },
@@ -1504,6 +2845,7 @@ PROTOTYPES["totem"] = {
 -- rendering (see the watcher comment).
 PROTOTYPES["swing"] = {
 	displayName = "Swing Timer",
+	wa2Event = "Swing Timer",
 	category = "unit",
 	progressType = "timed",
 	events = function() return { "WA_SWING_UPDATE", "WA_SLOW_TICK", "PLAYER_ENTERING_WORLD" } end,
@@ -1511,12 +2853,13 @@ PROTOTYPES["swing"] = {
 	loadFunc = function() WA.WatchSwing(); WA.EnsureSlowTick() end,
 	icon = "Interface\\Icons\\Ability_Warrior_DecisiveStrike",
 	iconFunc = function() return "Interface\\Icons\\Ability_Warrior_DecisiveStrike" end,
+	migrate = function(trigger) renameArg(trigger, "swingHand", "hand") end,
 	nameFunc = function(trigger)
-		local h = trigger.swingHand or "main"
+		local h = trigger.hand or "main"
 		return ((h == "off" and "Off Hand") or (h == "ranged" and "Ranged") or "Main Hand") .. " Swing"
 	end,
 	init = function(trigger)
-		return "local hand = " .. fmt(trigger.swingHand or "main") .. "\n"
+		return "local hand = " .. fmt(trigger.hand or "main") .. "\n"
 			.. "local active, startTime, duration, blocked, clipWarning, clipDelay, queuedAbility = WeakestAuras.SwingInfo(hand)\n"
 			.. "active = active and true or false\n"
 			.. "startTime = startTime or 0\n"
@@ -1529,7 +2872,7 @@ PROTOTYPES["swing"] = {
 			.. "local remaining = (expirationTime > 0 and (expirationTime - GetTime())) or 0"
 	end,
 	args = {
-		{ name = "swingHand", type = "select", required = true, display = "Weapon",
+		{ name = "hand", type = "select", required = true, display = "Weapon",
 			valueList = { "main", "off", "ranged" },
 			valueLabels = { main = "Main Hand", off = "Off Hand", ranged = "Ranged" },
 			default = "main" },
@@ -1591,28 +2934,41 @@ PROTOTYPES["powertick"] = {
 -- spec: { pollRaw(key) -> start, duration, enabled; changedEvent, readyEvent;
 -- extraEvents = { ... } (pcall-registered on the watcher's own frame, e.g.
 -- SPELL_UPDATE_COOLDOWN) }. Returns { Watch(key, wantTick), Info(key) }.
+-- `cache` is what the API last said and `announced` is what subscribers were
+-- last told. They are separate on purpose: `cache` is refreshed on every read,
+-- so no trigger ever evaluates a stale window, and comparing a poll against
+-- `cache` would then let a read that happened to land between two polls swallow
+-- the change event every *other* aura on that key is owed.
 local function newCooldownWatcher(spec)
-	local w = { keys = {}, tick = {}, cache = {}, frame = nil, ticker = nil }
+	local w = { keys = {}, tick = {}, cache = {}, announced = {}, frame = nil, ticker = nil }
+
+	-- Emits nothing, so generated trigger code -- which already runs inside a
+	-- scan -- can call it without re-entering dispatch.
+	local function refresh(key)
+		local start, duration, enabled = spec.pollRaw(key)
+		w.cache[key] = { start = start or 0, duration = duration or 0, enabled = enabled }
+		return w.cache[key]
+	end
 
 	local function pollKey(key)
-		local start, duration, enabled = spec.pollRaw(key)
-		start = start or 0; duration = duration or 0
-		local c = w.cache[key]
-		local changed = not c or c.start ~= start or c.duration ~= duration
-		if changed then
-			w.cache[key] = { start = start, duration = duration, enabled = enabled }
-		end
-		local running = start > 0 and duration > 0 and (start + duration) > GetTime()
+		local c = refresh(key)
+		local a = w.announced[key]
+		local changed = not a or a.start ~= c.start or a.duration ~= c.duration
+		local running = c.start > 0 and c.duration > 0 and (c.start + c.duration) > GetTime()
 		-- Fire on a real change, and additionally every tick while a remaining-time
 		-- filter is interested (w.tick), so its threshold flips near real time
 		-- rather than only at start/end -- a running cooldown emits no natural event.
 		if changed or (w.tick[key] and running) then
+			w.announced[key] = { start = c.start, duration = c.duration }
 			WA.ScanEvents(spec.changedEvent, key)
 		end
-		-- Schedule the ready flip for real (non-GCD) cooldowns, so the display
-		-- clears exactly on time without relying on the slow ticker's cadence.
-		if changed and start > 0 and duration > 1.5 then
-			local remain = (start + duration) - GetTime()
+		-- Schedule the ready flip for real cooldowns, so the display clears
+		-- exactly on time without relying on the ticker's cadence. A window no
+		-- longer than the global cooldown is skipped: it is the GCD passing over
+		-- the spell, not its own cooldown, and arming a timer for every one of
+		-- those would mean a timer per watched key per cast.
+		if changed and running and not WA.IsGcdCooldown(c.duration) then
+			local remain = (c.start + c.duration) - GetTime()
 			if remain > 0 then
 				C_Timer.After(remain + 0.05, function()
 					pollKey(key)
@@ -1620,71 +2976,132 @@ local function newCooldownWatcher(spec)
 				end)
 			end
 		end
+		return running
 	end
 
-	local function pollAll()
-		for key in pairs(w.keys) do pollKey(key) end
+	local pollAll
+
+	-- The poll runs only while something is actually on cooldown. An idle key has
+	-- nothing a pass could discover that the client's own cooldown events do not
+	-- already deliver, so a watcher whose keys are all ready costs nothing --
+	-- which matters because keys are never released (see Watch below). Upstream
+	-- suspends its equivalent the same way: cdReadyFrame hides itself, stopping
+	-- its OnUpdate, whenever no work is marked pending.
+	--
+	-- The events on w.frame are what start it again, so this trades the old
+	-- always-on pass for a dependency on one of them arriving when a cooldown
+	-- begins. They are the canonical ones for each kind and the per-cooldown
+	-- expiry timer above still closes the window regardless.
+	local function syncTicker(running)
+		if running and not w.ticker then
+			w.ticker = C_Timer.NewTicker(0.3, function() pollAll() end)
+		elseif not running and w.ticker then
+			w.ticker:Cancel()
+			w.ticker = nil
+		end
+	end
+
+	pollAll = function()
+		local running = false
+		for key in pairs(w.keys) do
+			if pollKey(key) then running = true end
+		end
+		syncTicker(running)
 	end
 
 	local function ensure()
-		if not w.frame then
-			w.frame = CreateFrame("Frame")
-			w.frame:SetScript("OnEvent", pollAll)
-			-- Guarded: not every 1.12 build fires every one of these, and an unknown
-			-- event name would error the whole registration (risk (c), settle per
-			-- build with Debug.lua's /wa events pattern).
-			for i = 1, table.getn(spec.extraEvents or {}) do
-				pcall(w.frame.RegisterEvent, w.frame, spec.extraEvents[i])
-			end
-		end
-		if not w.ticker then
-			w.ticker = C_Timer.NewTicker(0.3, pollAll)
+		if w.frame then return end
+		w.frame = CreateFrame("Frame")
+		w.frame:SetScript("OnEvent", pollAll)
+		-- Guarded: not every 1.12 build fires every one of these, and an unknown
+		-- event name would error the whole registration (risk (c), settle per
+		-- build with Debug.lua's /wa events pattern).
+		for i = 1, table.getn(spec.extraEvents or {}) do
+			pcall(w.frame.RegisterEvent, w.frame, spec.extraEvents[i])
 		end
 	end
 
-	-- Registers a key in the central cooldown cache. wantTick asks the watcher
-	-- to re-emit changedEvent every ticker pass while this key is on cooldown
-	-- (for remaining-time filters). No unwatch path yet (a few idle keys in the
-	-- poll set is cheap); refcounted teardown belongs with LoadDisplays/
-	-- UnloadDisplays.
+	-- Registers a key in the central cooldown cache. wantTick asks the watcher to
+	-- re-emit changedEvent every ticker pass while this key is on cooldown (for
+	-- remaining-time filters).
+	--
+	-- Keys are never released, which is deliberate rather than unfinished:
+	-- upstream has no unwatch either (its `items[id] = true` is likewise set once
+	-- and never cleared, and the refcount on SpellDetails.watched exists to remap
+	-- a spell whose override changed, not to free anything on unload). The cost
+	-- of a key nothing displays any more is one API read per pass, and only while
+	-- some *other* key is running -- syncTicker above is what makes that true.
 	local function watch(key, wantTick)
 		w.keys[key] = true
 		if wantTick then w.tick[key] = true end
 		ensure()
-		pollKey(key)
+		if pollKey(key) then syncTicker(true) end
 	end
 
-	-- Generated cooldown-trigger code reads the cache through this.
+	-- Generated cooldown-trigger code reads the cache through this. Refreshing
+	-- first is what makes it answer for a key nothing has registered yet -- a
+	-- force_events pass runs before loadFunc -- and keeps a read that arrives
+	-- between two polls current.
 	local function info(key)
-		local c = w.cache[key]
-		if not c then return nil, nil, nil end
+		local c = refresh(key)
 		return c.start, c.duration, c.enabled
 	end
 
 	return { Watch = watch, Info = info }
 end
 
+-- C_Spell.GetSpellCooldown and vanilla's GetSpellCooldown(slot, BOOKTYPE_SPELL)
+-- are the same read: ClassicAPI's Script_C_Spell_GetSpellCooldown calls
+-- FUN_SPELL_QUERY_COOLDOWN(spellID, bookType=0), which is the helper the slot
+-- form reaches after resolving the slot to a spellID (ref ClassicAPI
+-- src/spell/Cooldown.cpp). The spellID form is the one to use: the slot form
+-- additionally requires the spell to sit in the player's book, so it cannot
+-- answer for a talent passive or a profession recipe.
+--
+-- What this read depends on is the *identity* handed to it -- a spellID with no
+-- Spell.dbc row answers nil, and a rank other than the one actually cast has no
+-- cooldown of its own. That resolution is WA.ResolveSpellID's job, not this one's.
+--
+-- The start goes through WA.UnwrapTick: this is one of the two ClassicAPI reads
+-- that hand back a signed-wrapped tick on a long-lived client.
 local spellCdWatch = newCooldownWatcher({
 	pollRaw = function(spellId)
 		local cdInfo = C_Spell and C_Spell.GetSpellCooldown and C_Spell.GetSpellCooldown(spellId)
-		return cdInfo and cdInfo.startTime, cdInfo and cdInfo.duration, cdInfo and cdInfo.isEnabled
+		if not cdInfo then return nil, nil, nil end
+		return WA.UnwrapTick(cdInfo.startTime), cdInfo.duration, cdInfo.isEnabled
 	end,
 	changedEvent = "SPELL_COOLDOWN_CHANGED",
 	readyEvent = "SPELL_COOLDOWN_READY",
-	extraEvents = { "SPELL_UPDATE_COOLDOWN", "ACTIONBAR_UPDATE_COOLDOWN" },
+	extraEvents = { "SPELL_UPDATE_COOLDOWN", "SPELL_UPDATE_USABLE", "ACTIONBAR_UPDATE_COOLDOWN" },
 })
 function WA.WatchSpellCooldown(spellId, wantTick) spellCdWatch.Watch(spellId, wantTick) end
 function WA.SpellCdInfo(spellId) return spellCdWatch.Info(spellId) end
+
+-- Whether the client has a cooldown record for this spell at all. An id with no
+-- Spell.dbc row -- a name that resolved to nothing, a rank that does not exist,
+-- a hand-typed number -- reads back as a zero-length cooldown, which is
+-- indistinguishable from "ready" unless it is asked about separately. A trigger
+-- pointed at a spell the client cannot identify should stay dark rather than
+-- claim the spell is permanently off cooldown.
+function WA.SpellCdKnown(spellId)
+	if not spellId or spellId == 0 then return false end
+	if not (C_Spell and C_Spell.GetSpellCooldown) then return false end
+	return C_Spell.GetSpellCooldown(spellId) ~= nil
+end
 
 -- GetItemCooldown returns (start, duration, enable) directly, not a table --
 -- read behind an if-guard (not an `and`-chain) so all three values actually
 -- propagate; `and`-chaining a multi-return call truncates it to one value on
 -- this client's Lua 5.0.
+--
+-- The start goes through WA.UnwrapTick: this is the other ClassicAPI read that
+-- hands back a signed-wrapped tick on a long-lived client. The equipment-slot
+-- watcher below needs no such repair -- GetInventoryItemCooldown is vanilla's own.
 local itemCdWatch = newCooldownWatcher({
 	pollRaw = function(itemId)
 		if not GetItemCooldown then return 0, 0, false end
 		local start, duration, enable = GetItemCooldown(itemId)
-		return start, duration, enable == 1
+		return WA.UnwrapTick(start), duration, enable == 1
 	end,
 	changedEvent = "ITEM_COOLDOWN_CHANGED",
 	readyEvent = "ITEM_COOLDOWN_READY",
@@ -1778,6 +3195,140 @@ local function subscribeSpellGoSelf(fn)
 		if not spellId then return end
 		for i = 1, table.getn(spellGoSelfSubs) do spellGoSelfSubs[i](spellId) end
 	end)
+end
+
+-- ---------------------------------------------------------------------------
+-- Global cooldown (§4.4). Upstream's CheckGCD reads a start and duration
+-- straight off a dedicated GCD spell -- GetSpellCooldown(29515) on Classic,
+-- 61304 elsewhere. Neither ID exists here: they have no 1.12 Spell.dbc row, and
+-- this client's GetSpellCooldown takes a spellbook *slot* plus bookType rather
+-- than a spellID, so handing it one raises "invalid spell slot" instead of
+-- looking anything up.
+--
+-- What is readable is the same call used the way vanilla means it:
+-- GetSpellCooldown(slot, BOOKTYPE_SPELL) answers a true start and duration in
+-- GetTime()'s epoch, and a slot whose spell has no cooldown of its own shows
+-- the global cooldown and nothing else. So the GCD is read off exactly one such
+-- slot, learned from what the player actually casts -- after a SPELL_GO_SELF
+-- the caster's own slot either reports a GCD-length window (a usable probe,
+-- remembered) or a longer one (the spell's own cooldown, keep looking).
+--
+-- Before a probe is learned the window is latched at the cast instead. Latching
+-- rather than re-deriving is the point: a source that only reports a *remaining*
+-- time re-reads as a fresh full-length window on every poll, which is a bar that
+-- restarts from full several times a second.
+-- ---------------------------------------------------------------------------
+
+-- Longest window still attributable to the global cooldown. The GCD is 1.5s and
+-- server latency lands the reported window slightly over it.
+local GCD_MAX = 1.6
+local GCD_DEFAULT = 1.5
+
+local gcd = { start = 0, duration = 0, measured = nil, probeSlot = nil, generation = 0 }
+
+local function gcdEnd()
+	if gcd.duration == 0 then return end
+	gcd.generation = gcd.generation + 1
+	gcd.start, gcd.duration = 0, 0
+	WA.ScanEvents("GCD_END")
+end
+
+-- Closes the window on its own schedule, so the display clears on time whether
+-- or not another cooldown event happens to arrive. The generation stamp makes a
+-- timer from a superseded window a no-op instead of ending the current one.
+local function gcdSchedule()
+	local remain = (gcd.start + gcd.duration) - GetTime()
+	if remain <= 0 then return end
+	local generation = gcd.generation
+	C_Timer.After(remain + 0.05, function()
+		if gcd.generation == generation then gcdEnd() end
+	end)
+end
+
+local function gcdBegin(start, duration)
+	-- Same window seen again: keep the latched start and length. Re-deriving them
+	-- from a later read is what restarts a running bar.
+	if gcd.duration > 0 and math.abs((gcd.start + gcd.duration) - (start + duration)) < 0.1 then return end
+	gcd.generation = gcd.generation + 1
+	gcd.start, gcd.duration = start, duration
+	gcdSchedule()
+	WA.ScanEvents("GCD_UPDATE")
+end
+
+local function gcdPoll()
+	local start, duration = WA.SpellSlotCooldown(gcd.probeSlot)
+	if start and duration and duration > 0 and duration <= GCD_MAX then
+		gcd.measured = duration
+		gcdBegin(start, duration)
+	elseif gcd.duration > 0 and (gcd.start + gcd.duration) <= GetTime() then
+		gcdEnd()
+	end
+end
+
+local function gcdOnCast(spellId)
+	-- Open the window on the cast itself, so the trigger is live before any probe
+	-- slot has been learned and stays live for a caster whose own cooldown is
+	-- longer than the GCD (its slot can never serve as a probe).
+	gcdBegin(GetTime(), gcd.measured or GCD_DEFAULT)
+
+	local slot = WA.SpellSlotByID(spellId)
+	if not slot then return end
+	-- Read a frame later: the cooldown the server applied for this cast has not
+	-- landed on the slot at the instant SPELL_GO_SELF arrives.
+	C_Timer.After(0.05, function()
+		local start, duration = WA.SpellSlotCooldown(slot)
+		if start and duration and duration > 0 and duration <= GCD_MAX then
+			gcd.probeSlot = slot
+			gcd.measured = duration
+			gcdBegin(start, duration)
+		end
+	end)
+end
+
+local gcdFrame
+function WA.WatchGCD()
+	if gcdFrame then return end
+	gcdFrame = CreateFrame("Frame")
+	-- Guarded like every other event registration here (risk (c)).
+	local events = { "ACTIONBAR_UPDATE_COOLDOWN", "SPELL_UPDATE_COOLDOWN", "SPELLS_CHANGED", "LEARNED_SPELL_IN_TAB" }
+	for i = 1, table.getn(events) do pcall(gcdFrame.RegisterEvent, gcdFrame, events[i]) end
+	gcdFrame:SetScript("OnEvent", function()
+		if event == "SPELLS_CHANGED" or event == "LEARNED_SPELL_IN_TAB" then
+			-- Slot numbers shift as the book grows, so the shared index and the
+			-- probe drawn from it both stop meaning anything.
+			WA.InvalidateSpellSlots()
+			gcd.probeSlot = nil
+			return
+		end
+		gcdPoll()
+	end)
+	subscribeSpellGoSelf(gcdOnCast)
+end
+
+-- (start, duration, enabled) of the open window, or (0, 0, true) when none is.
+-- Reports an elapsed window as closed but does not close it: generated trigger
+-- code calls this from inside a scan, and ending the window there would re-enter
+-- dispatch. gcdSchedule's timer is what actually ends it and emits.
+function WA.GcdInfo()
+	if gcd.duration > 0 and (gcd.start + gcd.duration) <= GetTime() then return 0, 0, true end
+	return gcd.start, gcd.duration, true
+end
+
+-- True when a cooldown window is the global cooldown passing over a spell or
+-- item rather than its own. Nothing distinguishes the two here but length, so
+-- this is the measured GCD compared against -- GCD_DEFAULT only until a cast has
+-- been measured, which is why it is not the literal 1.5 it replaced.
+function WA.IsGcdCooldown(duration)
+	if not duration or duration <= 0 then return false end
+	return duration <= (gcd.measured or GCD_DEFAULT) + 0.1
+end
+
+-- The watcher's internals, for Debug.lua's /wa gcd. Which slot it settled on and
+-- what length it measured there are the two things the display cannot show and
+-- the two the runtime is wrong about when the GCD misbehaves.
+function WA.GcdDebug()
+	return { probeSlot = gcd.probeSlot, measured = gcd.measured, start = gcd.start,
+		duration = gcd.duration, watching = gcdFrame ~= nil }
 end
 
 -- Re-emits the shared dispatch as an internal event carrying the spell id, so a
@@ -2252,27 +3803,117 @@ local function ensureEventRegistered(event)
 	pcall(eventFrame.RegisterEvent, eventFrame, event)
 end
 
+-- The per-frame pulse behind `check = "update"`. Its own frame because an
+-- OnUpdate on the shared event frame would run for every display in the addon,
+-- and because hiding a frame is how an OnUpdate is switched off -- there is no
+-- way to unregister one.
+local frameUpdateFrame
+
+-- Runs the OnUpdate iff some loaded trigger listens for it. 1.12 hands the
+-- handler its elapsed time as the global arg1.
+local function syncFrameUpdate()
+	local map = loaded_events["FRAME_UPDATE"]
+	local any = false
+	if map then
+		for _ in pairs(map) do any = true; break end
+	end
+	if not any then
+		if frameUpdateFrame then frameUpdateFrame:Hide() end
+		return
+	end
+	if not frameUpdateFrame then
+		frameUpdateFrame = CreateFrame("Frame")
+		frameUpdateFrame:SetScript("OnUpdate", function()
+			WA.ScanEvents("FRAME_UPDATE", arg1)
+		end)
+	end
+	frameUpdateFrame:Show()
+end
+
+-- Whether this trigger accepts one payload of a unit-filtered event. The filter
+-- is the local stand-in for upstream's RegisterUnitEvent: the general event is
+-- registered, so an unwanted unit has to be dropped here instead of never
+-- arriving. Events the trigger declared no filter for always pass.
+local function passesUnitFilter(ti, event, unit)
+	local filters = ti.unitFilters
+	local set = filters and filters[event]
+	if not set then return true end
+	if unit == nil then return false end
+	return set[string.lower(tostring(unit))] and true or false
+end
+
+-- A trigger asking for FRAME_UPDATE at every frame is affordable only because it
+-- can ask for less. Upstream's onUpdateThrottle, in seconds; 0 means every frame.
+local function checkOnUpdateThrottle(ti)
+	local throttle = ti.onUpdateThrottle
+	if not throttle or throttle <= 0 then return true end
+	local now = GetTime()
+	if not ti.lastOnUpdate or (now - ti.lastOnUpdate) >= throttle then
+		ti.lastOnUpdate = now
+		return true
+	end
+	return false
+end
+
+-- watchedTriggers[id][watchedNum][observerNum]: observerNum's "TRIGGER:watchedNum"
+-- subscription. Pending/timers hold one coalesced delivery per display.
+local watchedTriggers = {}
+local watchedPending = {}
+local watchedTimers = {}
+
+-- Records one trigger's TRIGGER:n subscriptions, refusing a reciprocal pair.
+-- Two triggers watching each other would hand the delivery back and forth
+-- forever; upstream drops the second half of the pair, and which half that is
+-- falls out of compile order.
+local function registerWatchedTriggers(id, observerNum, requested)
+	local byWatched = watchedTriggers[id]
+	for num in pairs(requested) do
+		if num ~= observerNum
+			and not (byWatched and byWatched[observerNum] and byWatched[observerNum][num]) then
+			byWatched = byWatched or {}
+			watchedTriggers[id] = byWatched
+			byWatched[num] = byWatched[num] or {}
+			byWatched[num][observerNum] = true
+		end
+	end
+end
+
+local function cancelWatchedDelivery(id)
+	if watchedTimers[id] then
+		watchedTimers[id]:Cancel()
+		watchedTimers[id] = nil
+	end
+	watchedPending[id] = nil
+end
+
 -- A fire-and-forget trigger takes itself down on a timer instead of on a later
 -- event. C_Timer.NewTimer, not After: After returns nothing on this client, and
 -- a re-fire before the deadline must retract the pending hide or the second show
 -- gets cut short by the first one's timer.
-local function scheduleAutoHide(ti)
-	if ti.hideTimer then ti.hideTimer:Cancel() end
-	ti.hideTimer = C_Timer.NewTimer(ti.duration, function()
-		ti.hideTimer = nil
+local function scheduleAutoHide(ti, cloneId)
+	cloneId = cloneId or ""
+	ti.hideTimers = ti.hideTimers or {}
+	local old = ti.hideTimers[cloneId]
+	if old then old:Cancel() end
+	local timer
+	local function hideState()
+		if not ti.hideTimers or ti.hideTimers[cloneId] ~= timer then return end
+		ti.hideTimers[cloneId] = nil
 		local states = WA.GetTriggerStateForTrigger(ti.id, ti.triggernum)
-		local s = states and states[""]
+		local s = states and states[cloneId]
 		if s and s.show then
 			s.show = false; s.changed = true
 			WA.UpdatedTriggerState(ti.id)
 		end
-	end)
+	end
+	timer = C_Timer.NewTimer(ti.duration, hideState)
+	ti.hideTimers[cloneId] = timer
 end
 
 -- ActivateEvent-lite (§4.3): after a passing test, normalize the state's
 -- progress/name/icon. Stores already wrote the raw matched fields; this fills
 -- the display-shaped fields regions read.
-local function activateEvent(state, ti)
+local function activateEvent(state, ti, cloneId)
 	local proto = ti.proto
 	if not state.show then state.show = true; state.changed = true end
 
@@ -2286,7 +3927,27 @@ local function activateEvent(state, ti)
 		setC("progressType", "timed")
 		setC("duration", ti.duration)
 		setC("expirationTime", GetTime() + ti.duration)
-		scheduleAutoHide(ti)
+		scheduleAutoHide(ti, cloneId)
+	elseif ti.customDurationFunc then
+		local ok, values = WA.RunAuraFuncPacked(ti.id, ti.id .. ": duration function",
+			ti.customDurationFunc, ti.trigger)
+		local first = ok and tonumber(values[1]) or 0
+		local second = ok and tonumber(values[2]) or 0
+		setC("inverse", ok and values[4] or nil)
+		if ok and values[3] then
+			setC("progressType", "static")
+			setC("value", first)
+			setC("total", second)
+			setC("duration", nil)
+			setC("expirationTime", nil)
+		else
+			if second <= first then second = first end
+			setC("progressType", "timed")
+			setC("duration", first)
+			setC("expirationTime", second)
+			setC("value", nil)
+			setC("total", nil)
+		end
 	else
 		-- ti.* overrides let a per-trigger prototype (the custom trigger) pick its
 		-- progress shape at Add time; built-in prototypes leave them nil and fall back
@@ -2312,29 +3973,238 @@ local function activateEvent(state, ti)
 	-- instead of frozen at the target present when the aura was compiled.
 	if ti.name ~= nil and state.name == nil then setC("name", ti.name) end
 	if ti.icon ~= nil and state.icon == nil then setC("icon", ti.icon) end
+	if ti.customNameFunc then
+		local ok, value = WA.RunAuraFunc(ti.id, ti.id .. ": name function",
+			ti.customNameFunc, ti.trigger)
+		if ok then setC("name", value) end
+	end
+	if ti.customIconFunc then
+		local ok, value = WA.RunAuraFunc(ti.id, ti.id .. ": icon function",
+			ti.customIconFunc, ti.trigger)
+		if ok then setC("icon", value) end
+	end
 end
 
--- Runs one trigger's compiled function for an event and reconciles its "" state.
--- Returns true if the state changed (so the caller batches UpdatedTriggerState).
-local function runTriggerFunc(ti, event, a1, a2, a3, a4, a5, a6, a7, a8, a9)
+-- One member of a multi-unit family: created, refreshed, or dropped in place.
+local function runMultiUnitMember(ti, states, event, unit, cloneId)
+	local state = states[cloneId]
+	local existed = state ~= nil
+	if not state then state = {} end
+	local ok, passed = WA.RunAuraFunc(ti.id, ti.id, ti.triggerFunc, state, event, unit)
+	if ok and passed then
+		if not existed then
+			states[cloneId] = state
+			state.changed = true
+		end
+		activateEvent(state, ti, cloneId)
+		return state.changed and true or false
+	elseif existed then
+		states[cloneId] = nil
+		return true
+	end
+	return false
+end
+
+-- Every current member re-read, and every state whose member is gone dropped.
+local function runMultiUnitFullPass(ti, states, event)
+	local seen = {}
+	local dirty = false
+	WA.ForEachMultiUnit(ti.multiUnit, function(unit, cloneId)
+		seen[cloneId] = true
+		if runMultiUnitMember(ti, states, event, unit, cloneId) then dirty = true end
+	end)
+	local stale = {}
+	for cloneId in pairs(states) do
+		if cloneId ~= "" and not seen[cloneId] then table.insert(stale, cloneId) end
+	end
+	for i = 1, table.getn(stale) do
+		states[stale[i]] = nil
+		dirty = true
+	end
+	return dirty
+end
+
+-- Which event means a member left for good. A leaving plate's token still
+-- resolves to its unit for the duration of the handler (ClassicAPI computes the
+-- token before the slot vacates), so rescanning the family here would re-create
+-- the clone that just went away -- its state has to be dropped by GUID instead.
+local MULTI_UNIT_REMOVE_EVENT = { nameplate = "NAME_PLATE_UNIT_REMOVED" }
+
+-- Routes one event to the family: a removal drops one state, a unit event
+-- re-reads only the member it names, and anything else (roster churn, forced
+-- initialization) re-reads the whole family and sweeps what is no longer in it.
+local function runMultiUnitTrigger(ti, event, unit)
 	local states = WA.GetTriggerStateForTrigger(ti.id, ti.triggernum)
 	if not states then return false end
-	local state = states[""]
-	if not state then state = {}; states[""] = state end
+	local family = ti.multiUnit
+
+	if event == MULTI_UNIT_REMOVE_EVENT[family] then
+		local cloneId = type(unit) == "string" and WA.UnitCloneId(unit) or nil
+		if cloneId and states[cloneId] ~= nil then
+			states[cloneId] = nil
+			return true
+		end
+		return false
+	end
+
+	if type(unit) == "string" and UnitExists(unit) then
+		local cloneId = WA.UnitCloneId(unit)
+		local state = cloneId and states[cloneId]
+		-- One unit is reachable through several tokens at once (the player in a
+		-- raid is also raid7, and maybe target), and ClassicAPI fires the unit
+		-- event once per token. The state keeps the token its own family
+		-- iterates rather than adopting whichever token woke it.
+		if state then return runMultiUnitMember(ti, states, event, state.unit or unit, cloneId) end
+		if WA.MultiUnitHasToken(family, unit) then
+			return runMultiUnitMember(ti, states, event, unit, cloneId)
+		end
+		return false
+	end
+
+	return runMultiUnitFullPass(ti, states, event)
+end
+
+-- Runs a Trigger State Updater over its whole allstates table (upstream's `full`
+-- statesParameter, §4.3): the custom function owns every clone key and reports
+-- either by returning truthy or through the helper methods. Nothing here shapes
+-- the states afterwards -- a TSU state supplies its own progress, name and icon,
+-- which is the difference between this and activateEvent's normalization.
+local function runTsuTrigger(ti, event, a1, a2, a3, a4, a5, a6, a7, a8, a9)
+	local states = WA.GetTriggerStateForTrigger(ti.id, ti.triggernum)
+	if not states then return false end
+	-- Per run, not once at compile: WA.Add builds a fresh allstates table on every
+	-- recompile, so the helpers have to be re-attached to whatever table is live.
+	WA.EnsureAllStates(states, ti.showNilIsFalse)
+	states:SetChanged(false)
+	local ok, returned = WA.RunAuraFunc(ti.id, ti.id, ti.triggerFunc, states, event,
+		a1, a2, a3, a4, a5, a6, a7, a8, a9)
+	local dirty = (ok and (returned or (returned ~= false and states:IsChanged()))) and true or false
+	states:SetChanged(false)
+
+	-- Every consumer downstream indexes a clone key expecting a state table. One
+	-- non-table poisons the whole trigger rather than one clone, so upstream drops
+	-- the table entirely instead of guessing which key the author meant.
+	local bad
+	for key, state in pairs(states) do
+		if type(state) ~= "table" then bad = key; break end
+	end
+	if bad then
+		DEFAULT_CHAT_FRAME:AddMessage("|cffff0000WeakestAuras|r [" .. ti.id
+			.. "] all states table contains a non-table at key: " .. tostring(bad), 1, 0.3, 0.3)
+		local keys = {}
+		for key in pairs(states) do table.insert(keys, key) end
+		for i = 1, table.getn(keys) do states[keys[i]] = nil end
+		WA.StopStateTimers(ti.id, ti.triggernum)
+		return true
+	end
+
+	if ti.showNilIsFalse then
+		for _, state in pairs(states) do
+			if state.show == nil then state.show = false end
+		end
+	end
+
+	WA.StartStopStateTimers(ti.id, ti.triggernum, states)
+	return dirty
+end
+
+-- Runs one trigger's compiled function for an event and reconciles its base
+-- state or one new event clone.
+-- Returns true if the state changed (so the caller batches UpdatedTriggerState).
+local function runTriggerFunc(ti, event, a1, a2, a3, a4, a5, a6, a7, a8, a9)
+	if ti.tsu then return runTsuTrigger(ti, event, a1, a2, a3, a4, a5, a6, a7, a8, a9) end
+	if ti.multiUnit then return runMultiUnitTrigger(ti, event, a1) end
+	local states = WA.GetTriggerStateForTrigger(ti.id, ti.triggernum)
+	if not states then return false end
+	local cloneId = ""
+	local state
+	if ti.useCloneId then
+		state = {}
+	else
+		state = states[""]
+		if not state then state = {}; states[""] = state end
+	end
 
 	-- state.changed is false on entry (UpdatedTriggerState clears it after every
 	-- batch, step 7), so the flag the compiled stores / activateEvent set is a
 	-- true "changed since last apply" signal.
-	local ok, passed = WA.RunAuraFunc(ti.id, ti.id, ti.triggerFunc, state, event,
-		a1, a2, a3, a4, a5, a6, a7, a8, a9)
+	local ok, passed
+	if ti.custom and not ti.legacyStateArgs then
+		ok, passed = WA.RunAuraFunc(ti.id, ti.id, ti.triggerFunc, event,
+			a1, a2, a3, a4, a5, a6, a7, a8, a9)
+	else
+		ok, passed = WA.RunAuraFunc(ti.id, ti.id, ti.triggerFunc, state, event,
+			a1, a2, a3, a4, a5, a6, a7, a8, a9)
+	end
 	if ok and passed then
-		activateEvent(state, ti)
-	elseif state.show and not ti.autoHide then
-		-- An autoHide trigger owns its own hiding: a later event whose test fails
-		-- must not pull it down before its timer says so.
+		if ti.useCloneId then
+			cloneId = WA.GetUniqueCloneId(states)
+			if cloneId == nil then return false end
+			states[cloneId] = state
+		end
+		activateEvent(state, ti, cloneId)
+	elseif ok and ti.untriggerFunc then
+		local untriggerOk, shouldHide
+		if ti.legacyStateArgs then
+			untriggerOk, shouldHide = WA.RunAuraFunc(ti.id, ti.id .. ": untrigger",
+				ti.untriggerFunc, state, event, a1, a2, a3, a4, a5, a6, a7, a8, a9)
+		else
+			untriggerOk, shouldHide = WA.RunAuraFunc(ti.id, ti.id .. ": untrigger",
+				ti.untriggerFunc, event, a1, a2, a3, a4, a5, a6, a7, a8, a9)
+		end
+		if untriggerOk and shouldHide and state.show then
+			state.show = false; state.changed = true
+		end
+	elseif state.show and not ti.autoHide and not ti.eventMode then
+		-- Event states end through their declared hide path. A status state follows
+		-- its test result directly.
 		state.show = false; state.changed = true
 	end
 	return state.changed and true or false
+end
+
+-- Delivers the coalesced TRIGGER:n updates one display accumulated, as
+-- ("TRIGGER", watchedTriggernum, thatTrigger'sStates).
+local function flushWatchedTriggers(id)
+	watchedTimers[id] = nil
+	local pending = watchedPending[id]
+	watchedPending[id] = nil
+	local byWatched = watchedTriggers[id]
+	local byTrigger = events[id]
+	if not pending or not byWatched or not byTrigger or WA.forced[id] then return end
+	local dirty = false
+	for watchedNum in pairs(pending) do
+		local observers = byWatched[watchedNum]
+		local updated = WA.GetTriggerStateForTrigger(id, watchedNum)
+		if observers and updated then
+			for observerNum in pairs(observers) do
+				local ti = byTrigger[observerNum]
+				if ti and runTriggerFunc(ti, "TRIGGER", watchedNum, updated) then
+					dirty = true
+					-- An observer that changed is itself worth watching, so a chain
+					-- of TRIGGER:n subscriptions carries one hop per delivery. The
+					-- timer for the next hop is scheduled fresh, this one having
+					-- already released its slot above.
+					WA.NotifyWatchedTriggers(id, observerNum)
+				end
+			end
+		end
+	end
+	if dirty then WA.UpdatedTriggerState(id) end
+end
+
+-- One of a display's triggers produced new states; anything watching it hears so
+-- on a zero-delay timer rather than inline. The delay is the recursion guard that
+-- matters: a watcher runs after the state pass that woke it has finished, so it
+-- cannot re-enter it, and several updates in one pass collapse into one delivery.
+-- Called by the state-owned hide timers as well as by dispatch.
+function WA.NotifyWatchedTriggers(id, triggernum)
+	local byWatched = watchedTriggers[id]
+	if not byWatched or not byWatched[triggernum] then return end
+	watchedPending[id] = watchedPending[id] or {}
+	watchedPending[id][triggernum] = true
+	if watchedTimers[id] then return end
+	watchedTimers[id] = C_Timer.NewTimer(0, function() flushWatchedTriggers(id) end)
 end
 
 -- The producer entry point watchers and the event frame both call (§4.3):
@@ -2346,9 +4216,11 @@ function WA.ScanEvents(event, a1, a2, a3, a4, a5, a6, a7, a8, a9)
 	local dirty = {}
 	for id, byTrigger in pairs(byId) do
 		for triggernum, ti in pairs(byTrigger) do
-			if not WA.forced[id] then
+			if not WA.forced[id] and passesUnitFilter(ti, event, a1)
+				and (event ~= "FRAME_UPDATE" or checkOnUpdateThrottle(ti)) then
 				if runTriggerFunc(ti, event, a1, a2, a3, a4, a5, a6, a7, a8, a9) then
 					dirty[id] = true
+					WA.NotifyWatchedTriggers(id, triggernum)
 				end
 			end
 		end
@@ -2360,8 +4232,14 @@ end
 -- which exist only for the duration of the handler -- so they are read here and
 -- passed explicitly rather than left for ScanEvents to pick up.
 eventFrame:SetScript("OnEvent", function()
+	if event == "PLAYER_ENTERING_WORLD" then
+		C_Timer.After(1, function() WA.ScanEvents("WA_DELAYED_PLAYER_ENTERING_WORLD") end)
+	end
 	WA.ScanEvents(event, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9)
 end)
+-- PLAYER_ENTERING_WORLD is the source for the delayed status refresh, so it
+-- must be observed even when no active prototype lists the native event.
+ensureEventRegistered("PLAYER_ENTERING_WORLD")
 
 -- ---------------------------------------------------------------------------
 -- Trigger-system contract (StateMachine.lua calls these)
@@ -2372,10 +4250,19 @@ end)
 local function unregisterEvents(id)
 	local byTrigger = events[id]
 	if not byTrigger then return end
+	-- Pending state-owned hides and watched-trigger deliveries, on the same
+	-- grounds as the per-trigger hide timers below.
+	cancelWatchedDelivery(id)
+	WA.StopStateTimers(id)
 	for triggernum, ti in pairs(byTrigger) do
 		-- A pending hide outlives the events that scheduled it, and would fire
 		-- against a display that has since unloaded or been recompiled.
-		if ti.hideTimer then ti.hideTimer:Cancel(); ti.hideTimer = nil end
+		if ti.hideTimers then
+			for _, timer in pairs(ti.hideTimers) do
+				if timer then timer:Cancel() end
+			end
+			ti.hideTimers = nil
+		end
 		local evs = ti.eventList or {}
 		for i = 1, table.getn(evs) do
 			local map = loaded_events[evs[i]]
@@ -2390,6 +4277,7 @@ local function unregisterEvents(id)
 			if not any then map[id] = nil end
 		end
 	end
+	syncFrameUpdate()
 end
 
 -- Compile only: build each triggernum into a ti stored in events[id]. Neither
@@ -2400,40 +4288,106 @@ function GenericTrigger.Add(data)
 	-- unchanged can be told from one that was edited: the second is a seam for
 	-- dropping whatever the old code cached in aura_env, and WA.Add is not --
 	-- it fires per drag step.
-	local prev = events[data.id]
+	local prev = events[data.id] or lastCompiled[data.id]
 	GenericTrigger.Delete(data.id)
 	local byTrigger = {}
 	events[data.id] = byTrigger
+	unresolvedIds[data.id] = nil
+	compilingId = data.id
 
 	for triggernum = 1, table.getn(data.triggers) do
 		local trigger = WA.GetTrigger(data, triggernum)
 		local proto = trigger and PROTOTYPES[trigger.type]
 		if proto then
-			local fn, source
+			local fn, source, sourceKey, untriggerFunc, customDurationFunc, customNameFunc, customIconFunc
+			local tsuVariablesFunc, customEvents, customUnitFilters, customWatched
 			local errTag = data.id .. ": trigger " .. triggernum
+			local isTsu = proto.custom and trigger.custom_type == "stateupdate"
 			if proto.custom then
 				fn, source = constructCustomFunction(trigger, errTag)
+				local entry = data.triggers[triggernum]
+				local untriggerSource = entry.untrigger and entry.untrigger.custom or ""
+				if isTsu then
+					-- TSU state carries its own progress, name, icon and hiding, so the
+					-- auxiliary functions are not compiled at all rather than compiled
+					-- and left unread -- two sources for one value is what the editor
+					-- hides in this mode.
+					untriggerSource = ""
+					tsuVariablesFunc = compileTsuVariables(trigger.customVariables,
+						data.id .. ": custom variables " .. triggernum)
+				else
+					if trigger.custom_type == "status"
+						or (trigger.custom_type == "event" and trigger.custom_hide == "custom") then
+						untriggerFunc = compileCustomField(untriggerSource,
+							data.id .. ": untrigger " .. triggernum) or trueFunction
+					end
+					if trigger.custom_type ~= "event" or trigger.custom_hide == "custom" then
+						customDurationFunc = compileCustomField(trigger.customDuration,
+							data.id .. ": duration function " .. triggernum)
+					end
+					customNameFunc = compileCustomField(trigger.customName,
+						data.id .. ": name function " .. triggernum)
+					customIconFunc = compileCustomField(trigger.customIcon,
+						data.id .. ": icon function " .. triggernum)
+				end
+				if (trigger.custom_type == "status" or isTsu) and trigger.check == "update" then
+					customEvents = { "FRAME_UPDATE" }
+				else
+					customEvents, customUnitFilters, customWatched = parseCustomEventList(trigger.events)
+				end
+				if customWatched then
+					registerWatchedTriggers(data.id, triggernum, customWatched)
+				end
+				sourceKey = table.concat({ source or "", untriggerSource,
+					trigger.customDuration or "", trigger.customName or "", trigger.customIcon or "",
+					trigger.customVariables or "" }, "\n")
 			else
 				fn, source = constructFunction(proto, trigger, errTag)
 			end
+			sourceKey = sourceKey or source
 			local prevTi = prev and prev[triggernum]
-			if not prevTi or prevTi.source ~= source then WA.ClearAuraEnv(data.id) end
+			if not prevTi or (prevTi.sourceKey or prevTi.source) ~= sourceKey then
+				WA.ClearAuraEnv(data.id)
+			end
 			if fn then
 				local ti = {
 					id = data.id, triggernum = triggernum, proto = proto,
-					trigger = trigger, triggerFunc = fn, source = source,
-					eventList = proto.events(trigger),
+					trigger = trigger, triggerFunc = fn, source = source, sourceKey = sourceKey,
+					eventMode = (proto.eventMode or (proto.custom and trigger.custom_type == "event")) and true or false,
+					useCloneId = (trigger.type == "chatmessage" and trigger.use_cloneId) and true or false,
+					multiUnit = proto.statesParameter == "unit" and multiUnitFamily(trigger) or nil,
+					eventList = customEvents or proto.events(trigger),
 					name = proto.nameFunc and proto.nameFunc(trigger) or nil,
 					icon = proto.iconFunc and proto.iconFunc(trigger) or proto.icon,
+					forceEvents = proto.force_events and not (proto.custom and trigger.custom_type == "event"),
 				}
-				-- Custom triggers pick their progress shape from config; the user
-				-- writes state.value/state.total (static) or state.duration/
-				-- expirationTime (timed) directly, so the progress keys point at
-				-- those generic names rather than a prototype-declared store arg.
 				if proto.custom then
-					ti.progressType = trigger.customProgressType or "none"
-					ti.progressValue = "value"
-					ti.progressTotal = "total"
+					ti.custom = true
+					ti.unitFilters = customUnitFilters
+					ti.onUpdateThrottle = tonumber(trigger.onUpdateThrottle) or 0
+					ti.legacyStateArgs = trigger.weakestAurasLegacyStateArgs and true or false
+					if isTsu then
+						ti.tsu = true
+						ti.tsuVariablesFunc = tsuVariablesFunc
+						-- Upstream's saved flag for the contract where a state the code
+						-- built without setting `show` is hidden rather than left
+						-- undecided. An import predating the flag does not carry it and
+						-- keeps the older reading; the editor stamps it on an aura that
+						-- picks this mode with no `information` of its own.
+						ti.showNilIsFalse = (data.information and data.information.showNilIsFalse) and true or false
+					else
+						ti.untriggerFunc = untriggerFunc
+						ti.customDurationFunc = customDurationFunc
+						ti.customNameFunc = customNameFunc
+						ti.customIconFunc = customIconFunc
+						ti.progressType = trigger.customProgressType or "none"
+						ti.progressValue = "value"
+						ti.progressTotal = "total"
+						if trigger.custom_type == "event" and trigger.custom_hide == "timed" then
+							ti.autoHide = true
+							ti.duration = tonumber(trigger.duration) or 1
+						end
+					end
 				end
 				if proto.autoHide then
 					ti.autoHide = true
@@ -2443,6 +4397,7 @@ function GenericTrigger.Add(data)
 			end
 		end
 	end
+	compilingId = nil
 end
 
 -- Load: register this display's tis into loaded_events (+ RegisterEvent their
@@ -2468,16 +4423,20 @@ function GenericTrigger.LoadDisplays(ids)
 				-- effect, so it belongs to load, not compile -- an unloaded
 				-- cooldown aura shouldn't spin up its watcher.
 				if ti.proto.loadFunc then ti.proto.loadFunc(ti.trigger) end
-				if ti.proto.force_events then table.insert(toForce, ti) end
+				if ti.forceEvents then table.insert(toForce, ti) end
 			end
 			if table.getn(toForce) > 0 then
 				for i = 1, table.getn(toForce) do
-					runTriggerFunc(toForce[i], "FORCE")
+					local ti = toForce[i]
+					if runTriggerFunc(ti, ti.tsu and "STATUS" or "FORCE") then
+						WA.NotifyWatchedTriggers(id, ti.triggernum)
+					end
 				end
 				WA.UpdatedTriggerState(id)
 			end
 		end
 	end
+	syncFrameUpdate()
 end
 
 -- Re-seed an already-loaded display's status triggers (WA2's
@@ -2492,8 +4451,11 @@ function GenericTrigger.ForceUpdate(ids)
 		if byTrigger and activeIds[id] then
 			local dirty = false
 			for triggernum, ti in pairs(byTrigger) do
-				if ti.proto.force_events then
-					if runTriggerFunc(ti, "FORCE") then dirty = true end
+				if ti.forceEvents then
+					if runTriggerFunc(ti, ti.tsu and "STATUS" or "FORCE") then
+						dirty = true
+						WA.NotifyWatchedTriggers(id, triggernum)
+					end
 				end
 			end
 			if dirty then WA.UpdatedTriggerState(id) end
@@ -2515,7 +4477,19 @@ end
 
 function GenericTrigger.Delete(id)
 	GenericTrigger.UnloadDisplays({ id })
+	-- Handed to the next Add so it can still tell an edited trigger from an
+	-- untouched one. WA.Add deletes every system before it re-adds them, so by
+	-- the time Add runs, events[id] is already gone and the comparison it makes
+	-- would otherwise always report "changed" -- which drops aura_env on every
+	-- recompile, including the ones WA.Add fires per drag step.
+	if events[id] then lastCompiled[id] = events[id] end
 	events[id] = nil
+	-- Rebuilt from scratch by the next Add, which is also what makes the
+	-- reciprocal-watch refusal depend only on this compile's own order.
+	watchedTriggers[id] = nil
+	unresolvedIds[id] = nil
+	cancelWatchedDelivery(id)
+	WA.StopStateTimers(id)
 end
 
 function GenericTrigger.Rename(oldId, newId)
@@ -2534,10 +4508,21 @@ function GenericTrigger.Rename(oldId, newId)
 	end
 	events[newId] = byTrigger
 	events[oldId] = nil
+	lastCompiled[oldId] = nil
+	if unresolvedIds[oldId] then
+		unresolvedIds[newId] = true
+		unresolvedIds[oldId] = nil
+	end
 	if activeIds[oldId] then
 		activeIds[newId] = true
 		activeIds[oldId] = nil
 	end
+	if watchedTriggers[oldId] then
+		watchedTriggers[newId] = watchedTriggers[oldId]
+		watchedTriggers[oldId] = nil
+	end
+	cancelWatchedDelivery(oldId)
+	WA.RenameStateTimers(oldId, newId)
 end
 
 function GenericTrigger.CreateFallbackState(data, triggernum, state)
@@ -2561,11 +4546,29 @@ function GenericTrigger.GetNameAndIcon(data, triggernum)
 	return name, icon
 end
 
+-- The variables a Trigger State Updater declares, read out of its compiled
+-- customVariables chunk. That chunk is user code, so it runs through the aura
+-- environment; a chunk that errors or returns a non-table declares nothing.
+-- Public because it is the same answer the editor reports validation against.
+function WA.GetTsuVariables(id, triggernum)
+	local byTrigger = events[id]
+	local ti = byTrigger and byTrigger[triggernum]
+	if not ti or not ti.tsuVariablesFunc then return nil end
+	local ok, variables = WA.RunAuraFunc(id, id .. ": custom variables " .. triggernum,
+		ti.tsuVariablesFunc)
+	if not ok then return nil end
+	return variables
+end
+
 -- Condition variables (§10): every store arg that declared a conditionType.
 function GenericTrigger.GetTriggerConditions(data, triggernum)
 	local trigger = WA.GetTrigger(data, triggernum)
 	local proto = trigger and PROTOTYPES[trigger.type]
 	if not proto then return {} end
+	-- A TSU declares its own; the prototype has no args to derive them from.
+	if proto.custom and trigger.custom_type == "stateupdate" then
+		return WA.CleanCustomVariables(WA.GetTsuVariables(data.id, triggernum)) or {}
+	end
 	local out = {}
 	for i = 1, table.getn(proto.args) do
 		local arg = proto.args[i]
@@ -2618,15 +4621,17 @@ local function buildDefaults(proto)
 			if not arg.required then d["use_" .. arg.name] = false end
 			d[arg.name .. "_operator"] = arg.operator or "=="
 			d[arg.name] = arg.default or ""
-		elseif arg.type == "spell" or arg.type == "item" or arg.type == "text" then
+		elseif arg.type == "spell" or arg.type == "item" or arg.type == "talent" or arg.type == "text" then
 			d[arg.name] = arg.default or ""
 		elseif arg.type == "toggle" then
 			d[arg.name] = arg.default or false
 		elseif arg.type == "select" and arg.required then
-			d[arg.name] = arg.default or (arg.valueList and arg.valueList[1])
+			local values = type(arg.valueList) == "function" and arg.valueList(d) or arg.valueList
+			d[arg.name] = arg.default or (values and values[1])
 		elseif arg.type == "select" and not arg.required then
 			d["use_" .. arg.name] = false
-			d[arg.name] = arg.default or (arg.valueList and arg.valueList[1])
+			local values = type(arg.valueList) == "function" and arg.valueList(d) or arg.valueList
+			d[arg.name] = arg.default or (values and values[1])
 		elseif arg.type == "number" and not arg.required then
 			d["use_" .. arg.name] = false
 			d[arg.name .. "_operator"] = arg.operator or ">="
@@ -2649,38 +4654,162 @@ local function buildOptions(data, triggernum)
 	local proto = t and PROTOTYPES[t.type]
 	if not proto then return WA.TriggerTypeFields(data, t) end
 
-	-- Custom trigger has no args -- its editor is the code/events/progress fields,
-	-- not the generated per-arg controls. Committing recompiles via WA.Add (which
-	-- surfaces any compile error to chat; /wa gen dumps the stored source).
 	if proto.custom then
 		local fields = WA.TriggerTypeFields(data, t)
+		local entry = data.triggers[triggernum or 1]
+		entry.untrigger = entry.untrigger or {}
+		local function validate(txt, label)
+			return WA.Widgets.LuaSyntaxError(WA.WrapFunctionSource(txt), label)
+		end
+		local optionKey = tostring(data.id or "") .. ":" .. tostring(triggernum or 1)
+		local search = customEventSearch[optionKey] or ""
+		local eventValues, eventLabels = eventPickerValues(search)
+		local isTsu = t.custom_type == "stateupdate"
+		local perFrame = isTsu and t.check == "update"
 		local more = {
-			{ type = "header", name = "Custom Status Trigger" },
-			{ type = "select", name = "Progress", key = "customProgressType",
+			{ type = "header", name = "Custom Trigger" },
+			{ type = "select", name = "Event Type", key = "custom_type",
+				values = { "status", "event", "stateupdate" },
+				labels = { status = "Status", event = "Event",
+					stateupdate = "Trigger State Updater (Advanced)" },
+				get = function() return t.custom_type or "status" end,
+				set = function(v)
+					t.custom_type = v
+					if v ~= "status" then t.weakestAurasLegacyStateArgs = nil end
+					-- Upstream stamps this on every aura it creates, and a TSU state
+					-- that never set `show` reads differently with and without it. An
+					-- aura that arrived carrying `information` keeps whatever it said.
+					if v == "stateupdate" and data.information == nil then
+						data.information = { showNilIsFalse = true }
+					end
+					WA.Add(data); WA.RefreshOptions()
+				end },
+		}
+		if isTsu then
+			table.insert(more, { type = "select", name = "Check On", key = "check",
+				values = { "event", "update" },
+				labels = { event = "Event(s)", update = "Every Frame" },
+				get = function() return t.check or "event" end,
+				set = function(v) t.check = v; WA.Add(data); WA.RefreshOptions() end })
+		end
+		if not perFrame then
+			table.insert(more, { type = "multiline", name = "Event(s)", key = "events", height = 72,
+				get = function() return t.events or "" end,
+				set = function(v) t.events = v; WA.Add(data); WA.RefreshOptions() end })
+			table.insert(more, { type = "description", name =
+				"Type event names manually above, separated by spaces or commas. "
+				.. "Or search below, press Enter, and choose Insert Event." })
+			if isTsu then
+				table.insert(more, { type = "description", name =
+					"UNIT_AURA:player:target fires only for the listed units. TRIGGER:2 "
+					.. "runs this trigger when trigger 2 updates. CLEU: is not available "
+					.. "on this client." })
+			end
+			local invalid = invalidEventList(t.events)
+			if table.getn(invalid) > 0 then
+				table.insert(more, { type = "description", name =
+					"|cffff5555Not registered by this client: " .. table.concat(invalid, ", ")
+					.. ".|r The names remain saved for addon-generated events." })
+			end
+			table.insert(more, { type = "input", name = "Find Event", half = true,
+				get = function() return customEventSearch[optionKey] or "" end,
+				set = function(v) customEventSearch[optionKey] = v or ""; WA.RefreshOptions() end })
+			table.insert(more, { type = "menu", name = "Insert Event", half = true,
+				values = eventValues, labels = eventLabels,
+				onSelect = function(v)
+					if v == "__NO_EVENT_MATCH__" then return end
+					t.events = appendEventName(t.events, v)
+					WA.Add(data); WA.RefreshOptions()
+				end })
+		end
+		if perFrame or (isTsu and t.events and string.find(t.events, "FRAME_UPDATE", 1, true)) then
+			table.insert(more, { type = "range", name = "Throttle (s)", key = "onUpdateThrottle",
+				min = 0, max = 1, step = 0.01, decimals = 2,
+				get = function() return tonumber(t.onUpdateThrottle) or 0 end,
+				set = function(v) t.onUpdateThrottle = v; WA.Add(data) end })
+		end
+		table.insert(more, { type = "code", name = "Custom Trigger", key = "custom", height = 180,
+				get = function() return t.custom end,
+				set = function(v) t.custom = v; WA.Add(data) end,
+				default = (isTsu and "function(allstates, event, ...)\n    return true\nend")
+					or (t.weakestAurasLegacyStateArgs
+						and "function(state, event, ...)\n    return true\nend")
+					or (proto.defaults and proto.defaults.custom),
+				validate = function(txt) return validate(txt, "custom trigger") end })
+		if isTsu then
+			table.insert(more, { type = "code", name = "Custom Variables", key = "customVariables", height = 140,
+				get = function() return t.customVariables or "" end,
+				set = function(v) t.customVariables = v; WA.Add(data); WA.RefreshOptions() end,
+				default = "{\n    stacks = \"number\",\n}",
+				validate = function(txt)
+					return WA.Widgets.LuaSyntaxError(
+						WA.WrapFunctionSource("function() return \n" .. (txt or "") .. "\n end"),
+						"custom variables")
+				end })
+			-- The syntax check above only proves the chunk compiles. What the table
+			-- *says* is checked by running it, which is too much to do per keystroke,
+			-- so the declaration's own problems are reported off the compiled trigger.
+			local declared = WA.GetTsuVariables(data.id, triggernum or 1)
+			local problem = declared ~= nil and WA.ValidateCustomVariables(declared) or nil
+			if problem then
+				table.insert(more, { type = "description",
+					name = "|cffff5555Custom Variables: " .. problem .. "|r" })
+			end
+			table.insert(more, { type = "description", name =
+				"State fields shown here: show, changed, progressType, value, total, "
+				.. "duration, expirationTime, autoHide, paused, remaining, name, icon, "
+				.. "stacks, index, inverse." })
+			table.insert(more, { type = "description", name =
+				"This code also runs once when the aura loads, with event = \"STATUS\" "
+				.. "and no payload, so it can seed itself from the current world. Check "
+				.. "`event` before building state from an argument the load pass has no "
+				.. "value for." })
+		end
+		if t.weakestAurasLegacyStateArgs then
+			table.insert(more, { type = "select", name = "Legacy Progress", key = "customProgressType",
 				values = { "none", "timed", "static" },
 				labels = { none = "None", timed = "Timed", static = "Static" },
 				get = function() return t.customProgressType or "none" end,
-				set = function(v) t.customProgressType = v; WA.Add(data) end },
-			{ type = "input", name = "Events (comma-separated)", key = "customEvents",
-				get = function() return t.customEvents or "" end,
-				set = function(v) t.customEvents = v; WA.Add(data) end },
-			{ type = "code", name = "Custom Trigger Function", key = "customTrigger", height = 180,
-				-- Raw, not `or ""`: nil means never configured (open at the
-				-- default below), "" means cleared and left cleared. MergeDefaults
-				-- seeds this one, so nil only shows up on a hand-built trigger.
-				get = function() return t.customTrigger end,
-				set = function(v) t.customTrigger = v; WA.Add(data) end,
-				-- Reset seeds the signature back, so an emptied box is recoverable
-				-- without the user having to remember the shape. Taken from the
-				-- prototype's own defaults rather than spelled out again here.
-				default = proto.defaults and proto.defaults.customTrigger,
-				-- Asked of the compiler for its wrapper rather than spelling one
-				-- here: two spellings drift, and the symptom is an error line
-				-- number silently off by one.
-				validate = function(txt)
-					return WA.Widgets.LuaSyntaxError(WA.WrapFunctionSource(txt), "custom trigger")
-				end },
-		}
+				set = function(v) t.customProgressType = v; WA.Add(data) end })
+		end
+		if t.custom_type == "event" then
+			table.insert(more, { type = "select", name = "Hide", key = "custom_hide",
+				values = { "timed", "custom" }, labels = { timed = "Timed", custom = "Custom" },
+				get = function() return t.custom_hide or "timed" end,
+				set = function(v) t.custom_hide = v; WA.Add(data); WA.RefreshOptions() end })
+			if t.custom_hide ~= "custom" then
+				table.insert(more, { type = "range", name = "Duration (s)", key = "duration",
+					min = 0.1, max = 60, step = 0.1,
+					get = function() return tonumber(t.duration) or 1 end,
+					set = function(v) t.duration = v; WA.Add(data) end })
+			end
+		end
+		-- Everything below is a second source for a value TSU state already carries,
+		-- so this mode shows none of it. The saved fields survive untouched, and a
+		-- trigger switched back out of TSU gets its editors back with its text.
+		if not isTsu then
+			if t.custom_type == "status" or t.custom_hide == "custom" then
+				table.insert(more, { type = "code", name = "Custom Untrigger", key = "customUntrigger", height = 140,
+					get = function() return entry.untrigger.custom end,
+					set = function(v) entry.untrigger.custom = v; WA.Add(data) end,
+					default = t.weakestAurasLegacyStateArgs
+						and "function(state, event, ...)\n    return true\nend"
+						or "function(event, ...)\n    return true\nend",
+					validate = function(txt) return validate(txt, "custom untrigger") end })
+				table.insert(more, { type = "code", name = "Duration Info", key = "customDuration", height = 140,
+					get = function() return t.customDuration or "" end,
+					set = function(v) t.customDuration = v; WA.Add(data) end,
+					validate = function(txt) return validate(txt, "duration info") end })
+			end
+			table.insert(more, { type = "code", name = "Name Info", key = "customName", height = 120,
+				get = function() return t.customName or "" end,
+				set = function(v) t.customName = v; WA.Add(data) end,
+				validate = function(txt) return validate(txt, "name info") end })
+			table.insert(more, { type = "code", name = "Icon Info", key = "customIcon", height = 120,
+				get = function() return t.customIcon or "" end,
+				set = function(v) t.customIcon = v; WA.Add(data) end,
+				validate = function(txt) return validate(txt, "icon info") end })
+		end
 		for i = 1, table.getn(more) do table.insert(fields, more[i]) end
 		return fields
 	end
@@ -2706,7 +4835,8 @@ local function buildOptions(data, triggernum)
 			-- comes back when the override is switched off.
 			table.insert(fields, {
 				type = "select", name = arg.display or "Unit", key = arg.name, half = true,
-				values = WA.unit_tokens, labels = WA.unit_labels,
+				values = arg.valueList or WA.unit_tokens,
+				labels = arg.valueLabels or WA.unit_labels,
 				get = function() return t[arg.name] end,
 				set = function(v) t[arg.name] = v; WA.Add(data); WA.RefreshOptions() end,
 			})
@@ -2722,6 +4852,19 @@ local function buildOptions(data, triggernum)
 				type = "spell", name = arg.display or "Spell", key = arg.name,
 				get = function() return t[arg.name] or "" end,
 				set = function(v) t[arg.name] = v; WA.Add(data) end,
+			})
+		elseif arg.type == "talent" then
+			table.insert(fields, {
+				type = "talent", name = arg.display or "Talent", key = arg.name,
+				get = function() return t[arg.name] or "" end,
+				set = function(v) t[arg.name] = v; WA.Add(data) end,
+				resolve = function(v)
+					local found, _, _, _, tab, tier, column, icon = WA.TalentInfo(v,
+						(t.usePlacement and tonumber(t.talentTab)) or 0,
+						(t.usePlacement and tonumber(t.talentTier)) or 0,
+						(t.usePlacement and tonumber(t.talentColumn)) or 0)
+					return found and icon or nil
+				end,
 			})
 		elseif arg.type == "item" then
 			table.insert(fields, {
@@ -2776,9 +4919,18 @@ local function buildOptions(data, triggernum)
 		elseif arg.type == "select" and arg.required then
 			table.insert(fields, {
 				type = "select", name = arg.display or arg.name, key = arg.name,
-				values = arg.valueList or arg.values, labels = arg.valueLabels,
+				values = type(arg.valueList) == "function" and arg.valueList(t) or (arg.valueList or arg.values),
+				labels = type(arg.valueLabels) == "function" and arg.valueLabels(t) or arg.valueLabels,
 				get = function() return t[arg.name] end,
 				set = function(v)
+					if arg.name == "itemClassID" and t.type == "itemtypeequipped" then
+						local subclassValues = itemSubclassValues(v)
+						local found = false
+						for j = 1, table.getn(subclassValues) do
+							if subclassValues[j] == t.itemSubclassID then found = true; break end
+						end
+						if not found then t.itemSubclassID = subclassValues[1] end
+					end
 					t[arg.name] = v; WA.Add(data)
 					if arg.reloadOptions then WA.RefreshOptions() end
 				end,
@@ -2865,6 +5017,8 @@ for typeName, proto in pairs(PROTOTYPES) do
 			displayName = proto.displayName,
 			category = proto.category,
 			defaults = buildDefaults(proto),
+			migrate = proto.migrate,
+			wa2Event = proto.wa2Event,
 			summary = buildSummary(proto),
 			options = buildOptions,
 		})

@@ -81,11 +81,9 @@ end
 -- (resolution) share the one constant.
 WeakestAuras.trigger_modes = { first_active = -10 }
 
--- Unit tokens a trigger may target. All are native or ClassicAPI-backed and
--- resolve to a single unit; a multi-unit token (party as a group) needs the
--- clone path and is deliberately absent. raid1..raid40 and partyN are reachable
--- through the "specific" entry's free-text field rather than bloating every
--- dropdown by 40+ entries.
+-- Unit tokens a single-state trigger may target. All are native or
+-- ClassicAPI-backed. raid1..raid40 and partyN are reachable through the
+-- "specific" entry's free-text field rather than bloating every dropdown.
 WeakestAuras.unit_tokens = {
 	"player", "target", "targettarget", "focus", "focustarget",
 	"pet", "pettarget", "mouseover", "specific",
@@ -96,5 +94,121 @@ WeakestAuras.unit_labels = {
 	pet = "Pet", pettarget = "Target of Pet", mouseover = "Mouseover",
 	specific = "Specific Unit",
 }
+
+-- The multi-unit families a clone-producing trigger iterates instead of a single
+-- token. Upstream's saved `unit` values; ForEachMultiUnit below decides what
+-- each one currently contains. unit_tokens_multi is the dropdown a prototype
+-- that can produce clones offers -- the single tokens, then the families.
+WeakestAuras.multi_unit_tokens = { "group", "party", "raid", "nameplate" }
+WeakestAuras.multi_unit_labels = {
+	group = "Group", party = "Party", raid = "Raid", nameplate = "Nameplates",
+}
+WeakestAuras.unit_tokens_multi = {}
+WeakestAuras.unit_labels_multi = {}
+for i = 1, table.getn(WeakestAuras.unit_tokens) do
+	table.insert(WeakestAuras.unit_tokens_multi, WeakestAuras.unit_tokens[i])
+end
+for key, label in pairs(WeakestAuras.unit_labels) do
+	WeakestAuras.unit_labels_multi[key] = label
+end
+for i = 1, table.getn(WeakestAuras.multi_unit_tokens) do
+	local family = WeakestAuras.multi_unit_tokens[i]
+	table.insert(WeakestAuras.unit_tokens_multi, family)
+	WeakestAuras.unit_labels_multi[family] = WeakestAuras.multi_unit_labels[family]
+end
+
+-- The family a trigger's saved `unit` selects, or nil for a single token.
+function WeakestAuras.MultiUnitFamily(trigger)
+	local unit = trigger and trigger.unit
+	return (unit and WeakestAuras.multi_unit_labels[unit]) and unit or nil
+end
+
+-- Stable clone identity for unit-producing triggers. A nameplate slot or raid
+-- index can be reused for another unit; the GUID keeps the allstates key tied
+-- to the unit while `state.unit` retains the live token used by Unit* APIs.
+function WeakestAuras.UnitCloneId(unit)
+	local guid = UnitGUID and UnitGUID(unit)
+	return guid or unit
+end
+
+-- Calls fn(unit, cloneId) for every usable token in an upstream multi-unit
+-- family. Group/party include the player outside raids; raid tokens already
+-- include the player. Nameplate slots may contain holes, so all 40 confirmed
+-- ClassicAPI slots are checked instead of stopping at the first empty one.
+function WeakestAuras.ForEachMultiUnit(unitType, fn)
+	if type(fn) ~= "function" then return end
+	local seen = {}
+	local function emit(unit)
+		if UnitExists and UnitExists(unit) then
+			local cloneId = WeakestAuras.UnitCloneId(unit)
+			if cloneId ~= nil and not seen[cloneId] then
+				seen[cloneId] = true
+				fn(unit, cloneId)
+			end
+		end
+	end
+
+	if unitType == "nameplate" then
+		for i = 1, 40 do emit("nameplate" .. i) end
+		return
+	end
+
+	local raid = GetNumRaidMembers and (GetNumRaidMembers() or 0) or 0
+	if unitType == "raid" or (unitType == "group" and raid > 0) then
+		if raid > 40 then raid = 40 end
+		for i = 1, raid do emit("raid" .. i) end
+		return
+	end
+
+	if unitType == "party" or unitType == "group" then
+		emit("player")
+		local party = GetNumPartyMembers and (GetNumPartyMembers() or 0) or 0
+		if party > 4 then party = 4 end
+		for i = 1, party do emit("party" .. i) end
+	end
+end
+
+-- Whether a family currently iterates `unit`, by the same membership rules
+-- ForEachMultiUnit applies -- the token test a producer needs to answer "is this
+-- unit event mine?" without walking the whole family per event. A unit reachable
+-- through several tokens (the player in a raid is also raid7) answers false for
+-- the tokens the family does not iterate; a producer keyed by GUID recognizes
+-- those through its own state table instead.
+function WeakestAuras.MultiUnitHasToken(unitType, unit)
+	if type(unit) ~= "string" then return false end
+	local function slot(pattern, limit)
+		local _, _, n = string.find(unit, pattern)
+		n = n and tonumber(n)
+		return n ~= nil and n >= 1 and n <= limit
+	end
+
+	if unitType == "nameplate" then return slot("^nameplate(%d+)$", 40) end
+
+	local raid = GetNumRaidMembers and (GetNumRaidMembers() or 0) or 0
+	if unitType == "raid" or (unitType == "group" and raid > 0) then
+		if raid > 40 then raid = 40 end
+		return slot("^raid(%d+)$", raid)
+	end
+
+	if unitType == "party" or unitType == "group" then
+		if unit == "player" then return true end
+		local party = GetNumPartyMembers and (GetNumPartyMembers() or 0) or 0
+		if party > 4 then party = 4 end
+		return slot("^party(%d+)$", party)
+	end
+	return false
+end
+
+-- Upstream-compatible numeric clone ids for event producers. The optional
+-- allstates argument closes wrap-around collisions for the table receiving the
+-- key; clone ids are scoped to one trigger's allstates table.
+local nextCloneId = 0
+function WeakestAuras.GetUniqueCloneId(allstates)
+	for _ = 1, 1000000 do
+		nextCloneId = math.mod(nextCloneId + 1, 1000000)
+		if not allstates or allstates[nextCloneId] == nil then return nextCloneId end
+	end
+	return nil
+end
 
 DEFAULT_CHAT_FRAME:AddMessage("|cff33ff99WeakestAuras|r loaded.", 1, 1, 1)

@@ -1,0 +1,11 @@
+The status-bar files in this directory named Armory, Charcoal, Cilo, Comet,
+Dabs, DarkBottom, Diagonal, Frost, Glass, Glaze, Glaze2, Grid, Hatched,
+LiteStep, Melli, MelliDark, Perl2, Pill, Smoothv2, Steel, Striped, Tube,
+Water, Wglass, Wisps, and Xeon are unchanged copies from SharedMedia r201.
+
+Source: https://www.curseforge.com/wow/addons/sharedmedia/files/7508371
+Project: https://www.curseforge.com/wow/addons/sharedmedia
+
+The source archive does not provide a separate license file for these
+status-bar files. This attribution file records their provenance; confirm
+redistribution permission before publishing a release containing them.

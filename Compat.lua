@@ -11,6 +11,28 @@ local WA = WeakestAuras
 -- division is how 5.0 spells the same infinity.
 WA.INF = 1 / 0
 
+-- One 2^32-millisecond period, in seconds -- the width of the engine's tick
+-- counter expressed on GetTime()'s scale.
+local TICK_WRAP = 4294967.296
+
+-- Repairs a timestamp ClassicAPI read into a *signed* 32-bit int. Its
+-- cooldown backports do `int startMs` and hand back `startMs * 0.001`
+-- (src/spell/Cooldown.cpp, src/item/Cooldown.cpp -- the latter shared by
+-- GetItemCooldown and C_Container.GetItemCooldown), while the engine's counter
+-- is unsigned. Once the machine has been up past 2^31 ms (~24.9 days) every
+-- timestamp from those two reads back exactly one period short, and negative:
+-- a real start of 2697363.158 arrives as -1597604.138. A timestamp is never
+-- legitimately negative, so the sign is the whole test.
+--
+-- Deliberately not applied everywhere: ClassicAPI's aura and cast paths cast
+-- through uint32_t and are already right, as are vanilla's own
+-- GetSpellCooldown/GetInventoryItemCooldown. Wrapping a correct value would
+-- push it 49.7 days into the future.
+function WA.UnwrapTick(t)
+	if t and t < 0 then return t + TICK_WRAP end
+	return t
+end
+
 -- 5.0 has no `wipe`; clearing keys in place preserves the table identity that
 -- callers (memoization caches, per-tick scratch tables) hold a reference to.
 function WA.wipe(t)

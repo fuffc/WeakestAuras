@@ -65,6 +65,19 @@ end
 
 local UNKNOWN_ICON = "Interface\\Icons\\INV_Misc_QuestionMark"
 
+-- SpellDispelType.dbc ids 1..4, in the order the Dispel Type selector offers
+-- them. C_Spell.GetSpellDispelType answers the id and nothing in Lua maps an id
+-- to the localized name the descriptor carries, so this is the bridge for an
+-- aura that never reached a descriptor. An id that stopped lining up would cost
+-- a filter match, never produce a wrong one.
+local DISPEL_TYPES = { "Magic", "Curse", "Disease", "Poison" }
+
+local playerGuid
+local function playerGUID()
+	if not playerGuid then playerGuid = UnitGUID and UnitGUID("player") end
+	return playerGuid
+end
+
 -- name, icon for a ti's configured entries (the fallback identity for
 -- showOnMissing/showAlways with no current match, and what the options list
 -- resolves a row's icon from). Walks the entries until one resolves to a real
@@ -124,6 +137,10 @@ local function buildTriggerInfo(id, triggernum, t)
 		id = id,
 		triggernum = triggernum,
 		unit = WA.TriggerUnit(t, "player"),
+		-- Non-nil for a family (group/party/raid/nameplate): the scan runs once
+		-- per member and writes one GUID-keyed clone each, instead of one base
+		-- state for one token.
+		multiUnit = WA.MultiUnitFamily(t),
 		filters = filters,
 		entries = entries,
 		ignoreEntries = buildEntries(t.auraignorenames),
@@ -263,8 +280,7 @@ local AURA_CONDITIONS = {
 	duration = { display = "Duration", type = "number" },
 	active = { display = "Active", type = "bool" },
 	filter = { display = "Aura Type", type = "select", values = { "HELPFUL", "HARMFUL" } },
-	dispelName = { display = "Dispel Type", type = "select",
-		values = { "Magic", "Curse", "Disease", "Poison" } },
+	dispelName = { display = "Dispel Type", type = "select", values = DISPEL_TYPES },
 	expirationTime = { display = "Remaining Time", type = "timer" },
 	initialTime = { display = "Time Since Apply", type = "elapsedTimer" },
 	refreshTime = { display = "Time Since Refresh", type = "elapsedTimer" },
@@ -278,6 +294,9 @@ local AURA_CONDITIONS = {
 	casterName = { display = "Caster Name", type = "string" },
 	unitCaster = { display = "Caster Unit", type = "string" },
 	index = { display = "Aura Slot", type = "number" },
+	-- True for an aura recovered from the overflow cache rather than read off the
+	-- descriptor. Reachable so a display can say why it shows no stack count.
+	overflow = { display = "Overflow", type = "bool" },
 }
 
 function TriggerAura.GetTriggerConditions(data, triggernum)
@@ -300,13 +319,22 @@ local function passesMatch(ti, aura)
 			return false
 		end
 	end
-	-- Caster attribution is best-effort here: sourceUnit comes from ClassicAPI's
+	-- Caster attribution is best-effort here: it comes from ClassicAPI's
 	-- SMSG_SPELL_GO cache (SuperWoW GUIDs), so an aura active at login -- or any
-	-- aura when the cast packet wasn't observed -- reports sourceUnit=nil. Reject
-	-- only when we positively know the caster is someone else; an unknown caster
-	-- can't be proven foreign, so let it pass rather than hide a genuinely-own buff.
-	if ti.ownOnly and aura.sourceUnit ~= nil and aura.sourceUnit ~= "player" then
-		return false
+	-- aura when the cast packet wasn't observed -- reports no caster at all.
+	-- Reject only when we positively know the caster is someone else; an unknown
+	-- caster can't be proven foreign, so let it pass rather than hide a
+	-- genuinely-own buff.
+	--
+	-- Test sourceGUID rather than sourceUnit: the GUID is set whenever a caster
+	-- is known, while the token is nil for any caster outside token range, which
+	-- would read as "unknown" and pass someone else's debuff.
+	if ti.ownOnly then
+		if aura.sourceGUID ~= nil then
+			if not WA.AuraOverflow.SameGuid(aura.sourceGUID, playerGUID()) then return false end
+		elseif aura.sourceUnit ~= nil and aura.sourceUnit ~= "player" then
+			return false
+		end
 	end
 	-- Any player caster, as against ownOnly's "me". Inherits the same
 	-- unknown-caster tolerance: nil sourceUnit can't be proven to be a mob.
@@ -346,16 +374,100 @@ local function passesMatch(ti, aura)
 	return true
 end
 
+-- ---------------------------------------------------------------------------
+-- Overflow fallback. A unit descriptor carries 16 harmful slots and a raid boss
+-- carries more; the ones that got no slot are never transmitted, so a HARMFUL
+-- miss is not proof of absence. AuraOverflow.lua holds them, recovered from
+-- Nampower's aura-cast events, and this is where the miss gets to ask.
+-- Upstream has no counterpart -- retail has no aura cap.
+-- ---------------------------------------------------------------------------
+
+-- Gate result per unit for the tick. Reconcile costs a descriptor scan and
+-- evicts as it goes, so several triggers on one unit must not each run it.
+local gateMemo = {}
+
+-- An AuraData-shaped table built from a cache entry, marked so the filters that
+-- degrade on it can tell, and so a display can say why.
+local function synthesise(cached, spellId)
+	local name, _, icon = GetSpellInfo(spellId)
+	local duration = cached.duration or 0
+	local dispelType = C_Spell and C_Spell.GetSpellDispelType and C_Spell.GetSpellDispelType(spellId)
+	return {
+		name = cached.name or name,
+		icon = icon,
+		spellId = spellId,
+		-- Only the descriptor counts stacks, so an overflow entry reports the one
+		-- application its cast event proves.
+		applications = 1,
+		duration = duration,
+		expirationTime = duration > 0 and (cached.start + duration) or 0,
+		dispelName = dispelType and DISPEL_TYPES[dispelType] or nil,
+		isHarmful = true,
+		isHelpful = false,
+		-- Left as a GUID rather than resolved to a unit token: whether an
+		-- arbitrary caster's GUID addresses a unit here is not established, and
+		-- every Unit* call downstream would inherit the guess. sourceUnit is set
+		-- only for the one caster that can be named without one.
+		sourceGUID = cached.caster,
+		sourceUnit = WA.AuraOverflow.SameGuid(cached.caster, playerGUID()) and "player" or nil,
+		overflow = true,
+	}
+end
+
+local function overflowMatch(ti, unit)
+	local AO = WA.AuraOverflow
+	if not (AO and AO.Enabled()) then return nil end
+	if WA.Options().auraOverflow == false then return nil end
+
+	local harmful = false
+	for fi = 1, table.getn(ti.filters) do
+		if ti.filters[fi] == "HARMFUL" then harmful = true end
+	end
+	if not harmful then return nil end
+
+	local guid = UnitGUID and UnitGUID(unit)
+	if not guid then return nil end
+
+	local gate = gateMemo[unit]
+	if gate == nil then
+		gate = AO.Reconcile(unit, guid) and true or false
+		gateMemo[unit] = gate
+	end
+	if not gate then return nil end
+
+	-- Naming the caster is what picks our own copy out of several holding the
+	-- same debuff; the longest-remaining one would otherwise answer, and
+	-- passesMatch would then reject it and report the aura missing.
+	local caster = ti.ownOnly and playerGUID() or nil
+
+	for e = 1, table.getn(ti.entries) do
+		local entry = ti.entries[e]
+		local cached, spellId
+		if entry.id then
+			cached, spellId = AO.Get(guid, entry.id, caster), entry.id
+		else
+			cached, spellId = AO.GetByName(guid, entry.raw, caster)
+		end
+		if cached then
+			local aura = synthesise(cached, spellId)
+			if passesMatch(ti, aura) then
+				return { aura = aura, filter = "HARMFUL" }
+			end
+		end
+	end
+	return nil
+end
+
 -- Forward per-ti match: walk this ti's entries in configured (priority) order,
 -- each against each of its filters, first passing hit wins. Small n (a
 -- handful of entries/filters, <=40 auras per scan) makes this cheaper than
 -- maintaining a name+id reverse index for the multi-entry/BOTH-filter case.
-local function findMatch(ti)
+local function findMatch(ti, unit)
 	for e = 1, table.getn(ti.entries) do
 		local entry = ti.entries[e]
 		for fi = 1, table.getn(ti.filters) do
 			local filter = ti.filters[fi]
-			local list = scanUnit(ti.unit, filter)
+			local list = scanUnit(unit, filter)
 			for i = 1, table.getn(list) do
 				local aura = list[i]
 				local ok
@@ -367,12 +479,14 @@ local function findMatch(ti)
 			end
 		end
 	end
-	return nil
+	return overflowMatch(ti, unit)
 end
 
--- Writes ti's "" state with field-by-field change detection. `match` is the
--- matched { aura, index, filter } (or nil). Returns true if any field changed.
-local function updateTriggerInfoState(ti, match)
+-- Writes one state of ti with field-by-field change detection: the base `""`
+-- state for a single token, or `cloneId`'s for one member of a multi-unit
+-- family. `match` is the matched { aura, index, filter } (or nil). Returns true
+-- if any field changed.
+local function updateTriggerInfoState(ti, unit, cloneId, match)
 	local states = WA.GetTriggerStateForTrigger(ti.id, ti.triggernum)
 	if not states then return false end
 
@@ -388,9 +502,9 @@ local function updateTriggerInfoState(ti, match)
 	-- A unit that isn't there has no auras, which makes "aura missing" trivially
 	-- true on an empty target and would show the display whenever nothing is
 	-- targeted at all. Showing that is opt-in.
-	if not UnitExists(ti.unit) and not ti.unitExists then shown = false end
+	if not UnitExists(unit) and not ti.unitExists then shown = false end
 
-	local state = states[""]
+	local state = states[cloneId]
 
 	if not shown then
 		if not state or not state.show then return false end
@@ -399,7 +513,7 @@ local function updateTriggerInfoState(ti, match)
 		return true
 	end
 
-	if not state then state = {}; states[""] = state end
+	if not state then state = {}; states[cloneId] = state end
 	local now = GetTime()
 	local changed = false
 	local function set(k, v)
@@ -425,7 +539,7 @@ local function updateTriggerInfoState(ti, match)
 
 	set("show", true)
 	set("active", matched and true or false)
-	set("inRange", (UnitInRange and UnitInRange(ti.unit)) and true or false)
+	set("inRange", (UnitInRange and UnitInRange(unit)) and true or false)
 
 	if matched then
 		set("progressType", "timed")
@@ -436,12 +550,13 @@ local function updateTriggerInfoState(ti, match)
 		set("expirationTime", aura.expirationTime)
 		set("spellId", aura.spellId)
 		set("dispelName", aura.dispelName)
-		set("unit", ti.unit)
-		set("unitName", UnitName(ti.unit))
+		set("unit", unit)
+		set("unitName", UnitName(unit))
 		set("unitCaster", aura.sourceUnit)
 		set("casterName", aura.sourceUnit and UnitName(aura.sourceUnit) or nil)
 		set("filter", match.filter)
 		set("index", match.index)
+		set("overflow", aura.overflow and true or false)
 	else
 		-- showOnMissing / showAlways with no match: fallback identity. The
 		-- matched-only fields are cleared so a condition on them (Caster Name,
@@ -453,29 +568,60 @@ local function updateTriggerInfoState(ti, match)
 		set("stacks", 0)
 		set("duration", 0)
 		set("expirationTime", 0)
-		set("unit", ti.unit)
-		set("unitName", UnitName(ti.unit))
+		set("unit", unit)
+		set("unitName", UnitName(unit))
 		set("unitCaster", nil)
 		set("casterName", nil)
 		set("spellId", nil)
 		set("dispelName", nil)
 		set("filter", nil)
 		set("index", nil)
+		set("overflow", false)
 	end
 
 	if changed then state.changed = true end
 	return changed
 end
 
+-- One scan of a multi-unit ti: a GUID-keyed clone per current member, and every
+-- state whose member has left the family dropped. Unlike the generic system's
+-- producers there is no per-unit event to route -- the poll is the drive here,
+-- so every tick is a full pass.
+local function scanMultiUnit(ti)
+	local states = WA.GetTriggerStateForTrigger(ti.id, ti.triggernum)
+	if not states then return false end
+	local seen = {}
+	local dirty = false
+	WA.ForEachMultiUnit(ti.multiUnit, function(unit, cloneId)
+		seen[cloneId] = true
+		if updateTriggerInfoState(ti, unit, cloneId, findMatch(ti, unit)) then dirty = true end
+	end)
+	local stale = {}
+	for cloneId in pairs(states) do
+		if cloneId ~= "" and not seen[cloneId] then table.insert(stale, cloneId) end
+	end
+	for i = 1, table.getn(stale) do
+		states[stale[i]] = nil
+		dirty = true
+	end
+	return dirty
+end
+
 local function scanTick()
 	WA.wipe(memo)
+	WA.wipe(gateMemo)
 	local dirty = {}
-	for unit, tis in pairs(scanIndex) do
+	for _, tis in pairs(scanIndex) do
 		for j = 1, table.getn(tis) do
 			local ti = tis[j]
 			if not WA.forced[ti.id] then -- a forced leaf's state is owned by the preview
-				local match = findMatch(ti)
-				if updateTriggerInfoState(ti, match) then dirty[ti.id] = true end
+				local changed
+				if ti.multiUnit then
+					changed = scanMultiUnit(ti)
+				else
+					changed = updateTriggerInfoState(ti, ti.unit, "", findMatch(ti, ti.unit))
+				end
+				if changed then dirty[ti.id] = true end
 			end
 		end
 	end

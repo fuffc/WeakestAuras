@@ -1,0 +1,9 @@
+Oswald-Regular.ttf
+------------------
+Oswald, copyright 2012 Vernon Adams, with Reserved Font Name Oswald.
+Licensed under the SIL Open Font License, Version 1.1; see
+licenses\Details\OFL-Oswald.txt.
+
+Copied from the official Details repository's fonts directory. The Details
+bar artwork and its other registered font faces are not bundled because the
+repository does not grant redistribution rights for them.

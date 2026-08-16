@@ -1,5 +1,7 @@
 -- LibWidgets -- a small, addon-agnostic UI widget library for 1.12 WoW
--- addons. Currently houses twelve widgets: NewButton (a flat action button),
+-- addons. Currently houses fourteen widgets: NewButton (a flat action button),
+-- NewTabButton (a NewButton carrying the lit "selected" look), NewTabStrip (a
+-- row of NewTabButtons that measures, wraps and reflows itself),
 -- NewIconButton (a small texture-faced button),
 -- NewCheckBox (a labelled checkbox), NewColorSwatch (a ColorPickerFrame swatch),
 -- NewSlider (a value-carrying OptionsSliderTemplate slider), NewSpinBox (a
@@ -23,6 +25,27 @@
 --   onSelect(v)  -- called when a point is picked
 --   width/height -- optional outer size (defaults to 100x50)
 -- Returns the frame with `.setValue(v)` and `.setSize(width, height)` methods.
+--
+-- NewTabStrip is a row of tab buttons that lays itself out: each tab is sized
+-- to its own label rather than to an equal share, and the row wraps onto as
+-- many lines as it needs. spec:
+--   tabs        -- ordered { { value = <any>, text = <string>, hidden = <bool> }, ... }
+--   width       -- the width to wrap within (required in practice; default 100)
+--   rowHeight   -- tab height, default 22
+--   gap         -- horizontal space between tabs, default 4
+--   rowGap      -- vertical space between rows, default 4
+--   padding     -- added to each measured label to get the tab's width, default 16
+--   minWidth    -- floor for a very short label, default 24
+--   fillRatio   -- a row at or above this fraction of `width` is stretched to
+--                  fill it; a sparser one keeps its natural widths and is left-
+--                  aligned. Default 0.75
+--   onSelect(value)      -- a tab was clicked
+--   onReflow(rows, height) -- the row count or height changed; the consumer
+--                            re-anchors whatever sits below the strip
+-- Returns the frame with `.setTabs(list)`, `.select(value)` (nil deselects
+-- every tab), `.getSelected()`, `.getRows()`, `.setWidth(w)` and `.buttons`
+-- (index-stable, one per entry in the last `setTabs` list, hidden ones
+-- included).
 --
 -- NewCodeEditBox decorates NewMultiLineEditBox into a syntax-coloured Lua
 -- editor: it colours on blur (never while typing, so the caret never lands
@@ -206,6 +229,9 @@
 --                    e.g. profile names)
 --   labels        -- value -> display label; optional (defaults to the raw value)
 --   tips          -- value -> tooltip line; optional
+--   previews      -- value -> true; adds a per-row preview button
+--   previewTexture -- texture path for the preview button (optional)
+--   onPreview(v)  -- called by a row preview without selecting or closing
 --   swatches      -- optional: value -> texture path. Turns the picker into a
 --                    preview picker: the button's face and every menu entry draw
 --                    that texture as a filled green bar behind the label, so a
@@ -323,7 +349,7 @@
 -- Returns { height = <total pixel height used below (x,y)>, refresh = fn,
 --           frame = <the list's outer frame> }.
 
-local MAJOR, MINOR = "LibWidgets-1.0", 17
+local MAJOR, MINOR = "LibWidgets-1.0", 20
 -- Bind the global only on the winning copy. NewLibrary returns nil for a copy
 -- that loses the version race; assigning that nil straight to the global would
 -- wipe out the winner's binding (an older/equal copy loading last nulls it),
@@ -582,6 +608,192 @@ function LibWidgets.NewButton(parent, spec)
 	b:SetScript("OnMouseUp", function() this.label:SetPoint("CENTER", 0, 0) end)
 	if spec.onClick then b:SetScript("OnClick", spec.onClick) end
 	return b
+end
+
+-- A NewButton carrying the lit "selected" look a tab needs, plus the `value`
+-- identifying it to its strip. The selected tab ignores hover, so the active
+-- one stays lit rather than dimming when the pointer crosses it.
+function LibWidgets.NewTabButton(parent, spec)
+	spec = spec or {}
+	local b = LibWidgets.NewButton(parent, {
+		text = spec.text, onClick = spec.onClick,
+		width = spec.width, height = spec.height or 22,
+	})
+	b.value = spec.value
+	function b.setSelected(on)
+		b.selected = on and true or false
+		if b.selected then
+			b:SetBackdropColor(0.22, 0.20, 0.05, 0.95)
+			b:SetBackdropBorderColor(0.9, 0.8, 0.2, 1)
+			b.label:SetTextColor(1, 1, 1)
+		else
+			b:SetBackdropColor(0, 0, 0, 0.7)
+			b:SetBackdropBorderColor(0.4, 0.4, 0.4, 0.8)
+			b.label:SetTextColor(0.7, 0.7, 0.7)
+		end
+	end
+	b:SetScript("OnEnter", function() if not this.selected then this:SetBackdropBorderColor(0.9, 0.8, 0.2, 1) end end)
+	b:SetScript("OnLeave", function() if not this.selected then this:SetBackdropBorderColor(0.4, 0.4, 0.4, 0.8) end end)
+	b.setSelected(false)
+	return b
+end
+
+-- A self-laying-out row of tab buttons; see the header comment for spec.
+--
+-- The layout is AceGUI's TabGroup:BuildTabs: measure each tab from its own
+-- text, wrap greedily, pull a lone last tab up beside its neighbours, then
+-- stretch a row to fill. Dividing the width equally instead is the obvious
+-- alternative and it does not survive a strip growing past a handful of tabs --
+-- every tab shrinks to the narrowest one's needs, and a label with no width set
+-- does not clip on this client, it overflows into its neighbours.
+function LibWidgets.NewTabStrip(parent, spec)
+	spec = spec or {}
+	local frame = CreateFrame("Frame", nil, parent)
+	local gap = spec.gap or 4
+	local rowGap = spec.rowGap or 4
+	local rowHeight = spec.rowHeight or 22
+	local padding = spec.padding or 16
+	local minWidth = spec.minWidth or 24
+	local fillRatio = spec.fillRatio or 0.75
+	local width = spec.width or 100
+	frame:SetWidth(width)
+	frame:SetHeight(rowHeight)
+
+	local buttons, tabs = {}, {}
+	local rows, selected = 0, nil
+	frame.buttons = buttons
+
+	local function layout()
+		local shown, w = {}, {}
+		for i = 1, table.getn(tabs) do
+			if tabs[i].hidden then
+				buttons[i]:Hide()
+			else
+				buttons[i]:Show()
+				table.insert(shown, buttons[i])
+			end
+		end
+		local n = table.getn(shown)
+		for i = 1, n do
+			local sw = (shown[i].label:GetStringWidth() or 0) + padding
+			if sw < minWidth then sw = minWidth end
+			w[i] = sw
+		end
+
+		-- Greedy wrap. A row never breaks before its own first tab, so one too
+		-- wide for the strip gets a row to itself instead of disappearing.
+		local rowEnd, rowWidth = {}, {}
+		local used, r = 0, 1
+		for i = 1, n do
+			if used ~= 0 and used + gap + w[i] > width then
+				rowWidth[r] = used
+				rowEnd[r] = i - 1
+				r = r + 1
+				used = w[i]
+			else
+				used = used + (used == 0 and 0 or gap) + w[i]
+			end
+		end
+		rowWidth[r] = used
+		rowEnd[r] = n
+		local numRows = n > 0 and r or 0
+
+		-- A single tab alone on the last row reads as a mistake rather than as a
+		-- second row, so pull one down to keep it company when the row above can
+		-- spare it and the last row has room. (Ace's own second guard here is
+		-- redundant given the first; this is the intent, not a transcription.)
+		if numRows > 1 and rowEnd[numRows] - rowEnd[numRows - 1] == 1 then
+			local prevStart = numRows > 2 and rowEnd[numRows - 2] or 0
+			local prevCount = rowEnd[numRows - 1] - prevStart
+			local moving = w[rowEnd[numRows - 1]]
+			if prevCount > 2 and rowWidth[numRows] + gap + moving <= width then
+				rowEnd[numRows - 1] = rowEnd[numRows - 1] - 1
+				rowWidth[numRows] = rowWidth[numRows] + gap + moving
+				rowWidth[numRows - 1] = rowWidth[numRows - 1] - gap - moving
+			end
+		end
+
+		local first = 1
+		for row = 1, numRows do
+			local last = rowEnd[row]
+			local count = last - first + 1
+			-- Stretching a nearly-full row to the edge tidies it; stretching a
+			-- sparse one balloons two tabs across the whole strip, which is worse
+			-- than a ragged right edge. Ace applies this test only to a lone row;
+			-- per row is the same rule read one level down, and it is what keeps a
+			-- short second row looking like tabs.
+			-- Never negative: a row can hold one tab wider than the whole strip
+			-- (it cannot break before its first), and sharing that overrun out as
+			-- a squeeze would push every label back outside its own button --
+			-- the failure measuring the labels exists to avoid. Let it overhang.
+			local extra = 0
+			if rowWidth[row] >= width * fillRatio and width > rowWidth[row] then
+				extra = math.floor((width - rowWidth[row]) / count)
+			end
+			local x = 0
+			for i = first, last do
+				local b = shown[i]
+				b:SetWidth(w[i] + extra)
+				b:SetHeight(rowHeight)
+				b:ClearAllPoints()
+				b:SetPoint("TOPLEFT", frame, "TOPLEFT", x, -(row - 1) * (rowHeight + rowGap))
+				x = x + w[i] + extra + gap
+			end
+			first = last + 1
+		end
+
+		rows = numRows
+		local h = numRows > 0 and (numRows * rowHeight + (numRows - 1) * rowGap) or 0
+		frame:SetHeight(h > 0 and h or 1)
+		if spec.onReflow then spec.onReflow(numRows, h) end
+	end
+
+	-- Buttons are pooled by index and rebound rather than rebuilt: frames cannot
+	-- be destroyed on this client, so a strip rebuilt per selection change would
+	-- leak one button per tab every time.
+	function frame.setTabs(list)
+		tabs = list or {}
+		for i = 1, table.getn(tabs) do
+			local b = buttons[i]
+			if not b then
+				b = LibWidgets.NewTabButton(frame, {
+					height = rowHeight,
+					onClick = function()
+						if spec.onSelect then spec.onSelect(b.value) end
+					end,
+				})
+				buttons[i] = b
+			end
+			b.setText(tabs[i].text or "")
+			b.value = tabs[i].value
+		end
+		for i = table.getn(tabs) + 1, table.getn(buttons) do
+			buttons[i]:Hide()
+		end
+		layout()
+		frame.select(selected)
+	end
+
+	-- nil deselects every tab, which is a real state: a panel showing something
+	-- that belongs to no tab has no tab to light.
+	function frame.select(value)
+		selected = value
+		for i = 1, table.getn(buttons) do
+			buttons[i].setSelected(value ~= nil and buttons[i].value == value)
+		end
+	end
+
+	function frame.getSelected() return selected end
+	function frame.getRows() return rows end
+
+	function frame.setWidth(w)
+		width = w
+		frame:SetWidth(w)
+		layout()
+	end
+
+	if spec.tabs then frame.setTabs(spec.tabs) end
+	return frame
 end
 
 -- A standalone labelled checkbox; see the header comment for spec.
@@ -1329,12 +1541,15 @@ function LibWidgets.NewScrollFrame(parent, spec)
 	return frame
 end
 
--- A value-picker drop button; see the header comment for spec.
+-- A value-picker drop button; see the header comment for spec. `previews` marks
+-- rows with a side button that invokes `onPreview` without selecting or closing.
 function LibWidgets.NewDropButton(parent, spec)
 	local values   = spec.values
 	local labels   = spec.labels or {}
 	local tips     = spec.tips
 	local swatches = spec.swatches
+	local previews = spec.previews
+	local previewTexture = spec.previewTexture
 	local width    = spec.width or 92
 	local itemH    = spec.itemHeight or (swatches and 20 or 14)
 
@@ -1443,6 +1658,20 @@ function LibWidgets.NewDropButton(parent, spec)
 		local ifs = item:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
 		ifs:SetPoint("LEFT", item, "LEFT", 2, 0)
 		item.label = ifs
+		if previews then
+			local preview = CreateFrame("Button", nil, item)
+			preview:SetWidth(16); preview:SetHeight(itemH - 2)
+			preview:SetPoint("RIGHT", item, "RIGHT", -1, 0)
+			local previewIcon = preview:CreateTexture(nil, "ARTWORK")
+			previewIcon:SetAllPoints(preview)
+			previewIcon:SetTexture(previewTexture or "Interface\\ChatFrame\\UI-ChatIcon-Chat")
+			previewIcon:SetVertexColor(1, 0.82, 0.15, 1)
+			preview.icon = previewIcon
+			preview:SetScript("OnClick", function()
+				if spec.onPreview and this.value then spec.onPreview(this.value) end
+			end)
+			item.preview = preview
+		end
 		local hl = item:CreateTexture(nil, "HIGHLIGHT")
 		hl:SetAllPoints(item); hl:SetTexture(0.3, 0.3, 0.8, 0.5)
 		item:SetScript("OnClick", function()
@@ -1468,6 +1697,10 @@ function LibWidgets.NewDropButton(parent, spec)
 			local item = menuItem(i)
 			item.value = vals[i]
 			item.label:SetText(labels[vals[i]] or vals[i])
+			if item.preview then
+				item.preview.value = vals[i]
+				if previews[vals[i]] then item.preview:Show() else item.preview:Hide() end
+			end
 			if item.swatch then
 				local path = swatches[vals[i]]
 				if path then

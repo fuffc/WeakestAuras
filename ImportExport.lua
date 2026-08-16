@@ -1,21 +1,5 @@
--- WeakestAuras -- copy-paste import/export of displays. Rides ClassicAPI's
--- C_EncodingUtil (SerializeCBOR -> CompressString(zlib) -> EncodeBase64 and the
--- three inverses), the exact chain pfUI's share.lua uses live on this client --
--- so WA2's Transmission.lua (LibSerialize + LibDeflate + custom base64) is
--- unnecessary. CBOR deserializes to plain data, so nothing here executes what it
--- decodes; what it must also not do is *hand* the engine a field the engine will
--- loadstring, which is what dropCode below enforces in both directions. Do NOT
--- add a Lua-source import path.
---
--- One field is knowingly outside that guard: a generic trigger's `customTrigger`
--- still travels, because sharing a custom trigger is the point of having one.
--- Receiving an aura is therefore a data-trust question for everything except
--- that -- see design/plans/SHARING_PLAN.md and drift.md §D2.
---
--- C_EncodingUtil is undocumented in ClassicAPI's API.md (present at runtime,
--- pfUI depends on it), so its presence is probed at load and import/export
--- degrades gracefully (buttons disabled / clear message) if a build lacks it.
-
+-- WeakestAuras -- copy-paste transport and reviewed display installation.
+-- C_EncodingUtil handles the local format; WA2 uses the transport helpers below.
 if WeakestAuras.disabled then return end
 
 local WA = WeakestAuras
@@ -42,18 +26,36 @@ local function encodeBody(payload)
 	return E.EncodeBase64(E.CompressString(E.SerializeCBOR(payload)))
 end
 
--- Fields the engine would loadstring, removed from a display. The text region's
--- customText is one, and it never travels: the receiving side would compile a
--- stranger's Lua. Enforced on the way in as well as stripped on the way out,
--- since a transport string can be assembled by hand.
-local function dropCode(display)
-	if type(display) ~= "table" then return end
-	display.customText = nil
+-- Which addon's export format a pasted string is, by prefix alone: "wa1"
+-- (ours), "wa2" (WeakAuras 2, !WA:2!), "wa2legacy" (WeakAuras' pre-2020 format,
+-- a bare leading !), or nil for anything else.
+--
+-- Order is load-bearing: !WA1! also begins with the bare ! the legacy format is
+-- recognised by, so ours has to be tested first or every WeakestAuras string
+-- classifies as a decade-old WeakAuras one.
+function WA.ClassifyImport(text)
+	if type(text) ~= "string" then return nil end
+	text = string.gsub(text, "%s", "")
+	if string.sub(text, 1, string.len(MAGIC)) == MAGIC then return "wa1" end
+	if string.find(text, "^!WA:%d+!") then return "wa2" end
+	if string.sub(text, 1, 1) == "!" then return "wa2legacy" end
+	return nil
 end
+
+-- Why a paste this file cannot read is unreadable, phrased for someone holding
+-- a string they got from a website. "Not a WeakestAuras export string" is true
+-- of a wago.io string and reads as "yours is corrupt", which sends people to
+-- re-copy a string that was never going to work.
+-- Kept short enough to wrap to two lines in the import dialog's status area
+-- rather than three; naming wago.io is what tells someone holding one of its
+-- strings why theirs is not corrupt.
+local CLASSIFY_REFUSAL = {
+	wa2 = "that is a WeakAuras string (wago.io). WeakestAuras cannot import those.",
+	wa2legacy = "that is a very old WeakAuras string. Re-export it from a current WeakAuras.",
+}
 
 -- Reverses encode; nil on a foreign/garbage/truncated string. The !WA1! prefix
 -- both identifies our format and lets this reject pfUI/WA2 strings cleanly.
--- Every import path decodes here, which is why the code strip lives here too.
 local function decode(text)
 	if not text then return nil end
 	text = string.gsub(text, "%s", "")
@@ -62,10 +64,6 @@ local function decode(text)
 		return E.DeserializeCBOR(E.DecompressString(E.DecodeBase64(string.sub(text, string.len(MAGIC) + 1))))
 	end)
 	if not ok or type(result) ~= "table" then return nil end
-	dropCode(result.d)
-	if type(result.c) == "table" then
-		for i = 1, table.getn(result.c) do dropCode(result.c[i]) end
-	end
 	return result
 end
 
@@ -80,7 +78,6 @@ local function cleanForExport(data)
 	local c = WA.DeepCopy(data)
 	c.parent = nil
 	c.controlledChildren = nil
-	dropCode(c)
 	return c
 end
 
@@ -128,27 +125,6 @@ function WA.FindByUID(uid)
 	return nil
 end
 
--- The id of the display this string is another copy of, plus whether it can be
--- updated in place. Lets the import dialog say so before anything is installed.
--- Groups answer false: replacing one means reconciling its children against the
--- incoming set, and a child held here but missing from the import has no safe
--- default -- keeping it leaves a stale aura, deleting it is irreversible.
-function WA.ImportInfo(str)
-	if not WA.hasImportExport then return nil end
-	local payload = decode(str)
-	if not payload or type(payload.d) ~= "table" then return nil end
-	local id = WA.FindByUID(payload.d.uid)
-	if not id then return nil end
-	local target = WeakestAurasDB.displays[id]
-	local canUpdate = not (WA.IsGroup(target) or WA.IsGroup(payload.d)
-		or type(payload.c) == "table")
-	return id, canUpdate
-end
-
--- Fields an update keeps from the display it replaces. Position and size are
--- yours rather than the author's -- upstream defaults its "Size & Position"
--- category off for the same reason -- and the id stays so an update never
--- renames an aura out from under the list. Everything else is replaced.
 local UPDATE_PRESERVED = {
 	id = true, uid = true, parent = true, controlledChildren = true,
 	anchorFrameType = true, anchorFrameFrame = true, anchorFrameParent = true,
@@ -157,87 +133,252 @@ local UPDATE_PRESERVED = {
 	scale = true, width = true, height = true,
 }
 
--- Replaces the display this string is a copy of, in place. Destructive by
--- design and only ever reached from its own button. The existing table is
--- mutated rather than swapped out, because the region and trigger state are
--- bound to it; WA.Add then recompiles it exactly as any options edit would.
-function WA.ImportOverwrite(str)
-	if not WA.hasImportExport then return nil, "C_EncodingUtil is not available on this client" end
-	local payload = decode(str)
-	if not payload then return nil, "not a WeakestAuras export string" end
-	if payload.m ~= "WeakestAuras" or type(payload.d) ~= "table" then
-		return nil, "unrecognized or wrong-format string"
-	end
-
-	local targetId, canUpdate = WA.ImportInfo(str)
-	if not targetId then return nil, "no aura here matches that one" end
-	if not canUpdate then return nil, "groups cannot be updated in place" end
-
-	local target = WeakestAurasDB.displays[targetId]
-	local incoming = payload.d
-	for k in pairs(target) do
-		if not UPDATE_PRESERVED[k] then target[k] = nil end
-	end
-	for k, v in pairs(incoming) do
-		if not UPDATE_PRESERVED[k] then target[k] = v end
-	end
-	WA.MergeDefaults(target)
-	WA.Add(target)
-	return targetId
+local function importReport(reason)
+	return { created = {}, dropped = {}, code = {}, refused = reason }
 end
 
--- Installs one imported display: fresh non-colliding id, stored, then
--- MergeDefaults (fills fields the exporter's version lacked, runs trigger
--- migrate; internalVersion-gated so a newer exporter's fields survive and an
--- older one's get defaulted). Returns the new id. Importing "Foo" twice never
--- overwrites: WA.UniqueId gives the second one "Foo 2".
-local function installDisplay(data, parentId)
+local function localPending(payload)
+	if type(payload) ~= "table" or payload.m ~= "WeakestAuras"
+		or type(payload.d) ~= "table" then
+		return nil, "unrecognized or wrong-format string"
+	end
+	local root = WA.DeepCopy(payload.d)
+	local children = {}
+	root.parent = nil
+	root.controlledChildren = nil
+	if payload.c ~= nil then
+		if type(payload.c) ~= "table" or not WA.IsGroup(root) then
+			return nil, "child displays require a group root"
+		end
+		for i = 1, table.getn(payload.c) do
+			if type(payload.c[i]) ~= "table" then
+				return nil, "child display " .. i .. " is not a table"
+			end
+			local child = WA.DeepCopy(payload.c[i])
+			child.parent = nil
+			child.controlledChildren = nil
+			table.insert(children, child)
+		end
+	end
+	return { root = root, children = children }
+end
+
+local function decodeWA2(text)
+	local bytes, err = WA.WA2Decode(text)
+	if not bytes then return nil, err end
+	local payload, why = WA.WA2Deserialize(bytes)
+	if not payload then return nil, why end
+	return payload
+end
+
+function WA.ImportPreview(str)
+	local class = WA.ClassifyImport(str)
+	local refusal = class == "wa2legacy" and CLASSIFY_REFUSAL[class] or nil
+	if refusal then return nil, importReport(refusal) end
+	if class == "wa1" then
+		local payload = decode(str)
+		if not payload then return nil, importReport("not a WeakestAuras export string") end
+		local pending, why = localPending(payload)
+		if not pending then return nil, importReport(why) end
+		local report = importReport(nil)
+		WA.CollectImportCode(pending.root, report, tostring(pending.root.id or "?") .. " - ")
+		for i = 1, table.getn(pending.children) do
+			local child = pending.children[i]
+			WA.CollectImportCode(child, report, tostring(child.id or "?") .. " - ")
+		end
+		report.format = class
+		return pending, report
+	end
+	if class == "wa2" then
+		local payload, why = decodeWA2(str)
+		if not payload then
+			return nil, importReport("WeakAuras string could not be imported: " .. tostring(why))
+		end
+		local pending, report = WA.WA2Translate(payload)
+		report.format = class
+		return pending, report
+	end
+	return nil, importReport("not a WeakestAuras export string")
+end
+
+local function canUpdatePending(pending)
+	return pending and pending.root and not WA.IsGroup(pending.root)
+		and table.getn(pending.children or {}) == 0
+end
+
+local function removeId(list, id)
+	for i = table.getn(list or {}), 1, -1 do
+		if list[i] == id then table.remove(list, i) end
+	end
+end
+
+local function installOne(data, parentId)
 	local base = data.id
 	if not base or base == "" then base = "Imported" end
 	local newId = WA.UniqueId(base)
 	data.id = newId
-	-- Identity survives the import, so a later one can be recognised as the same
-	-- aura. A uid already held here means this is a deliberate second copy and
-	-- gets a fresh one instead: Conditions.lua keys its compiled state by uid, so
-	-- two displays sharing one would overwrite each other's condition state.
-	if not data.uid or WA.FindByUID(data.uid) then
-		data.uid = WA.NewUID()
-	end
+	if not data.uid or WA.FindByUID(data.uid) then data.uid = WA.NewUID() end
 	data.parent = parentId
+	data.internalVersion = 3
 	WeakestAurasDB.displays[newId] = data
-	WA.MergeDefaults(data)
+	local ok, err = pcall(WA.MergeDefaults, data)
+	if not ok then
+		WeakestAurasDB.displays[newId] = nil
+		error(err, 0)
+	end
 	return newId
 end
 
--- Imports a transport string into a new display, live (WA.Add builds runtime
--- state + region immediately -- no reload). Returns the new id, or nil + reason.
--- No loadstring anywhere: the payload is data the engine consumes, never code.
+local function rollbackInstalled(installed)
+	for i = table.getn(installed), 1, -1 do
+		local data = installed[i]
+		if data.parent then
+			local parent = WeakestAurasDB.displays[data.parent]
+			if parent then removeId(parent.controlledChildren, data.id) end
+		else
+			removeId(WeakestAurasDB.order, data.id)
+		end
+		WeakestAurasDB.displays[data.id] = nil
+	end
+end
+
+-- A dynamic group's sortHybridTable names its children by id, and every id in an
+-- import is reassigned by WA.UniqueId. Keys naming a display that travelled in
+-- this same import move with it; anything else is a stale key the author's own
+-- profile carried and is left exactly as it arrived.
+--
+-- An anchor reference (`WeakestAuras:<id>`) is the same problem seen from the
+-- other side, and it has to be repaired here rather than at translation time:
+-- a display can be anchored to one installed *after* it -- the corpus's
+-- ComboFill1 anchors to a Cback1 that arrives twenty displays later -- so the
+-- map is only complete once the whole pack is in.
+local function remapChildIdKeys(installed, byOldId)
+	local prefix = WA.ANCHOR_AURA_PREFIX
+	for i = 1, table.getn(installed) do
+		local data = installed[i]
+		if type(data.sortHybridTable) == "table" then
+			local remapped = {}
+			for oldId, value in pairs(data.sortHybridTable) do
+				remapped[byOldId[oldId] or oldId] = value
+			end
+			data.sortHybridTable = remapped
+		end
+		if data.anchorFrameType == "SELECTFRAME" and type(data.anchorFrameFrame) == "string" then
+			local _, _, oldId = string.find(data.anchorFrameFrame, "^" .. prefix .. "(.+)$")
+			-- Only an id that travelled in this import is rewritten. One naming a
+			-- display already here is the user's own aura and is left alone; one
+			-- naming neither is a stale reference from the sender's profile, and
+			-- inventing a target for it would anchor the display to a stranger.
+			if oldId and byOldId[oldId] then
+				data.anchorFrameFrame = prefix .. byOldId[oldId]
+			end
+		end
+	end
+end
+
+function WA.InstallPendingImport(pending)
+	if type(pending) ~= "table" or type(pending.root) ~= "table" then
+		return nil, "no pending import"
+	end
+	if pending.confirmed then return nil, "import already confirmed" end
+	local root, children = pending.root, pending.children or {}
+	if table.getn(children) > 0 and not WA.IsGroup(root) then
+		return nil, "child displays require a group root"
+	end
+	local installed = {}
+	local ok, rootId = pcall(function()
+		WA.GetOrder()
+		-- A child's `parent` still names its group by the id it had in the export;
+		-- the map is what turns that into the id it was just given here. The list
+		-- is ordered parents-first, so a parent is always already in the map.
+		local byOldId = {}
+		local rootOldId = root.id
+		local id = installOne(root, nil)
+		table.insert(installed, root)
+		table.insert(WeakestAurasDB.order, id)
+		byOldId[rootOldId] = id
+		for i = 1, table.getn(children) do
+			local child = children[i]
+			local oldId, parentId = child.id, byOldId[child.parent] or id
+			child.parent = nil
+			local childId = installOne(child, nil)
+			table.insert(installed, child)
+			table.insert(WeakestAurasDB.order, childId)
+			byOldId[oldId] = childId
+			-- Reparenting through the primitive rather than writing the arrays:
+			-- it owns detach, the cycle guard and RefreshMembership. It answers
+			-- nothing, so the placement is read back rather than assumed.
+			WA.AddChildToGroup(parentId, childId)
+			if WeakestAurasDB.displays[childId].parent ~= parentId then
+				error("\"" .. childId .. "\" could not be placed in \"" .. parentId .. "\"", 0)
+			end
+		end
+		remapChildIdKeys(installed, byOldId)
+		WA.GetOrder()
+		WA.AddMany(installed)
+		return id
+	end)
+	if not ok then
+		rollbackInstalled(installed)
+		return nil, tostring(rootId)
+	end
+	pending.confirmed = rootId
+	return rootId
+end
+
+function WA.UpdatePendingImport(pending, targetId)
+	if not canUpdatePending(pending) then return nil, "groups cannot be updated in place" end
+	local target = WeakestAurasDB.displays[targetId]
+	if not target then return nil, "no aura here matches that one" end
+	local incoming = pending.root
+	local original = WA.DeepCopy(target)
+	for key in pairs(target) do
+		if not UPDATE_PRESERVED[key] then target[key] = nil end
+	end
+	for key, value in pairs(incoming) do
+		if not UPDATE_PRESERVED[key] then target[key] = WA.DeepCopy(value) end
+	end
+	target.id, target.uid, target.parent = targetId, original.uid, original.parent
+	target.internalVersion = 3
+	local ok, err = pcall(WA.MergeDefaults, target)
+	if not ok then
+		for key in pairs(target) do target[key] = nil end
+		for key, value in pairs(original) do target[key] = value end
+		return nil, tostring(err)
+	end
+	WA.Add(target)
+	pending.confirmed = targetId
+	return targetId
+end
+
+function WA.ConfirmImport(pending, mode, targetId)
+	if mode == "update" then return WA.UpdatePendingImport(pending, targetId) end
+	return WA.InstallPendingImport(pending)
+end
+
+function WA.ImportInfo(str)
+	if not WA.hasImportExport then return nil end
+	local pending, report = WA.ImportPreview(str)
+	if not pending or report.refused then return nil end
+	local id = WA.FindByUID(pending.root.uid)
+	if not id then return nil end
+	return id, canUpdatePending(pending)
+end
+
+function WA.ImportOverwrite(str)
+	if not WA.hasImportExport then return nil, "C_EncodingUtil is not available on this client" end
+	local class = WA.ClassifyImport(str)
+	if class == "wa2legacy" then return nil, CLASSIFY_REFUSAL[class] end
+	local pending, report = WA.ImportPreview(str)
+	if not pending or report.refused then return nil, report.refused or "not a WeakestAuras export string" end
+	local targetId = WA.FindByUID(pending.root.uid)
+	if not targetId then return nil, "no aura here matches that one" end
+	return WA.UpdatePendingImport(pending, targetId)
+end
+
 function WA.Import(str)
 	if not WA.hasImportExport then return nil, "C_EncodingUtil is not available on this client" end
-	local payload = decode(str)
-	if not payload then return nil, "not a WeakestAuras export string" end
-	if payload.m ~= "WeakestAuras" or type(payload.d) ~= "table" then
-		return nil, "unrecognized or wrong-format string"
-	end
-
-	local root = payload.d
-	local newId = installDisplay(root, nil)
-	-- GetOrder self-heals: it appends any top-level display order doesn't know
-	-- about yet, so a fresh import lands at the end of the list on next read.
-	WA.GetOrder()
-
-	if type(payload.c) == "table" and WA.IsGroup(root) then
-		root.controlledChildren = {}
-		local imported = { root }
-		for i = 1, table.getn(payload.c) do
-			local child = payload.c[i]
-			local childId = installDisplay(child, newId)
-			table.insert(root.controlledChildren, childId)
-			table.insert(imported, child)
-		end
-		WA.AddMany(imported)
-	else
-		WA.Add(root)
-	end
-	return newId
+	local pending, report = WA.ImportPreview(str)
+	if not pending or report.refused then return nil, report.refused or "not a WeakestAuras export string" end
+	return WA.InstallPendingImport(pending)
 end

@@ -55,6 +55,9 @@ local S = {
 	FALLBACK_ICON = "Interface\\Icons\\INV_Misc_QuestionMark",
 	SEARCH_H = 26, -- search box height (20) + gap above the list (6)
 	TOOLBAR_H = 26, -- toolbar button row (22 tall + 4 gap) above the search box
+	TAB_ROW_H = 22, -- one row of the tab strip
+	TAB_ROW_GAP = 4, -- between two rows of a wrapped strip
+	TAB_TO_CONTENT = 6, -- gap below the strip's last row
 	BOTTOM_RESERVED = 12, -- bottom margin only; the list runs to the panel's edge
 	-- MIN_W = left inset + LIST_W + gap + CONTENT_W + right inset, i.e. the
 	-- narrowest window that still gives the list its minimum beside a
@@ -66,17 +69,22 @@ local S = {
 		{ key = "display", name = "Display" },
 		{ key = "trigger", name = "Trigger" },
 		{ key = "conditions", name = "Conditions" },
+		{ key = "animation", name = "Animations" },
+		{ key = "action", name = "Actions" },
 		{ key = "load", name = "Load" },
+		{ key = "config", name = "Custom" },
 	},
 	-- The context menu's Copy settings submenu, mirroring upstream's less the
-	-- parts this addon has no subsystem for (actions, animations, author
-	-- options, custom config). A group offers the single "Group" entry: it has
+	-- parts this addon has no subsystem for (author options, custom
+	-- config). A group offers the single "Group" entry: it has
 	-- no triggers, conditions or load of its own to copy.
 	COPY_PARTS_LEAF = {
 		{ text = "Everything", part = "all", paste = "Paste Settings" },
 		{ text = "Display", part = "display", paste = "Paste Display Settings" },
 		{ text = "Trigger", part = "trigger", paste = "Paste Trigger Settings" },
 		{ text = "Conditions", part = "condition", paste = "Paste Condition Settings" },
+		{ text = "Animations", part = "animation", paste = "Paste Animation Settings" },
+		{ text = "Actions", part = "action", paste = "Paste Action Settings" },
 		{ text = "Load", part = "load", paste = "Paste Load Settings" },
 	},
 	COPY_PARTS_GROUP = {
@@ -87,7 +95,7 @@ local S = {
 	-- absent -- the text/border/glow *are* the display here, and a copy that
 	-- dropped them would surprise.
 	COPY_IGNORE = {
-		triggers = true, conditions = true, load = true,
+		triggers = true, conditions = true, animation = true, actions = true, load = true,
 		id = true, parent = true, controlledChildren = true,
 		uid = true, internalVersion = true,
 	},
@@ -194,9 +202,7 @@ function S.applySelectionChange()
 		S.activeTab = "new"
 	elseif S.activeTab == "new" and table.getn(S.selection) > 0 then
 		S.activeTab = "info"
-		for i = 1, table.getn(S.tabButtons or {}) do
-			S.tabButtons[i].setSelected(S.tabButtons[i].key == "info")
-		end
+		if S.tabStrip then S.tabStrip.select("info") end
 	end
 	S.refreshTabContent()
 end
@@ -385,6 +391,7 @@ function S.copyAuraPart(source, dest, part)
 	if WA.IsGroup(source) then return end
 	if part == "trigger" or all then dest.triggers = WA.DeepCopy(source.triggers) end
 	if part == "condition" or all then dest.conditions = WA.DeepCopy(source.conditions) end
+	if part == "action" or all then dest.actions = WA.DeepCopy(source.actions) end
 	if part == "load" or all then dest.load = WA.DeepCopy(source.load) end
 end
 
@@ -865,12 +872,13 @@ end
 
 -- ---------------------------------------------------------------------------
 -- Conditions tab: edits data.conditions -- each is a check
--- (trigger/variable/op/value) plus a list of property changes. The vocabulary
--- (checkable variables, changeable properties) is pulled from the engine
--- (WA.GetConditionTemplates / WA.GetProperties / WA.globalConditions) so a new
--- trigger or region property shows up here for free. Structural edits (add/
--- remove a condition or change, or switching a variable/property whose type
--- changes the value widget) re-render the tab via S.refreshTabContent.
+-- (trigger/variable/op/value), optionally an AND/OR tree, plus a list of
+-- property changes. The vocabulary (checkable variables, changeable
+-- properties) is pulled from the engine (WA.GetConditionTemplates /
+-- WA.GetProperties / WA.globalConditions) so a new trigger or region property
+-- shows up here for free. Structural edits (add/remove a condition, nested
+-- check or change, or switching a variable/property whose type changes the
+-- value widget) re-render the tab via S.refreshTabContent.
 -- ---------------------------------------------------------------------------
 
 function S.sortedKeys(map)
@@ -880,11 +888,16 @@ function S.sortedKeys(map)
 	return out
 end
 
--- (type, template) for a check's variable: a global condition when trigger is
--- -1, otherwise the trigger's condition template. Defaults keep the editor
--- functional even if a saved variable no longer exists.
+-- (type, template) for a check's variable: a combination pseudo-trigger at
+-- -2, a global condition at -1, otherwise the trigger's condition template.
+-- Defaults keep the editor functional even if a saved variable no longer exists.
+local CONDITION_COMBINATION_VALUES = { "AND", "OR" }
+local CONDITION_COMBINATION_LABELS = { AND = "All of", OR = "Any of" }
+
 function S.conditionVarType(check, templates)
-	if check.trigger == -1 then
+	if check.trigger == -2 then
+		return "combination", nil
+	elseif check.trigger == -1 then
 		local g = WA.globalConditions[check.variable]
 		return g and g.type or "bool", g
 	end
@@ -895,6 +908,9 @@ end
 
 -- Sorted variable keys + display labels for a trigger (or the global set).
 function S.conditionVariableList(trigger, templates)
+	if trigger == -2 then
+		return CONDITION_COMBINATION_VALUES, CONDITION_COMBINATION_LABELS
+	end
 	local map = (trigger == -1) and WA.globalConditions or ((templates and templates[trigger]) or {})
 	local vals = S.sortedKeys(map)
 	local labels = {}
@@ -907,7 +923,8 @@ function S.defaultOpValue(vtype, template)
 	if vtype == "timer" or vtype == "elapsedTimer" then return "<", 5
 	elseif vtype == "number" then return ">=", 1
 	elseif vtype == "bool" then return "==", true
-	elseif vtype == "select" then return "==", (template and template.values and template.values[1]) or "" end
+	elseif vtype == "select" then return "==", (template and template.values and template.values[1]) or ""
+	elseif vtype == "combination" then return nil, nil end
 	return "==", ""
 end
 
@@ -922,12 +939,13 @@ function S.defaultPropertyValue(pentry)
 end
 
 -- Appends the op/value editor for a check, picking the widget by variable type.
-local function appendCheckValue(fields, data, check, vtype, template)
+local function appendCheckValue(fields, data, check, vtype, template, indent)
+	if vtype == "combination" then return end
 	if vtype == "number" or vtype == "timer" or vtype == "elapsedTimer" then
 		local label = vtype == "timer" and "Remaining (s)"
 			or (vtype == "elapsedTimer" and "Elapsed (s)" or "Value")
 		table.insert(fields, {
-			type = "opnumber", name = label,
+			type = "opnumber", name = label, indent = indent,
 			getOp = function() return check.op or ">=" end,
 			setOp = function(v) check.op = v; WA.Add(data) end,
 			getVal = function() return check.value end,
@@ -935,24 +953,26 @@ local function appendCheckValue(fields, data, check, vtype, template)
 		})
 	elseif vtype == "bool" then
 		table.insert(fields, {
-			type = "toggle", name = "Is true",
+			type = "toggle", name = "Is true", indent = indent,
 			get = function() return check.value == true or check.value == "true" end,
 			set = function(v) check.op = "=="; check.value = v and true or false; WA.Add(data) end,
 		})
 	elseif vtype == "select" then
 		table.insert(fields, {
-			type = "select", name = "Value", values = (template and template.values) or {},
+			type = "select", name = "Value", indent = indent,
+			values = (template and template.values) or {},
 			get = function() return check.value end,
 			set = function(v) check.op = "=="; check.value = v; WA.Add(data) end,
 		})
 	else -- string
 		table.insert(fields, {
-			type = "select", name = "Op", half = true, values = { "==", "~=" },
+			type = "select", name = "Op", half = true, indent = indent,
+			values = { "==", "~=" },
 			get = function() return check.op or "==" end,
 			set = function(v) check.op = v; WA.Add(data) end,
 		})
 		table.insert(fields, {
-			type = "input", name = "Value", half = true,
+			type = "input", name = "Value", half = true, indent = indent,
 			get = function() return check.value end,
 			set = function(v) check.value = v; WA.Add(data) end,
 		})
@@ -962,6 +982,32 @@ end
 -- Appends the value widget for one property change, picked by property type.
 local function appendChangeValue(fields, data, change, pentry)
 	local ptype = pentry and pentry.type
+	if pentry and pentry.action then
+		if ptype == "sound" and WA.ActionSoundFields then
+			local value = change.value or {}
+			WA.ActionSoundFields(fields, data, value, true)
+		elseif ptype == "chat" and WA.ActionMessageFields then
+			local value = change.value or {}
+			WA.ActionMessageFields(fields, data, value, "condition", true)
+		elseif ptype == "customcode" then
+			table.insert(fields, { type = "code", height = 80, name = "Custom Code",
+				get = function() return change.value end,
+				set = function(v) change.value = v; WA.Add(data) end })
+		elseif ptype == "glowexternal" then
+			table.insert(fields, { type = "select", name = "Glow Action", values = { "show", "hide" },
+				get = function() return change.value and change.value.glow_action or "show" end,
+				set = function(v) change.value = change.value or {}; change.value.glow_action = v; WA.Add(data) end })
+			table.insert(fields, { type = "select", name = "Frame Type", values = { "PARENTFRAME", "FRAMESELECTOR" },
+				get = function() return change.value and change.value.glow_frame_type or "PARENTFRAME" end,
+				set = function(v) change.value = change.value or {}; change.value.glow_frame_type = v; WA.Add(data) end })
+		if change.value and change.value.glow_frame_type == "FRAMESELECTOR" then
+			table.insert(fields, { type = "input", name = "Frame Name",
+				get = function() return change.value.glow_frame end,
+				set = function(v) change.value.glow_frame = v; WA.Add(data) end })
+		end
+		end
+		return
+	end
 	if ptype == "bool" then
 		table.insert(fields, {
 			type = "toggle", name = "Value", half = true,
@@ -1005,12 +1051,14 @@ function S.appendConditionOptions(fields, data)
 	local props = WA.GetProperties(data)
 	local numTriggers = table.getn(data.triggers or {})
 
-	-- Trigger dropdown: each trigger number, plus Global (-1).
+	-- Trigger dropdown: Combinations (-2), each trigger number, plus Global (-1).
 	local trigVals, trigLabels = {}, {}
 	for n = 1, numTriggers do
 		table.insert(trigVals, tostring(n))
 		trigLabels[tostring(n)] = "Trigger " .. n
 	end
+	table.insert(trigVals, 1, "-2")
+	trigLabels["-2"] = "Combinations"
 	table.insert(trigVals, "-1")
 	trigLabels["-1"] = "Global"
 
@@ -1018,6 +1066,89 @@ function S.appendConditionOptions(fields, data)
 	local propVals = S.sortedKeys(props)
 	local propLabels = {}
 	for i = 1, table.getn(propVals) do propLabels[propVals[i]] = props[propVals[i]].display end
+
+	local function newConditionCheck()
+		local trigger = numTriggers >= 1 and 1 or -1
+		local check = { trigger = trigger }
+		local vars = S.conditionVariableList(trigger, templates)
+		check.variable = vars[1]
+		local vt, tmpl = S.conditionVarType(check, templates)
+		check.op, check.value = S.defaultOpValue(vt, tmpl)
+		return check
+	end
+
+	local appendConditionCheck
+	appendConditionCheck = function(out, check, parent, childIndex, depth)
+		depth = depth or 0
+
+		local function setTrigger(v)
+			local trigger = tonumber(v)
+			check.trigger = trigger
+			if trigger == -2 then
+				if check.variable ~= "AND" and check.variable ~= "OR" then check.variable = "AND" end
+				check.op, check.value = nil, nil
+				check.checks = check.checks or { newConditionCheck() }
+			else
+				check.checks = nil
+				local vars = S.conditionVariableList(trigger, templates)
+				check.variable = vars[1]
+				local vt, tmpl = S.conditionVarType(check, templates)
+				check.op, check.value = S.defaultOpValue(vt, tmpl)
+			end
+			WA.Add(data); S.refreshTabContent()
+		end
+
+		local triggerField = {
+			type = "select", name = "Trigger", half = true, indent = depth,
+			values = trigVals, labels = trigLabels,
+			get = function() return tostring(check.trigger or 1) end,
+			set = setTrigger,
+		}
+		if parent then
+			triggerField.actions = { W.DeleteAction(function()
+				table.remove(parent.checks, childIndex)
+				WA.Add(data); S.refreshTabContent()
+			end) }
+		end
+		table.insert(out, triggerField)
+
+		local varVals, varLabels = S.conditionVariableList(check.trigger, templates)
+		table.insert(out, {
+			type = "select", name = "Variable", half = true, indent = depth,
+			values = varVals, labels = varLabels,
+			get = function() return check.variable end,
+			set = function(v)
+				check.variable = v
+				if check.trigger == -2 then
+					check.op, check.value = nil, nil
+					check.checks = check.checks or { newConditionCheck() }
+				else
+					check.checks = nil
+					local vt, tmpl = S.conditionVarType(check, templates)
+					check.op, check.value = S.defaultOpValue(vt, tmpl)
+				end
+				WA.Add(data); S.refreshTabContent()
+			end,
+		})
+
+		local vtype, template = S.conditionVarType(check, templates)
+		appendCheckValue(out, data, check, vtype, template, depth)
+
+		if check.trigger == -2 then
+			check.checks = check.checks or {}
+			for i = 1, table.getn(check.checks) do
+				if not check.checks[i] then check.checks[i] = newConditionCheck() end
+				appendConditionCheck(out, check.checks[i], check, i, depth + 1)
+			end
+			table.insert(out, {
+				type = "button", name = "+ Add nested check", indent = depth,
+				onClick = function()
+					table.insert(check.checks, newConditionCheck())
+					WA.Add(data); S.refreshTabContent()
+				end,
+			})
+		end
+	end
 
 	for ci = 1, table.getn(data.conditions) do
 		local cond = data.conditions[ci]
@@ -1033,44 +1164,17 @@ function S.appendConditionOptions(fields, data)
 		local collapsed = S.isCollapsed(data, key, table.getn(data.conditions) > 1)
 		table.insert(fields, {
 			type = "header", name = "Condition " .. idx, collapsed = collapsed,
+			actions = W.ListActions(data.conditions, idx, function()
+				S.clearCollapsed(data, "cond:")
+				WA.Add(data); S.refreshTabContent()
+			end),
 			onToggle = function()
 				S.setCollapsed(data, key, not collapsed)
 				S.refreshTabContent()
 			end,
-			onDelete = function()
-				table.remove(data.conditions, idx)
-				S.clearCollapsed(data, "cond:")
-				WA.Add(data); S.refreshTabContent()
-			end,
 		})
 		if not collapsed then
-			table.insert(fields, {
-				type = "select", name = "Trigger", half = true, values = trigVals, labels = trigLabels,
-				get = function() return tostring(check.trigger or 1) end,
-				set = function(v)
-					check.trigger = tonumber(v)
-					local vars = S.conditionVariableList(check.trigger, templates)
-					check.variable = vars[1]
-					local vt, tmpl = S.conditionVarType(check, templates)
-					check.op, check.value = S.defaultOpValue(vt, tmpl)
-					WA.Add(data); S.refreshTabContent()
-				end,
-			})
-
-			local varVals, varLabels = S.conditionVariableList(check.trigger, templates)
-			table.insert(fields, {
-				type = "select", name = "Variable", half = true, values = varVals, labels = varLabels,
-				get = function() return check.variable end,
-				set = function(v)
-					check.variable = v
-					local vt, tmpl = S.conditionVarType(check, templates)
-					check.op, check.value = S.defaultOpValue(vt, tmpl)
-					WA.Add(data); S.refreshTabContent()
-				end,
-			})
-
-			local vtype, template = S.conditionVarType(check, templates)
-			appendCheckValue(fields, data, check, vtype, template)
+			appendConditionCheck(fields, check, nil, nil, 0)
 
 			for chi = 1, table.getn(cond.changes) do
 				local change = cond.changes[chi]
@@ -1108,13 +1212,7 @@ function S.appendConditionOptions(fields, data)
 		type = "button", name = "+ Add Condition",
 		onClick = function()
 			data.conditions = data.conditions or {}
-			local trigger = numTriggers >= 1 and 1 or -1
-			local check = { trigger = trigger }
-			local vars = S.conditionVariableList(trigger, templates)
-			check.variable = vars[1]
-			local vt, tmpl = S.conditionVarType(check, templates)
-			check.op, check.value = S.defaultOpValue(vt, tmpl)
-			table.insert(data.conditions, { check = check, changes = {} })
+			table.insert(data.conditions, { check = newConditionCheck(), changes = {} })
 			WA.Add(data); S.refreshTabContent()
 		end,
 	})
@@ -1352,6 +1450,105 @@ function S.appendTriggerOptions(fields, data)
 			WA.Add(data); S.refreshTabContent()
 		end,
 	})
+end
+
+function S.appendActionOptions(fields, data)
+	data.actions = data.actions or {}
+	data.actions.init = data.actions.init or {}
+	data.actions.start = data.actions.start or {}
+	data.actions.finish = data.actions.finish or {}
+	local function codeField(block, enabled, source, name)
+		local out = {
+			type = "toggle", name = name,
+			get = function() return block[enabled] and true or false end,
+			set = function(v) block[enabled] = v and true or false; WA.Add(data); S.refreshTabContent() end,
+		}
+		local fields = { out }
+		if block[enabled] then
+			table.insert(fields, {
+				type = "code", height = 80, name = source,
+				get = function() return block[source] end,
+				set = function(v) block[source] = v; WA.Add(data) end,
+			})
+		end
+		return fields
+	end
+
+	table.insert(fields, { type = "header", name = "Custom Functions" })
+	local initFields = codeField(data.actions.init, "do_custom", "custom", "Custom Init")
+	for i = 1, table.getn(initFields) do table.insert(fields, initFields[i]) end
+	local loadFields = codeField(data.actions.init, "do_custom_load", "customOnLoad", "Custom On Load")
+	for i = 1, table.getn(loadFields) do table.insert(fields, loadFields[i]) end
+	local unloadFields = codeField(data.actions.init, "do_custom_unload", "customOnUnload", "Custom On Unload")
+	for i = 1, table.getn(unloadFields) do table.insert(fields, unloadFields[i]) end
+
+	table.insert(fields, { type = "header", name = "On Show" })
+	if WA.ActionMessageFields then WA.ActionMessageFields(fields, data, data.actions.start, "start") end
+	if WA.ActionSoundFields then WA.ActionSoundFields(fields, data, data.actions.start) end
+	local startFields = codeField(data.actions.start, "do_custom", "custom", "Custom Code")
+	for i = 1, table.getn(startFields) do table.insert(fields, startFields[i]) end
+
+	table.insert(fields, { type = "header", name = "On Hide" })
+	if WA.ActionMessageFields then WA.ActionMessageFields(fields, data, data.actions.finish, "finish") end
+	if WA.ActionSoundFields then WA.ActionSoundFields(fields, data, data.actions.finish) end
+	local finishFields = codeField(data.actions.finish, "do_custom", "custom", "Custom Code")
+	for i = 1, table.getn(finishFields) do table.insert(fields, finishFields[i]) end
+end
+
+function S.appendAnimationOptions(fields, data)
+	data.animation = data.animation or {}
+	local blocks = { "start", "main", "finish" }
+	local names = { start = "Start", main = "Main", finish = "Finish" }
+	for i = 1, table.getn(blocks) do
+		local key = blocks[i]
+		local block = data.animation[key] or { type = "none", duration_type = "seconds" }
+		data.animation[key] = block
+		table.insert(fields, { type = "header", name = names[key] })
+		table.insert(fields, {
+			type = "select", name = "Type", values = WA.anim_type_values, labels = WA.anim_types,
+			get = function() return block.type or "none" end,
+			set = function(v) block.type = v; WA.Add(data, true); S.refreshTabContent() end,
+		})
+		if block.type == "preset" then
+			local values = key == "start" and WA.anim_start_preset_values or key == "main" and WA.anim_main_preset_values or WA.anim_finish_preset_values
+			local labels = key == "start" and WA.anim_start_preset_types or key == "main" and WA.anim_main_preset_types or WA.anim_finish_preset_types
+			table.insert(fields, { type = "select", name = "Preset", values = values, labels = labels,
+				get = function() return block.preset end,
+				set = function(v) block.preset = v; block.type = "preset"; WA.Add(data, true) end })
+		end
+		if block.type == "custom" then
+			local durationValues = key == "finish" and WA.duration_values_no_choice or WA.duration_values
+			local durationLabels = key == "finish" and WA.duration_types_no_choice or WA.duration_types
+			table.insert(fields, { type = "select", name = "Time In", values = durationValues, labels = durationLabels,
+				get = function() return block.duration_type or "seconds" end,
+				set = function(v) block.duration_type = v; WA.Add(data, true) end })
+			table.insert(fields, { type = "input", name = "Duration", get = function() return tostring(block.duration or "") end,
+				set = function(v) block.duration = v; WA.Add(data, true) end })
+			table.insert(fields, { type = "select", name = "Ease Type", values = WA.anim_ease_values, labels = WA.anim_ease_types,
+				get = function() return block.easeType or "none" end,
+				set = function(v) block.easeType = v; WA.Add(data, true) end })
+			local function slot(use, label, types, capability, prefix)
+				if capability and not capability() then return end
+				table.insert(fields, { type = "toggle", name = label, get = function() return block[use] end,
+					set = function(v) block[use] = v and true or false; WA.Add(data, true); S.refreshTabContent() end })
+				if block[use] then
+					local typeValues = prefix == "alpha" and WA.anim_alpha_values
+						or prefix == "translate" and WA.anim_translate_values
+						or prefix == "scale" and WA.anim_scale_values
+						or prefix == "rotate" and WA.anim_rotate_values
+						or WA.anim_color_values
+					local typeLabels = types
+					table.insert(fields, { type = "select", name = "Type", values = typeValues, labels = typeLabels, get = function() return block[prefix .. "Type"] end,
+						set = function(v) block[prefix .. "Type"] = v; WA.Add(data, true) end })
+				end
+			end
+			slot("use_alpha", key == "start" and "Fade In" or key == "finish" and "Fade Out" or "Fade", WA.anim_alpha_types, function() return true end, "alpha")
+			slot("use_translate", key == "start" and "Slide In" or key == "finish" and "Slide Out" or "Slide", WA.anim_translate_types, function() return true end, "translate")
+			slot("use_scale", "Zoom", WA.anim_scale_types, function() return WA.GetRegion(data.id, "").Scale ~= nil end, "scale")
+			slot("use_rotate", "Rotate", WA.anim_rotate_types, function() return WA.GetRegion(data.id, "").SetAnimRotation ~= nil end, "rotate")
+			slot("use_color", "Colour", WA.anim_color_types, function() return WA.GetRegion(data.id, "").Color ~= nil end, "color")
+		end
+	end
 end
 
 -- Paints S.content and resizes it to fit, so the surrounding scroll frame gets
@@ -1592,11 +1789,10 @@ function S.newPaneSample(regionType)
 	return sample
 end
 
+-- The New pane belongs to no tab, so nothing in the strip is lit while it is up.
 function S.openNewPane()
 	S.activeTab = "new"
-	for i = 1, table.getn(S.tabButtons or {}) do
-		S.tabButtons[i].setSelected(false)
-	end
+	if S.tabStrip then S.tabStrip.select(nil) end
 	S.refreshTabContent()
 end
 
@@ -1644,36 +1840,62 @@ function S.refreshTabContent()
 		local fields = {}
 		S.appendConditionOptions(fields, data)
 		paintContent(fields)
+	elseif S.activeTab == "animation" then
+		local fields = {}
+		S.appendAnimationOptions(fields, data)
+		paintContent(fields)
+	elseif S.activeTab == "action" then
+		local fields = {}
+		S.appendActionOptions(fields, data)
+		paintContent(S.collapsibleSections(fields, data, "actions:"))
 	elseif S.activeTab == "load" then
 		local fields = {}
 		S.appendLoadOptions(fields, data)
+		paintContent(fields)
+	elseif S.activeTab == "config" then
+		local fields = {}
+		WA.CustomOptionsFields(fields, data)
 		paintContent(fields)
 	else
 		paintContent(S.getInfoOptions(data))
 	end
 end
 
--- Groups have no trigger of their own (see WA.IsGroup in Data.lua), so the
--- Trigger tab doesn't apply to one -- hides the button, and steps off it back
--- to Info if it was the active tab when the selection changed onto a group.
--- (Text editing lives under Display, which every region -- group or leaf -- has.)
+-- Groups have no trigger and no runtime state, so five of the tabs don't apply
+-- to one. (Text editing lives under Display, which every region -- group or leaf
+-- -- has.)
+local LEAF_ONLY_TABS = {
+	trigger = true, conditions = true, animation = true, action = true, load = true,
+}
+
+-- Hands the strip the tab list with the inapplicable ones marked hidden, which
+-- is what makes it reflow over the tabs that remain. Hiding a button in place
+-- would leave its slot behind: a tab is anchored to its predecessor and anchors
+-- resolve against hidden frames, so a group's strip would read as two tabs and
+-- five tab-shaped holes.
+function S.rebuildTabs()
+	local data = S.primaryId() and WeakestAurasDB.displays[S.primaryId()]
+	local isGroup = data and WA.IsGroup(data)
+	local list = {}
+	for i = 1, table.getn(S.TAB_DEFS) do
+		local def = S.TAB_DEFS[i]
+		list[i] = {
+			value = def.key, text = def.name,
+			hidden = isGroup and LEAF_ONLY_TABS[def.key] or false,
+		}
+	end
+	S.tabStrip.setTabs(list)
+end
+
+-- Steps off a tab that has just stopped applying, back to Info.
 function S.updateTabAvailability()
 	local data = S.primaryId() and WeakestAurasDB.displays[S.primaryId()]
 	local isGroup = data and WA.IsGroup(data)
-	for i = 1, table.getn(S.tabButtons) do
-		local tb = S.tabButtons[i]
-		-- Groups have no trigger and no runtime state, so the Trigger,
-		-- Conditions and Load tabs don't apply to one.
-		if tb.key == "trigger" or tb.key == "conditions" or tb.key == "load" then
-			if isGroup then tb:Hide() else tb:Show() end
-		end
-	end
-	if isGroup and (S.activeTab == "trigger" or S.activeTab == "conditions" or S.activeTab == "load") then
+	if isGroup and LEAF_ONLY_TABS[S.activeTab] then
 		S.activeTab = "info"
-		for i = 1, table.getn(S.tabButtons) do
-			S.tabButtons[i].setSelected(S.tabButtons[i].key == "info")
-		end
 	end
+	S.rebuildTabs()
+	S.tabStrip.select(S.activeTab)
 end
 
 -- Status icons, pooled across every row rather than per row -- see the strip in
@@ -2068,12 +2290,28 @@ function S.refreshList()
 	end
 end
 
+-- Where the tab strip's top edge sits, measured down from the panel's top. The
+-- strip grows downward from here and the content pane starts below whatever it
+-- ends up occupying, so this is the one fixed number of the pair.
+function S.tabStripTop()
+	return 36 + S.SEARCH_H + S.TOOLBAR_H
+end
+
+-- Puts the content pane's top edge under a strip of `rows` rows. Called at build
+-- with one row and from the strip's onReflow after that; a group hiding five
+-- tabs collapses to one row and hands the second row's height back to the
+-- content pane. contentBg is anchored to contentScroll and follows for free.
+function S.anchorContent(rows)
+	if rows < 1 then rows = 1 end
+	local stripH = rows * S.TAB_ROW_H + (rows - 1) * S.TAB_ROW_GAP
+	S.contentScroll:SetPoint("TOPRIGHT", S.panel, "TOPRIGHT", -14,
+		-(S.tabStripTop() + stripH + S.TAB_TO_CONTENT))
+end
+
 function S.selectTab(key)
 	S.searchBox:ClearFocus()
 	S.activeTab = key
-	for i = 1, table.getn(S.tabButtons) do
-		S.tabButtons[i].setSelected(S.tabButtons[i].key == key)
-	end
+	S.tabStrip.select(key)
 	S.refreshTabContent()
 end
 
@@ -2096,8 +2334,12 @@ end
 
 function S.ensureIEDialog()
 	if S.ieDialog then return S.ieDialog end
+	-- Function-scoped rather than chunk-level: a local here would count against
+	-- buildPanel's upvalue budget, which is already at Lua 5.0's limit (see the
+	-- S-table note at the top of this file).
+	local DIALOG_W = 480
 	local f = CreateFrame("Frame", "WeakestAurasIEDialog", UIParent)
-	f:SetWidth(480); f:SetHeight(360)
+	f:SetWidth(DIALOG_W); f:SetHeight(360)
 	f:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
 	f:SetBackdrop(W.PANEL_BACKDROP)
 	f:SetBackdropColor(0, 0, 0, 1)
@@ -2121,28 +2363,53 @@ function S.ensureIEDialog()
 
 	local box = LibWidgets.NewMultiLineEditBox(f, {
 		width = 456, height = 250,
-		onChange = function(text) S.refreshImportNotice(f, text) end,
+		-- Editing the box after a preview throws the pending tree away, so that
+		-- Confirm can never install something other than what was reviewed.
+		--
+		-- Recognising our own write by content, not by a flag raised around
+		-- `setText`: this client does not deliver a scripted SetText's
+		-- OnTextChanged inside the call, so any such flag is already lowered by
+		-- the time the change lands and the summary reads as the user having
+		-- retyped the box -- which discards the tree one frame after it was
+		-- built and leaves Confirm re-parsing its own report.
+		onChange = function(text)
+			if f.preview then
+				if text == f.previewText then return end
+				f.pending, f.report, f.preview = nil, nil, nil
+				f.confirmMode, f.importText, f.previewText = nil, nil, nil
+			end
+			S.refreshImportNotice(f, text)
+		end,
 	})
 	box:SetPoint("TOPLEFT", 12, -40)
 	f.box = box
 
+	-- A refusal reason runs past one line, and **SetWidth is what makes a
+	-- FontString wrap here** -- anchoring both horizontal edges gives it a
+	-- layout width without wrapping anything, and the text is then cut instead.
+	-- The text region relies on the same rule from the other side: it clears the
+	-- width with SetWidth(0) precisely to stop a string wrapping.
+	--
+	-- One anchor, not two: with an explicit width a second horizontal point
+	-- constrains the same axis twice. Anchoring at the BOTTOM leaves the height
+	-- free to grow upward as lines are added.
 	local status = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-	status:SetPoint("BOTTOMLEFT", 14, 18)
-	status:SetPoint("RIGHT", f, "RIGHT", -104, 0)
+	status:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", 14, 18)
+	status:SetWidth(DIALOG_W - 14 - 104)
 	status:SetJustifyH("LEFT")
+	status:SetJustifyV("BOTTOM")
 	f.status = status
 
 	local loadBtn = W.button(f, "Import", nil)
 	loadBtn:SetWidth(84)
 	loadBtn:SetPoint("BOTTOMRIGHT", -12, 12)
 	loadBtn:SetScript("OnClick", function()
-		local newId, err = WA.Import(f.box.getText())
-		if newId then
-			f:Hide()
-			S.setSelection(newId)
+		if f.pending then
+			local id, err = WA.ConfirmImport(f.pending, f.confirmMode, f.duplicateOf)
+			if id then f:Hide(); S.refreshList(); S.setSelection(id)
+			else f.status:SetText("Import failed: " .. (err or "unknown")); f.status:SetTextColor(1, 0.4, 0.4) end
 		else
-			f.status:SetText("Import failed: " .. (err or "unknown"))
-			f.status:SetTextColor(1, 0.4, 0.4)
+			S.stageImport(f, "copy")
 		end
 	end)
 	f.loadBtn = loadBtn
@@ -2151,21 +2418,63 @@ function S.ensureIEDialog()
 	updateBtn:SetWidth(84)
 	updateBtn:SetPoint("RIGHT", loadBtn, "LEFT", -8, 0)
 	updateBtn:SetScript("OnClick", function()
-		local id, err = WA.ImportOverwrite(f.box.getText())
-		if id then
-			f:Hide()
-			S.refreshList()
-			S.setSelection(id)
+		if f.pending then
+			local id, err = WA.ConfirmImport(f.pending, "update", f.duplicateOf)
+			if id then f:Hide(); S.refreshList(); S.setSelection(id)
+			else f.status:SetText("Update failed: " .. (err or "unknown")); f.status:SetTextColor(1, 0.4, 0.4) end
 		else
-			f.status:SetText("Update failed: " .. (err or "unknown"))
-			f.status:SetTextColor(1, 0.4, 0.4)
+			S.stageImport(f, "update")
 		end
 	end)
 	updateBtn:Hide()
 	f.updateBtn = updateBtn
+	f:SetScript("OnHide", function()
+		f.pending, f.report, f.preview = nil, nil, nil
+		f.confirmMode, f.importText, f.previewText = nil, nil, nil
+	end)
 
 	S.ieDialog = f
 	return f
+end
+
+function S.stageImport(f, requestedMode)
+	local text = f.box.getText() or ""
+	f.importText = text
+	local pending, report = WA.ImportPreview(text)
+	f.pending, f.report = pending, report
+	if not pending or report.refused then
+		f.pending, f.report, f.preview = nil, report, nil
+		f.confirmMode, f.duplicateOf, f.canUpdate = nil, nil, nil
+		f.previewText = nil
+		f.loadBtn.setText("Import")
+		f.loadBtn:SetWidth(84)
+		f.updateBtn:Hide()
+		f.status:SetText(report and report.refused or "Import failed")
+		f.status:SetTextColor(1, 0.4, 0.4)
+		f.status:SetPoint("RIGHT", f, "RIGHT", -24 - f.loadBtn:GetWidth(), 0)
+		return nil
+	end
+	local existing, canUpdate = WA.ImportInfo(text)
+	f.duplicateOf, f.canUpdate = existing, canUpdate
+	f.confirmMode = requestedMode == "update" and canUpdate and "update" or "copy"
+	f.preview = true
+	f.previewText = WA.ImportSummary(pending, report)
+	f.box.setText(f.previewText)
+	f.noticeFor = nil
+	f.loadBtn.setText("Confirm")
+	f.loadBtn:SetWidth(84)
+	if canUpdate then
+		f.updateBtn:Show()
+		f.updateBtn.setText(f.confirmMode == "update" and "Confirm Update" or "Update")
+	else
+		f.updateBtn:Hide()
+	end
+	local reserve = 24 + f.loadBtn:GetWidth()
+	if f.updateBtn:IsShown() then reserve = reserve + 8 + f.updateBtn:GetWidth() end
+	f.status:SetText("Review the summary, then confirm.")
+	f.status:SetTextColor(1, 0.82, 0)
+	f.status:SetPoint("RIGHT", f, "RIGHT", -reserve, 0)
+	return pending, report
 end
 
 -- Says whether the pasted or received string is one we already hold, and
@@ -2186,7 +2495,7 @@ function S.refreshImportNotice(f, text)
 
 	local existing, canUpdate
 	if text ~= "" then existing, canUpdate = WA.ImportInfo(text) end
-	f.duplicateOf = existing
+	f.duplicateOf, f.canUpdate = existing, canUpdate
 
 	if not existing then
 		f.updateBtn:Hide()
@@ -2221,6 +2530,8 @@ function S.openExport(id)
 	local f = S.ensureIEDialog()
 	f.title:SetText("Export Aura")
 	f.exporting = true
+	f.pending, f.report, f.preview = nil, nil, nil
+	f.confirmMode, f.importText, f.previewText = nil, nil, nil
 	f.noticeFor = nil
 	f.loadBtn:Hide()
 	f.updateBtn:Hide()
@@ -2236,6 +2547,8 @@ function S.openImport()
 	local f = S.ensureIEDialog()
 	f.title:SetText("Import Aura")
 	f.exporting = nil
+	f.pending, f.report, f.preview = nil, nil, nil
+	f.confirmMode, f.importText, f.previewText = nil, nil, nil
 	f.noticeFor = nil
 	f.loadBtn:Show()
 	f.box.setText("")
@@ -2256,6 +2569,8 @@ function S.openReceived(sender, name, blob)
 	local f = S.ensureIEDialog()
 	f.title:SetText(sender .. " sent you \"" .. name .. "\"")
 	f.exporting = nil
+	f.pending, f.report, f.preview = nil, nil, nil
+	f.confirmMode, f.importText, f.previewText = nil, nil, nil
 	f.noticeFor = nil
 	-- Nothing to say: the title names the sender and the aura, and the box holds
 	-- an opaque blob there is no way to read. A duplicate notice may fill this.
@@ -2365,8 +2680,11 @@ local function buildPanel()
 	local contentScroll = LibWidgets.NewScrollFrame(panel, { wheelStep = 28 })
 	S.contentScroll = contentScroll
 	contentScroll:SetWidth(S.CONTENT_W)
-	contentScroll:SetPoint("TOPRIGHT", panel, "TOPRIGHT", -14, -36 - S.SEARCH_H - S.TOOLBAR_H - 28)
+	-- The tab strip wraps, so where the content pane starts is decided by the
+	-- strip's row count rather than by a constant -- S.anchorContent, driven from
+	-- the strip's onReflow. One row reproduces the offset this used to hardcode.
 	contentScroll:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", -14, 12)
+	S.anchorContent(1)
 
 	-- The options pane reads as its own surface rather than as fields floating on
 	-- the window, matching the list's box. Held at the panel's own frame level so
@@ -3085,28 +3403,41 @@ local function buildPanel()
 	end)
 	S.updateNotifyBtn = notifyBtn
 
+	-- Same lit-unless-switched-off shape as the notice button. Switching it off
+	-- returns every aura trigger to reading the descriptor alone, which is the
+	-- escape hatch if a recovered debuff ever turns out to be a phantom.
+	local overflowBtn = W.toolbarButton(toolbar, "Interface\\Icons\\Spell_Shadow_CurseOfSargeras",
+		"Debuff overflow", nil, "Debuff Overflow")
+	overflowBtn:SetPoint("RIGHT", notifyBtn, "LEFT", -4, 0)
+	overflowBtn.tipDesc = "A unit shows at most 16 debuffs. Recovers the ones past that from cast events, so a trigger for one still fires."
+	overflowBtn.setToggled(WA.Options().auraOverflow ~= false)
+	overflowBtn:SetScript("OnClick", function()
+		local opts = WA.Options()
+		if opts.auraOverflow == false then opts.auraOverflow = nil else opts.auraOverflow = false end
+		overflowBtn.setToggled(opts.auraOverflow ~= false)
+	end)
+	S.overflowBtn = overflowBtn
+
 	newBtn:SetScript("OnClick", function()
 		searchBox:ClearFocus()
 		S.openNewPane()
 	end)
 
-	-- Right: tab strip + content
-	local tabButtons = {}
-	S.tabButtons = tabButtons
-	local prevTab
-	for i = 1, table.getn(S.TAB_DEFS) do
-		local def = S.TAB_DEFS[i]
-		local tb = W.toggleButton(panel, def.name, function() S.selectTab(def.key) end)
-		tb.key = def.key
-		tb:SetWidth(80)
-		if prevTab then
-			tb:SetPoint("LEFT", prevTab, "RIGHT", 4, 0)
-		else
-			tb:SetPoint("BOTTOMLEFT", contentScroll, "TOPLEFT", 0, 6)
-		end
-		prevTab = tb
-		tabButtons[i] = tb
-	end
+	-- Right: tab strip + content. The strip sizes each tab to its own label and
+	-- wraps, rather than handing every tab an equal share of the pane -- with
+	-- eight tabs an equal share is narrower than "Animations", and a label with
+	-- no width set overflows into its neighbours rather than clipping.
+	local tabStrip = LibWidgets.NewTabStrip(panel, {
+		width = S.CONTENT_W,
+		rowHeight = S.TAB_ROW_H,
+		rowGap = S.TAB_ROW_GAP,
+		onSelect = function(value) S.selectTab(value) end,
+		onReflow = function(rows) S.anchorContent(rows) end,
+	})
+	S.tabStrip = tabStrip
+	S.tabButtons = tabStrip.buttons
+	tabStrip:SetPoint("TOPRIGHT", panel, "TOPRIGHT", -14, -S.tabStripTop())
+	S.rebuildTabs()
 
 	-- The content pane scrolls: a region's Display tab (including its subtext
 	-- editors) can run taller than the window. Built above, where its width has
@@ -3124,7 +3455,7 @@ local function buildPanel()
 	end)
 
 	S.activeTab = "info"
-	tabButtons[1].setSelected(true)
+	tabStrip.select("info")
 end
 
 function WeakestAuras.ToggleOptions()
@@ -3242,6 +3573,16 @@ initFrame:SetScript("OnEvent", function()
 	-- run of GET_ITEM_INFO_RECEIVED a bagful of uncached items produces, coalesce
 	-- into a single recompile.
 	if not didInit or recompilePending then return end
+	-- Only while some trigger still holds a name the client cannot resolve. This
+	-- sweep exists for nothing else, and GET_ITEM_INFO_RECEIVED keeps arriving all
+	-- session -- every bag change, mouseover, loot and linked item -- so an
+	-- ungated sweep recompiles every aura indefinitely. A recompile discards the
+	-- states its triggers produced, which a status or aura trigger re-derives on
+	-- the next pass but a Trigger State Updater cannot: its clones came from
+	-- events that have already happened.
+	if WeakestAuras.HasUnresolvedNames and not WeakestAuras.HasUnresolvedNames() then
+		return
+	end
 	recompilePending = true
 	C_Timer.After(1, doRecompile)
 end)

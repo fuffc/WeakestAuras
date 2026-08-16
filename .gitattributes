@@ -6,4 +6,8 @@
 
 *.tga binary
 *.blp binary
+*.png binary
 *.ttf binary
+*.ogg binary
+*.mp3 binary
+*.wav binary

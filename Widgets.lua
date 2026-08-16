@@ -5,7 +5,7 @@
 -- WA.Widgets.BuildOptions(page, fields) paints a whole tab's controls from a
 -- plain array of field descriptors instead of hand-building a frame per field:
 --   { type = "header"|"disclosure"|"toggle"|"input"|"multiline"|"range"|"select"
---            |"color"|"spell"|"item"|"icon"|"namelist"|"opnumber"|"button"|"menu"|"anchorgrid",
+--            |"color"|"spell"|"item"|"icon"|"namelist"|"opnumber"|"button"|"menu"|"space"|"anchorgrid",
 --     name = "...",
 --     key = "...",         -- stable field id, see below; omitted for header/button
 --     get = function() end, set = function(value) end,   -- color: get/set a {r,g,b,a}
@@ -18,8 +18,9 @@
 --     onClick, width }     -- button only: name is its label, width its pixel size
 -- A `header` additionally takes `collapsed` (a bool -- present at all makes the
 -- section collapsible: draws an up/down arrow, and the title line itself
--- toggles) with `onToggle`, and `onDelete` (draws a two-click-confirm delete
--- button on the right).
+-- toggles) with `onToggle`, `onDelete` (a two-click-confirm delete button), and
+-- `actions` (icon buttons painted left-to-right on the right).
+-- A `select` can also carry `actions`, which are painted beside its dropdown.
 -- Collapsing is the *generator's* job: BuildOptions only paints the affordance,
 -- so a collapsed section simply omits its body fields from the array it returns.
 -- A `disclosure` folds the same way but is a control rather than a divider: a
@@ -77,11 +78,46 @@ if WeakestAuras.disabled then return end
 local WA = WeakestAuras
 WA.Widgets = {}
 local W = WA.Widgets
+local OPTIONS_INDENT_W = 14
 
 -- Absolute path to the vendored LibWidgets textures. The library can't discover
 -- its own path (no debug library here), so callers pass it in. Handed to widgets
 -- that need their own art, e.g. the drop button's menu-affordance arrow.
 W.LIBWIDGETS_TEXTURES = "Interface\\AddOns\\WeakestAuras\\libs\\LibWidgets\\textures\\"
+W.DUPLICATE_TEXTURE = "Interface\\AddOns\\WeakestAuras\\textures\\duplicate.tga"
+
+function W.DeleteAction(onClick)
+	return { icon = LibWidgets.ICON_DELETE, tooltip = "Delete", onClick = onClick }
+end
+
+function W.ListActions(list, index, onChanged, onDuplicate)
+	local actions = {}
+	table.insert(actions, { icon = W.DUPLICATE_TEXTURE, tooltip = "Duplicate", onClick = function()
+		if onDuplicate then
+			onDuplicate(list, index)
+		else
+			table.insert(list, index + 1, WA.DeepCopy(list[index]))
+		end
+		onChanged()
+	end })
+	table.insert(actions, { icon = W.LIBWIDGETS_TEXTURES .. "up", tooltip = "Move Up", onClick = function()
+		if index > 1 then
+			list[index - 1], list[index] = list[index], list[index - 1]
+			onChanged()
+		end
+	end })
+	table.insert(actions, { icon = W.LIBWIDGETS_TEXTURES .. "down", tooltip = "Move Down", onClick = function()
+		if index < table.getn(list) then
+			list[index + 1], list[index] = list[index], list[index + 1]
+			onChanged()
+		end
+	end })
+	table.insert(actions, W.DeleteAction(function()
+		table.remove(list, index)
+		onChanged()
+	end))
+	return actions
+end
 
 -- Status bar art. The names are LibWidgets' (so every consumer offers the same
 -- set); the files are this addon's, for the same no-self-path reason as above.
@@ -104,6 +140,7 @@ W.CODE_FONT = "Interface\\AddOns\\WeakestAuras\\fonts\\RobotoMono.ttf"
 -- the UI's usual body size. Only the default: WeakestAurasDB.codeEditorFontSize
 -- overrides it (/wa codefont <6-16>), and the widget takes it per paint.
 W.CODE_FONT_SIZE = 9
+W.SOUND_PREVIEW_TEXTURE = "Interface\\AddOns\\DPSMate\\images\\UI-GuildButton-MOTD-Up"
 
 -- Falls back to the client's own bar art rather than erroring, so an older
 -- LibWidgets copy winning the version race degrades a bar's *look* instead of
@@ -118,7 +155,13 @@ end
 -- every addon vendoring the library, and only this one ships these files -- a
 -- name added there would offer the other consumers a texture that resolves to
 -- nothing.
-local EXTRA_BAR_TEXTURES = { "Clean", "Stripes", "ThinStripes", "ThickStripes" }
+local EXTRA_BAR_TEXTURES = {
+	"Clean", "Stripes", "ThinStripes", "ThickStripes",
+	"Armory", "Charcoal", "Cilo", "Comet", "Dabs", "DarkBottom",
+	"Diagonal", "Frost", "Glass", "Glaze", "Glaze2", "Grid", "Hatched",
+	"LiteStep", "Melli", "MelliDark", "Perl2", "Pill", "Smoothv2",
+	"Steel", "Striped", "Tube", "Water", "Wglass", "Wisps", "Xeon",
+}
 
 -- LibWidgets' set plus ours, built once. Every consumer of the bar list reads
 -- this rather than LibWidgets.BAR_TEXTURES directly, or the two drift.
@@ -227,28 +270,6 @@ end
 
 function W.button(parent, text, onClick)
 	return LibWidgets.NewButton(parent, { text = text, onClick = onClick })
-end
-
--- A selectable button (tab strip): b.setSelected(on) shows the lit/gold-border
--- active look; the selected button ignores hover so the active tab stays lit.
-function W.toggleButton(parent, text, onClick)
-	local b = W.button(parent, text, onClick)
-	b.label:SetTextColor(0.7, 0.7, 0.7)
-	function b.setSelected(on)
-		b.selected = on and true or false
-		if b.selected then
-			b:SetBackdropColor(0.22, 0.20, 0.05, 0.95)
-			b:SetBackdropBorderColor(0.9, 0.8, 0.2, 1)
-			b.label:SetTextColor(1, 1, 1)
-		else
-			b:SetBackdropColor(0, 0, 0, 0.7)
-			b:SetBackdropBorderColor(0.4, 0.4, 0.4, 0.8)
-			b.label:SetTextColor(0.7, 0.7, 0.7)
-		end
-	end
-	b:SetScript("OnEnter", function() if not this.selected then this:SetBackdropBorderColor(0.9, 0.8, 0.2, 1) end end)
-	b:SetScript("OnLeave", function() if not this.selected then this:SetBackdropBorderColor(0.4, 0.4, 0.4, 0.8) end end)
-	return b
 end
 
 -- Icon-only toolbar button. Mirrors WA2's WeakAurasToolbarButton, minus the
@@ -372,13 +393,90 @@ local TEXTURE_CATEGORIES = {
 		"SpellActivationOverlay0.blp", "SwordAndBoard.blp", "ThrillOfTheHunt1.blp", "ThrillOfTheHunt2.blp", "ThrillOfTheHunt3.blp", "ToothAndClaw.blp",
 		"Ultimatum.blp", "WhiteTiger.blp",
 	},
+	-- Power Auras art, split the four ways upstream splits it. Every name here
+	-- also has to be reachable from WA2Import's rewrite of an incoming
+	-- PowerAurasMedia\Auras path, which looks the basename up in this table --
+	-- so a file dropped from here stops resolving on import as well as in the
+	-- picker. Aura146-246 exist upstream of WeakAuras2 but not in it, and are
+	-- not bundled: see textures/README.md.
+	PowerAurasHeadsUp = {
+		"Aura1.tga", "Aura2.tga", "Aura3.tga", "Aura4.tga", "Aura5.tga", "Aura6.tga", "Aura7.tga",
+		"Aura11.tga", "Aura16.tga", "Aura17.tga", "Aura18.tga", "Aura23.tga", "Aura24.tga", "Aura28.tga",
+		"Aura33.tga",
+	},
+	PowerAurasIcons = {
+		"Aura8.tga", "Aura9.tga", "Aura10.tga", "Aura12.tga", "Aura13.tga", "Aura14.tga", "Aura15.tga",
+		"Aura19.tga", "Aura21.tga", "Aura22.tga", "Aura25.tga", "Aura26.tga", "Aura27.tga", "Aura29.tga",
+		"Aura30.tga", "Aura31.tga", "Aura32.tga", "Aura34.tga", "Aura35.tga", "Aura36.tga", "Aura45.tga",
+		"Aura48.tga", "Aura49.tga", "Aura50.tga", "Aura51.tga", "Aura52.tga", "Aura53.tga", "Aura54.tga",
+		"Aura68.tga", "Aura69.tga", "Aura70.tga", "Aura71.tga", "Aura72.tga", "Aura73.tga", "Aura74.tga",
+		"Aura75.tga", "Aura76.tga", "Aura77.tga", "Aura78.tga", "Aura79.tga", "Aura84.tga", "Aura85.tga",
+		"Aura86.tga", "Aura87.tga", "Aura88.tga", "Aura95.tga", "Aura96.tga", "Aura97.tga", "Aura98.tga",
+		"Aura99.tga", "Aura100.tga", "Aura101.tga", "Aura102.tga", "Aura103.tga", "Aura110.tga",
+		"Aura111.tga", "Aura112.tga", "Aura113.tga", "Aura114.tga", "Aura115.tga", "Aura116.tga",
+		"Aura117.tga", "Aura118.tga", "Aura119.tga", "Aura120.tga", "Aura130.tga", "Aura131.tga",
+		"Aura132.tga", "Aura138.tga", "Aura139.tga", "Aura140.tga", "Aura141.tga", "Aura142.tga",
+		"Aura143.tga",
+	},
+	PowerAurasSeparated = {
+		"Aura46.tga", "Aura47.tga", "Aura55.tga", "Aura56.tga", "Aura57.tga", "Aura58.tga", "Aura59.tga",
+		"Aura60.tga", "Aura61.tga", "Aura62.tga", "Aura63.tga", "Aura64.tga", "Aura65.tga", "Aura66.tga",
+		"Aura67.tga", "Aura80.tga", "Aura81.tga", "Aura82.tga", "Aura83.tga", "Aura89.tga", "Aura90.tga",
+		"Aura91.tga", "Aura92.tga", "Aura93.tga", "Aura94.tga", "Aura104.tga", "Aura105.tga", "Aura106.tga",
+		"Aura107.tga", "Aura108.tga", "Aura109.tga", "Aura121.tga", "Aura122.tga", "Aura123.tga",
+		"Aura124.tga", "Aura125.tga", "Aura126.tga", "Aura127.tga", "Aura128.tga", "Aura129.tga",
+		"Aura133.tga", "Aura134.tga", "Aura135.tga", "Aura136.tga", "Aura137.tga", "Aura144.tga",
+		"Aura145.tga",
+	},
+	PowerAurasWords = {
+		"Aura20.tga", "Aura37.tga", "Aura38.tga", "Aura39.tga", "Aura40.tga", "Aura41.tga", "Aura42.tga",
+		"Aura43.tga", "Aura44.tga",
+	},
 }
 WA.textureTypes = TEXTURE_CATEGORIES
-local TEXTURE_CATEGORY_VALUES = { "Alerts", "Shapes" }
-local TEXTURE_CATEGORY_LABELS = { Alerts = "Blizzard Alerts", Shapes = "Shapes" }
 
-local function texturePath(category, name)
-	return TEXTURE_PATH_PREFIX .. string.lower(category) .. "\\" .. name
+-- All four Power Auras categories draw from one folder, so the category name
+-- cannot be lowercased into the path the way Shapes and Alerts are.
+local TEXTURE_CATEGORY_DIRS = {
+	PowerAurasHeadsUp = "powerauras", PowerAurasIcons = "powerauras",
+	PowerAurasSeparated = "powerauras", PowerAurasWords = "powerauras",
+}
+local TEXTURE_CATEGORY_VALUES = {
+	"Alerts", "Shapes",
+	"PowerAurasHeadsUp", "PowerAurasIcons", "PowerAurasSeparated", "PowerAurasWords",
+}
+local TEXTURE_CATEGORY_LABELS = {
+	Alerts = "Blizzard Alerts", Shapes = "Shapes",
+	PowerAurasHeadsUp = "Power Auras: Heads-Up", PowerAurasIcons = "Power Auras: Icons",
+	PowerAurasSeparated = "Power Auras: Separated", PowerAurasWords = "Power Auras: Words",
+}
+
+-- Full path to one bundled texture. Public because WA2Import builds its rewrite
+-- index off WA.textureTypes and has to form the same paths the picker stores.
+function W.TexturePath(category, name)
+	local dir = TEXTURE_CATEGORY_DIRS[category] or string.lower(category)
+	return TEXTURE_PATH_PREFIX .. dir .. "\\" .. name
+end
+local texturePath = W.TexturePath
+
+-- lowercased file name -> the category holding it, for the categories whose
+-- folder does not name them. Built on first use, since the four Power Auras
+-- lists share one folder and the path alone cannot say which tab to open on.
+local powerAurasCategory
+local function powerAurasCategoryFor(name)
+	if not powerAurasCategory then
+		powerAurasCategory = {}
+		for i = 1, table.getn(TEXTURE_CATEGORY_VALUES) do
+			local category = TEXTURE_CATEGORY_VALUES[i]
+			if TEXTURE_CATEGORY_DIRS[category] == "powerauras" then
+				local list = TEXTURE_CATEGORIES[category]
+				for j = 1, table.getn(list) do
+					powerAurasCategory[string.lower(list[j])] = category
+				end
+			end
+		end
+	end
+	return powerAurasCategory[string.lower(name or "")]
 end
 
 function W.OpenTexturePicker(current, onPick)
@@ -401,7 +499,12 @@ function W.OpenTexturePicker(current, onPick)
 				return name or value
 			end,
 			categoryFor = function(value)
-				if string.find(string.lower(value or ""), "textures\\alerts\\", 1, true) then return "Alerts" end
+				local lower = string.lower(value or "")
+				if string.find(lower, "textures\\alerts\\", 1, true) then return "Alerts" end
+				if string.find(lower, "textures\\powerauras\\", 1, true) then
+					local _, _, name = string.find(lower, "([^\\]+)$")
+					return powerAurasCategoryFor(name) or "PowerAurasIcons"
+				end
 				return "Shapes"
 			end,
 			labelFor = function(name) return name end,
@@ -626,17 +729,32 @@ local function poolButton(page, text, width, onClick)
 	return b
 end
 
--- The small texture-faced buttons on a collapsible header (arrow, delete) and on
+-- The small texture-faced buttons on a collapsible header (arrow, actions, delete) and on
 -- a disclosure line (gear). The tint is reset on every acquisition, since one
 -- pool serves all of them and a dimmed disclosure gear would otherwise carry
 -- over onto whatever header arrow lands on that instance next.
-local function poolIconButton(page, icon, onClick)
+local function poolIconButton(page, icon, onClick, tooltip)
 	local b = acquire(page, "iconbutton", function()
-		return LibWidgets.NewIconButton(page, { width = 16, height = 16, iconSize = 9 })
+		local w = LibWidgets.NewIconButton(page, { width = 16, height = 16, iconSize = 9 })
+		w.baseOnEnter = w:GetScript("OnEnter")
+		w.baseOnLeave = w:GetScript("OnLeave")
+		return w
 	end)
 	b.icon:SetTexture(icon)
 	b.icon:SetVertexColor(1, 1, 1)
-	b:SetScript("OnClick", function() LibWidgets.CloseAllMenus(); onClick() end)
+	b:SetScript("OnClick", function() LibWidgets.CloseAllMenus(); if onClick then onClick() end end)
+	b:SetScript("OnEnter", function()
+		if b.baseOnEnter then b.baseOnEnter() end
+		if tooltip and tooltip ~= "" then
+			GameTooltip:SetOwner(b, "ANCHOR_RIGHT")
+			GameTooltip:AddLine(tooltip)
+			GameTooltip:Show()
+		end
+	end)
+	b:SetScript("OnLeave", function()
+		if b.baseOnLeave then b.baseOnLeave() end
+		GameTooltip:Hide()
+	end)
 	return b
 end
 
@@ -697,6 +815,11 @@ local function poolDeleteButton(page, onDelete)
 	return b
 end
 
+local function poolActionButton(page, action)
+	if action.confirm then return poolDeleteButton(page, action.onClick) end
+	return poolIconButton(page, action.icon, action.onClick, action.tooltip)
+end
+
 -- A bare click target laid over a collapsible header's title line.
 local function poolHitArea(page, onClick)
 	local b = acquire(page, "hitarea", function() return CreateFrame("Button", nil, page) end)
@@ -707,8 +830,9 @@ end
 
 -- `swatches` (value -> texture path) turns this into a previewing picker; a
 -- swatch button can't be un-swatched after construction, so it pools separately.
-local function poolDropdown(page, width, values, labels, onSelect, get, swatches)
-	local d = acquire(page, (swatches and "dropsw" or "drop") .. width, function()
+local function poolDropdown(page, width, values, labels, onSelect, get, swatches, previews, onPreview)
+	local kind = (swatches and "dropsw" or previews and "droppreview" or "drop") .. width
+	local d = acquire(page, kind, function()
 		local bind = {}
 		-- NewDropButton captures `labels` once; a proxy that forwards misses to
 		-- the live binding is what lets one pooled button serve every field.
@@ -722,11 +846,18 @@ local function poolDropdown(page, width, values, labels, onSelect, get, swatches
 			if k == nil then return nil end
 			return bind.swatches and bind.swatches[k]
 		end })
+		local previewProxy = previews and setmetatable({}, { __index = function(t, k)
+			if k == nil then return nil end
+			return bind.previews and bind.previews[k]
+		end })
 		local w = LibWidgets.NewDropButton(page, {
 			width = width,
 			values = function() return bind.values or EMPTY end,
 			labels = labelProxy,
 			swatches = swatchProxy,
+			previews = previewProxy,
+			previewTexture = W.SOUND_PREVIEW_TEXTURE,
+			onPreview = function(v) if bind.onPreview then bind.onPreview(v) end end,
 			onSelect = function(v) if bind.onSelect then bind.onSelect(v) end end,
 			get = function() return bind.get and bind.get() end,
 			textureDir = W.LIBWIDGETS_TEXTURES,
@@ -742,6 +873,8 @@ local function poolDropdown(page, width, values, labels, onSelect, get, swatches
 	d.bind.values = values
 	d.bind.labels = labels
 	d.bind.swatches = swatches
+	d.bind.previews = previews
+	d.bind.onPreview = onPreview
 	d.bind.onSelect = onSelect
 	d.bind.get = get
 	d.setValue(get and get())
@@ -926,7 +1059,13 @@ local function poolListEditor(page, f, x, y, rightInset, visibleRows)
 		W._listSeq = (W._listSeq or 0) + 1
 		local bind = {}
 		local function list() return (bind.list and bind.list()) or EMPTY end
-		local function changed() if bind.onChange then bind.onChange() end end
+		local function changed(kind, first, second)
+			if bind[kind] then
+				if second ~= nil then bind[kind](first, second) else bind[kind](first) end
+			elseif bind.onChange then
+				bind.onChange()
+			end
+		end
 		local editor = LibWidgets.NewListEditor(page, {
 			nameFrame = "WeakestAurasOptList" .. W._listSeq,
 			textureDir = W.LIBWIDGETS_TEXTURES,
@@ -934,16 +1073,16 @@ local function poolListEditor(page, f, x, y, rightInset, visibleRows)
 			list = list,
 			reorder = function(fromIndex, before)
 				spliceReorder(list(), fromIndex, before)
-				changed()
+				changed("onReorder", fromIndex, before)
 			end,
 			remove = function(index)
 				table.remove(list(), index)
-				changed()
+				changed("onRemove", index)
 			end,
 			add = { onAdd = function(text)
 				if text and text ~= "" then
 					table.insert(list(), text)
-					changed()
+					changed("onAdd", text)
 				end
 			end },
 			nameGet = function(entry) return entry end,
@@ -954,6 +1093,9 @@ local function poolListEditor(page, f, x, y, rightInset, visibleRows)
 	end)
 	frame.bind.list = f.get
 	frame.bind.onChange = f.onChange
+	frame.bind.onReorder = f.onReorder
+	frame.bind.onRemove = f.onRemove
+	frame.bind.onAdd = f.onAdd
 	frame:SetPoint("TOPLEFT", page, "TOPLEFT", x, y)
 	frame:SetPoint("RIGHT", page, "RIGHT", -rightInset, 0)
 	frame.editor.refresh()
@@ -964,23 +1106,50 @@ end
 -- Declarative options-table renderer
 -- ---------------------------------------------------------------------------
 
+-- Distance from a field's top edge down to the top of its control body -- the
+-- caption line a labelled field draws above its widget, zero for one that has
+-- none. A two-column row aligns on this rather than on its top edge, so a bare
+-- toggle or swatch sits level with the control beside it instead of level with
+-- that control's caption. `range` is listed although `placeField` puts its
+-- widget on the row's top edge: NewSpinBox draws its own caption inside the
+-- frame, in the 14px it reserves above the track.
+local FIELD_LEAD = {
+	input = 16, multiline = 16, namelist = 16, select = 16, opnumber = 16,
+	spell = 16, item = 16, talent = 16, icon = 16, texture = 16,
+	anchorgrid = 16, anchorlayout = 16,
+	code = 20,
+	range = 14,
+}
+
+local function fieldLead(f) return FIELD_LEAD[f.type] or 0 end
+
 -- Places one field at (x, y) with widget width `w` and returns the vertical
 -- space it consumed. Headers are handled by the caller (they're always
 -- full-width). Shared by the single-column and two-column paths so both stay
 -- identical per field type.
 local function placeField(page, f, x, y, w)
+	local indent = (f.indent or 0) * OPTIONS_INDENT_W
+	if indent > 0 then
+		x = x + indent
+		w = w - indent
+		if w < 90 then w = 90 end
+	end
+	local lead = fieldLead(f)
 	if f.type == "toggle" then
 		local cb = poolCheck(page, f.name, f.set, f.get)
 		cb:SetPoint("TOPLEFT", x, y)
 		return 24
+	elseif f.type == "space" then
+		local line = 24
+		return f.useHeight and (f.height or 1) * line or line
 	elseif f.type == "input" then
 		local label = poolLabel(page, f.name)
 		label:SetPoint("TOPLEFT", x, y)
 		local e = poolEditBox(page, w, f.set)
 		local v = f.get()
 		e:SetText(v ~= nil and tostring(v) or "")
-		e:SetPoint("TOPLEFT", x, y - 16)
-		return 44
+		e:SetPoint("TOPLEFT", x, y - lead)
+		return lead + 28
 	elseif f.type == "multiline" then
 		local label = poolLabel(page, f.name)
 		label:SetPoint("TOPLEFT", x, y)
@@ -992,8 +1161,8 @@ local function placeField(page, f, x, y, w)
 		if mw < 120 then mw = 120 end
 		local mh = f.height or 150
 		local box = poolMultiline(page, mw, mh, f.get() or "", f.set)
-		box:SetPoint("TOPLEFT", x, y - 16)
-		return 16 + mh + 8
+		box:SetPoint("TOPLEFT", x, y - lead)
+		return lead + mh + 8
 	elseif f.type == "description" then
 		-- Text only, no control: `name` is the whole body. Sized to the page
 		-- rather than the capped column, since it is prose and wraps.
@@ -1011,18 +1180,19 @@ local function placeField(page, f, x, y, w)
 		if mw < 120 then mw = 120 end
 		local mh = f.height or 150
 		local box = poolCode(page, f, mw, mh)
-		-- The label row leaves room for the widget's own Reset button, which
-		-- sits above the box's top-right corner.
-		box:SetPoint("TOPLEFT", x, y - 20)
-		-- 20 for the label/Reset row, then the box, then the widget's own error
-		-- line (14) -- which is always allotted, so the layout below doesn't
-		-- shift as errors come and go while typing.
-		return 20 + mh + 8 + 14
-	elseif f.type == "spell" or f.type == "item" or f.type == "icon" or f.type == "texture" then
+		-- The lead is deeper here than a plain label needs: it also has to clear
+		-- the widget's own Reset button, which sits above the box's top-right
+		-- corner.
+		box:SetPoint("TOPLEFT", x, y - lead)
+		-- The label/Reset row, then the box, then the widget's own error line
+		-- (14) -- which is always allotted, so the layout below doesn't shift as
+		-- errors come and go while typing.
+		return lead + mh + 8 + 14
+	elseif f.type == "spell" or f.type == "item" or f.type == "talent" or f.type == "icon" or f.type == "texture" then
 		local label = poolLabel(page, f.name)
 		label:SetPoint("TOPLEFT", x, y)
 		local icon = poolPreviewIcon(page)
-		icon:SetPoint("TOPLEFT", x, y - 16)
+		icon:SetPoint("TOPLEFT", x, y - lead)
 		-- `spell`/`item` store what the user typed and preview whatever it
 		-- resolves to; `icon` resolves at commit instead and stores the texture
 		-- path itself, so the region can SetTexture it blindly.
@@ -1040,6 +1210,8 @@ local function placeField(page, f, x, y, w)
 				if not (C_Item and C_Item.GetItemInfo) then return nil end
 				local _, _, _, _, _, _, _, _, _, ic = C_Item.GetItemInfo(id)
 				return ic
+			elseif f.type == "talent" then
+				return f.resolve and f.resolve(v) or nil
 			end
 			local id = WA.ResolveSpellID(v)
 			if id then local _, _, ic = GetSpellInfo(id); return ic end
@@ -1056,14 +1228,14 @@ local function placeField(page, f, x, y, w)
 			icon:SetTexture(path or QUESTION_ICON)
 			if WA.RefreshList then WA.RefreshList() end
 		end)
-		-- Only an item field takes a shift-clicked link; a spell or icon field has
+		-- Only an item field takes a shift-clicked link; a spell, talent, or icon field has
 		-- nothing to do with one.
 		e.acceptsLinks = (f.type == "item")
 		local v = f.get()
 		e:SetText(v ~= nil and tostring(v) or "")
-		e:SetPoint("TOPLEFT", x + 24, y - 16)
+		e:SetPoint("TOPLEFT", x + 24, y - lead)
 		if browsable then
-			icon:SetTexture((v and v ~= "" and v) or QUESTION_ICON)
+			icon:SetTexture(WA.DrawableTexture(v) or QUESTION_ICON)
 			local b = poolButton(page, "Browse", browseW - 4, function()
 				local picker = f.type == "texture" and W.OpenTexturePicker or W.OpenIconPicker
 				picker(f.get(), function(path)
@@ -1072,19 +1244,19 @@ local function placeField(page, f, x, y, w)
 					if WA.RefreshOptions then WA.RefreshOptions() end
 				end)
 			end)
-			b:SetPoint("TOPLEFT", x + 24 + (w - 24 - browseW) + 4, y - 16)
+			b:SetPoint("TOPLEFT", x + 24 + (w - 24 - browseW) + 4, y - lead)
 		else
 			icon:SetTexture(resolve(v) or QUESTION_ICON)
 		end
-		return 44
+		return lead + 28
 	elseif f.type == "namelist" then
 		local label = poolLabel(page, f.name)
 		label:SetPoint("TOPLEFT", x, y)
 		local n = table.getn(f.get())
 		local visibleRows = n < 2 and 2 or (n > 5 and 5 or n)
 		local rightInset = (page:GetWidth() or 400) - (x + w)
-		local frame = poolListEditor(page, f, x, y - 16, rightInset, visibleRows)
-		return 16 + frame.editor.height + 6
+		local frame = poolListEditor(page, f, x, y - lead, rightInset, visibleRows)
+		return lead + frame.editor.height + 6
 	elseif f.type == "range" then
 		local s = acquire(page, "spin", function()
 			-- The bind table *is* the widget's spec: NewSpinBox reads label/min/
@@ -1135,19 +1307,31 @@ local function placeField(page, f, x, y, w)
 		local label = poolLabel(page, f.name)
 		label:SetPoint("TOPLEFT", x, y)
 		local dw = w < 160 and w or 160
-		local d = poolDropdown(page, dw, f.values, f.labels, f.set, f.get, f.swatches)
-		d:SetPoint("TOPLEFT", x, y - 16)
-		return 44
+		local actionCount = table.getn(f.actions or {})
+		if actionCount > 0 then
+			local actionW = actionCount * 16 + (actionCount - 1) * 6
+			local available = w - actionW - 6
+			if available < 90 then available = 90 end
+			dw = available < 160 and available or 160
+		end
+		local d = poolDropdown(page, dw, f.values, f.labels, f.set, f.get, f.swatches, f.previews, f.onPreview)
+		d:SetPoint("TOPLEFT", x, y - lead)
+		for i = 1, actionCount do
+			local action = f.actions[i]
+			local button = poolActionButton(page, action)
+			button:SetPoint("TOPLEFT", x + dw + 6 + (i - 1) * 22, y - lead + 2)
+		end
+		return lead + 28
 	elseif f.type == "opnumber" then
 		local label = poolLabel(page, f.name)
 		label:SetPoint("TOPLEFT", x, y)
 		local op = poolDropdown(page, 52, W.OPERATORS, nil, f.setOp, f.getOp)
-		op:SetPoint("TOPLEFT", x, y - 16)
+		op:SetPoint("TOPLEFT", x, y - lead)
 		local e = poolEditBox(page, 60, function(v) f.setVal(tonumber(v)) end)
 		local v = f.getVal()
 		e:SetText(v ~= nil and tostring(v) or "")
-		e:SetPoint("TOPLEFT", x + 58, y - 16)
-		return 44
+		e:SetPoint("TOPLEFT", x + 58, y - lead)
+		return lead + 28
 	elseif f.type == "color" then
 		local label = poolLabel(page, f.name)
 		label:SetPoint("TOPLEFT", x, y - 3)
@@ -1167,8 +1351,8 @@ local function placeField(page, f, x, y, w)
 		label:SetPoint("TOPLEFT", x, y)
 		local gw = f.width or w
 		local grid = poolAnchorGrid(page, f, gw)
-		grid:SetPoint("TOPLEFT", x, y - 16)
-		return 16 + (f.height or 50) + 8
+		grid:SetPoint("TOPLEFT", x, y - lead)
+		return lead + (f.height or 50) + 8
 	elseif f.type == "anchorlayout" then
 		local grid = f.grid
 		local gridW = grid.width or 100
@@ -1176,7 +1360,7 @@ local function placeField(page, f, x, y, w)
 		local anchor = poolLabel(page, grid.name)
 		anchor:SetPoint("TOPLEFT", x, y)
 		local anchorGrid = poolAnchorGrid(page, grid, gridW)
-		anchorGrid:SetPoint("TOPLEFT", x, y - 16)
+		anchorGrid:SetPoint("TOPLEFT", x, y - lead)
 		local sideX = x + gridW + 12
 		local sideW = w - gridW - 12
 		if sideW < 90 then sideW = 90 end
@@ -1187,7 +1371,7 @@ local function placeField(page, f, x, y, w)
 			sideY = sideY - used
 			sideHeight = sideHeight + used
 		end
-		local gridHeight = 16 + gridH + 8
+		local gridHeight = lead + gridH + 8
 		return gridHeight > sideHeight and gridHeight or sideHeight
 	end
 	return 0
@@ -1230,37 +1414,51 @@ function W.BuildOptions(page, fields)
 	if fullW > 240 then fullW = 240 end
 
 	local y = -8
-	local col = 0          -- 0 = next half goes left, 1 = right slot pending
-	local rowTopY, leftH = y, 0
+	-- A `half` field waits here for the partner it shares its row with, since
+	-- where it goes depends on that partner's shape. A header, a full-width
+	-- field, or the end of the list flushes it into the left column alone.
+	local pending, pendingY
+
+	local function flushPending()
+		if not pending then return end
+		y = pendingY - placeField(page, pending, leftX, pendingY, colW - 8)
+		pending = nil
+	end
 
 	for i = 1, table.getn(fields) do
 		local f = fields[i]
 		if f.type == "header" then
-			if col == 1 then y = rowTopY - leftH; col = 0 end
+			flushPending()
 			y = y - 10
 			-- Centered gold label flanked by horizontal rules (the WeakAuras
 			-- section-divider look) -- plain size-differentiated text wasn't
 			-- separating areas clearly enough.
 			local h = poolHeaderLabel(page, f.name)
-			h:SetPoint("TOP", page, "TOPLEFT", avail / 2, y)
+			local headerIndent = (f.indent or 0) * OPTIONS_INDENT_W
+			h:SetPoint("TOP", page, "TOPLEFT", avail / 2 + headerIndent, y)
 
-			-- A collapsible/deletable section puts its own controls where the
-			-- flanking rules would otherwise run, so the rules stop short of
-			-- them (see leftEdge/rightEdge below).
-			local leftEdge, rightEdge = 8, avail - 8
+			-- Header actions occupy the right edge in descriptor order; placing them
+			-- backwards keeps the first action leftmost.
+			local leftEdge, rightEdge = 8 + headerIndent, avail - 8
+			if f.onDelete then
+				local del = poolDeleteButton(page, f.onDelete)
+				del:SetPoint("TOPRIGHT", page, "TOPLEFT", rightEdge, y + 2)
+				rightEdge = rightEdge - 16 - 6
+			end
+			for actionIndex = table.getn(f.actions or {}), 1, -1 do
+				local action = f.actions[actionIndex]
+				local button = poolActionButton(page, action)
+				button:SetPoint("TOPRIGHT", page, "TOPLEFT", rightEdge, y + 2)
+				rightEdge = rightEdge - 16 - 6
+			end
 			if f.collapsed ~= nil then
 				-- The arrow points the way the section will move on click: down to
 				-- unfold a collapsed one, up to fold an open one.
 				local arrow = poolIconButton(page,
 					W.LIBWIDGETS_TEXTURES .. (f.collapsed and "down" or "up"),
 					f.onToggle or function() end)
-				arrow:SetPoint("TOPLEFT", 8, y + 2)
-				leftEdge = 8 + 16 + 6
-			end
-			if f.onDelete then
-				local del = poolDeleteButton(page, f.onDelete)
-				del:SetPoint("TOPRIGHT", page, "TOPLEFT", avail - 8, y + 2)
-				rightEdge = avail - 8 - 16 - 6
+				arrow:SetPoint("TOPLEFT", 8 + headerIndent, y + 2)
+				leftEdge = 8 + headerIndent + 16 + 6
 			end
 			-- The whole title line toggles too, not just the small arrow. It's a
 			-- bare mouse-enabled frame (no textures of its own) laid over the
@@ -1286,21 +1484,26 @@ function W.BuildOptions(page, fields)
 			end
 			y = y - 18
 		elseif f.half then
-			if col == 0 then
-				rowTopY = y
-				leftH = placeField(page, f, leftX, y, colW - 8)
-				col = 1
+			if not pending then
+				pending, pendingY = f, y
 			else
-				local rh = placeField(page, f, rightX, rowTopY, colW - 8)
-				y = rowTopY - (leftH > rh and leftH or rh)
-				col = 0
+				-- Both controls hang from the deeper of the two caption lines, so
+				-- a one-line toggle lands beside the control of the labelled field
+				-- next to it rather than beside that field's caption. The row is
+				-- then as tall as the taller of the two bodies under that line.
+				local leadL, leadR = fieldLead(pending), fieldLead(f)
+				local top = leadL > leadR and leadL or leadR
+				local lh = (top - leadL) + placeField(page, pending, leftX, pendingY - (top - leadL), colW - 8)
+				local rh = (top - leadR) + placeField(page, f, rightX, pendingY - (top - leadR), colW - 8)
+				y = pendingY - (lh > rh and lh or rh)
+				pending = nil
 			end
 		else
-			if col == 1 then y = rowTopY - leftH; col = 0 end
+			flushPending()
 			y = y - placeField(page, f, 8, y, fullW)
 		end
 	end
-	if col == 1 then y = rowTopY - leftH end
+	flushPending()
 
 	-- Total laid-out height (y runs negative from the top), so a scroll-child
 	-- container can size itself to the content -- see OptionsFrame.lua's content

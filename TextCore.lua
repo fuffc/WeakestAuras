@@ -3,10 +3,9 @@
 -- half of WA2's Text region (§7).
 -- Upstream section refs (§N) point at design/architecture/weakauras2-reference.md
 --
--- A consumer keeps its settings as flat keys under a prefix of its own
--- ("text_font", "text_flags", ...) and hands the whole table plus that prefix to
--- Apply; every key is optional, and the defaults below are what a FontString
--- does with no font block at all.
+-- A consumer keeps its settings as flat keys under its own schema and hands the
+-- table plus a prefix and alias map to Apply; every key is optional, and the
+-- defaults below are what a FontString does with no font block at all.
 
 if WeakestAuras.disabled then return end
 
@@ -18,12 +17,35 @@ WA.textCore = textCore
 -- No LibSharedMedia here, so the picker is a fixed list and what gets *stored*
 -- is the path, not the name: there is no registry to resolve a name against
 -- later, so renaming an entry would leave every aura holding it with no font.
+--
+-- The bundled faces carry WA2's LibSharedMedia names verbatim, because that is
+-- what a WeakAuras export stores in text_font and WA2Import resolves an incoming
+-- name against this list -- renaming one here silently strips the font off every
+-- aura imported afterwards.
 textCore.FONTS = {
 	{ name = "Friz Quadrata", path = "Fonts\\FRIZQT__.TTF" },
 	{ name = "Arial Narrow", path = "Fonts\\ARIALN.TTF" },
 	{ name = "Morpheus", path = "Fonts\\MORPHEUS.TTF" },
 	{ name = "Skurri", path = "Fonts\\SKURRI.TTF" },
 	{ name = "Roboto Mono", path = "Interface\\AddOns\\WeakestAuras\\fonts\\RobotoMono.ttf" },
+	{ name = "Fira Mono Medium", path = "Interface\\AddOns\\WeakestAuras\\fonts\\FiraMono-Medium.ttf" },
+	{ name = "Fira Sans Black", path = "Interface\\AddOns\\WeakestAuras\\fonts\\FiraSans-Heavy.ttf" },
+	{ name = "Fira Sans Medium", path = "Interface\\AddOns\\WeakestAuras\\fonts\\FiraSans-Medium.ttf" },
+	{ name = "Fira Sans Condensed Black", path = "Interface\\AddOns\\WeakestAuras\\fonts\\FiraSansCondensed-Heavy.ttf" },
+	{ name = "Fira Sans Condensed Medium", path = "Interface\\AddOns\\WeakestAuras\\fonts\\FiraSansCondensed-Medium.ttf" },
+	{ name = "PT Sans Narrow Regular", path = "Interface\\AddOns\\WeakestAuras\\fonts\\PTSansNarrow-Regular.ttf" },
+	{ name = "PT Sans Narrow Bold", path = "Interface\\AddOns\\WeakestAuras\\fonts\\PTSansNarrow-Bold.ttf" },
+	{ name = "Oswald", path = "Interface\\AddOns\\WeakestAuras\\fonts\\Oswald-Regular.ttf" },
+	{ name = "Celestia Medium Redux", path = "Interface\\AddOns\\WeakestAuras\\fonts\\CelestiaMediumRedux1.55.ttf" },
+	{ name = "DejaVu Sans", path = "Interface\\AddOns\\WeakestAuras\\fonts\\DejaVuLGCSans.ttf" },
+	{ name = "DejaVu Serif", path = "Interface\\AddOns\\WeakestAuras\\fonts\\DejaVuLGCSerif.ttf" },
+	{ name = "Gentium Plus", path = "Interface\\AddOns\\WeakestAuras\\fonts\\GentiumPlus-Regular.ttf" },
+	{ name = "Hack", path = "Interface\\AddOns\\WeakestAuras\\fonts\\Hack-Regular.ttf" },
+	{ name = "Liberation Mono", path = "Interface\\AddOns\\WeakestAuras\\fonts\\LiberationMono-Regular.ttf" },
+	{ name = "Liberation Sans", path = "Interface\\AddOns\\WeakestAuras\\fonts\\LiberationSans-Regular.ttf" },
+	{ name = "Liberation Serif", path = "Interface\\AddOns\\WeakestAuras\\fonts\\LiberationSerif-Regular.ttf" },
+	{ name = "swf!t", path = "Interface\\AddOns\\WeakestAuras\\fonts\\SWF!T___.TTF" },
+	{ name = "Yellowjacket", path = "Interface\\AddOns\\WeakestAuras\\fonts\\yellow.ttf" },
 }
 
 -- Stored as "None" rather than "" so the picker has no empty value; Apply maps
@@ -66,6 +88,17 @@ local DEFAULTS = {
 }
 textCore.DEFAULTS = DEFAULTS
 
+textCore.REGION_KEYS = {
+	font = "font", size = "fontSize", flags = "outline", color = "color",
+	justifyH = "justify", justifyV = "justifyV", spacing = "spacing",
+	shadowColor = "shadowColor", shadowX = "shadowXOffset", shadowY = "shadowYOffset",
+}
+textCore.SUBTEXT_KEYS = {
+	font = "font", size = "fontSize", flags = "fontType", color = "color",
+	justifyH = "justify", justifyV = "justifyV", spacing = "spacing",
+	shadowColor = "shadowColor", shadowX = "shadowXOffset", shadowY = "shadowYOffset",
+}
+
 local FONT_VALUES, FONT_LABELS = {}, {}
 for i = 1, table.getn(textCore.FONTS) do
 	local f = textCore.FONTS[i]
@@ -97,8 +130,12 @@ local function setFont(fs, path, size, flags)
 	return fs:GetFont() ~= nil
 end
 
-local function val(data, prefix, key)
-	local v = data[prefix .. key]
+local function keyName(aliases, key)
+	return aliases and aliases[key] or key
+end
+
+local function val(data, prefix, key, aliases)
+	local v = data[prefix .. keyName(aliases, key)]
 	if v == nil then return DEFAULTS[key] end
 	return v
 end
@@ -109,20 +146,20 @@ end
 -- `size` overrides the stored one without writing it back: a condition changing
 -- font size has to re-enter SetFont -- and therefore the read-back above -- not
 -- merely call SetTextHeight, but the size it picked is not the user's setting.
-function textCore.Apply(fs, data, prefix, size)
-	local ok = setFont(fs, val(data, prefix, "font"), size or val(data, prefix, "size"),
-		flagString(val(data, prefix, "flags")))
+function textCore.Apply(fs, data, prefix, size, aliases)
+	local ok = setFont(fs, val(data, prefix, "font", aliases), size or val(data, prefix, "size", aliases),
+		flagString(val(data, prefix, "flags", aliases)))
 
-	local c = val(data, prefix, "color")
+	local c = val(data, prefix, "color", aliases)
 	fs:SetTextColor(c[1] or 1, c[2] or 1, c[3] or 1, c[4] or 1)
 
-	fs:SetJustifyH(val(data, prefix, "justifyH"))
-	fs:SetJustifyV(val(data, prefix, "justifyV"))
-	fs:SetSpacing(val(data, prefix, "spacing"))
+	fs:SetJustifyH(val(data, prefix, "justifyH", aliases))
+	fs:SetJustifyV(val(data, prefix, "justifyV", aliases))
+	fs:SetSpacing(val(data, prefix, "spacing", aliases))
 
-	local s = val(data, prefix, "shadowColor")
+	local s = val(data, prefix, "shadowColor", aliases)
 	fs:SetShadowColor(s[1] or 0, s[2] or 0, s[3] or 0, s[4] or 1)
-	fs:SetShadowOffset(val(data, prefix, "shadowX"), val(data, prefix, "shadowY"))
+	fs:SetShadowOffset(val(data, prefix, "shadowX", aliases), val(data, prefix, "shadowY", aliases))
 
 	return ok
 end
@@ -140,9 +177,9 @@ end
 -- Options
 -- ---------------------------------------------------------------------------
 
-local function summary(get)
-	local font = get("font") or DEFAULTS.font
-	local flags = get("flags") or DEFAULTS.flags
+local function summary(get, aliases)
+	local font = get(keyName(aliases, "font")) or DEFAULTS.font
+	local flags = get(keyName(aliases, "flags")) or DEFAULTS.flags
 	return (FONT_LABELS[font] or font) .. ", "
 		.. (textCore.FLAG_LABELS[flags] or flags)
 end
@@ -154,12 +191,12 @@ end
 -- Size and colour are deliberately not here. They belong wherever the consumer
 -- already puts them: they are the two rows anyone actually edits, and burying
 -- them under a fold to keep the other eight company is a worse tab.
-function textCore.OptionFields(data, foldKey, get, set)
+function textCore.OptionFields(data, foldKey, get, set, aliases)
 	local S = WA.OptionsState
 	local collapsed = S.isCollapsed(data, foldKey, true)
 	local fields = { {
 		type = "disclosure", name = "Font Options",
-		summary = summary(get),
+		summary = summary(get, aliases),
 		collapsed = collapsed,
 		onToggle = function()
 			S.setCollapsed(data, foldKey, not collapsed)
@@ -170,21 +207,23 @@ function textCore.OptionFields(data, foldKey, get, set)
 
 	local function row(f) table.insert(fields, f) end
 	local function pick(key, name, values, labels, half)
+		local storedKey = keyName(aliases, key)
 		row({
-			type = "select", name = name, key = key, values = values, labels = labels, half = half,
-			get = function() return get(key) or DEFAULTS[key] end,
-			set = function(v) set(key, v) end,
+			type = "select", name = name, key = storedKey, values = values, labels = labels, half = half,
+			get = function() return get(storedKey) or DEFAULTS[key] end,
+			set = function(v) set(storedKey, v) end,
 		})
 	end
 	local function slide(key, name, min, max, half)
+		local storedKey = keyName(aliases, key)
 		row({
-			type = "range", name = name, key = key, min = min, max = max, step = 1, half = half,
+			type = "range", name = name, key = storedKey, min = min, max = max, step = 1, half = half,
 			get = function()
-				local v = get(key)
+				local v = get(storedKey)
 				if v == nil then return DEFAULTS[key] end
 				return v
 			end,
-			set = function(v) set(key, v) end,
+			set = function(v) set(storedKey, v) end,
 		})
 	end
 
@@ -193,10 +232,11 @@ function textCore.OptionFields(data, foldKey, get, set)
 	pick("justifyH", "Justify", textCore.JUSTIFY_H, JUSTIFY_LABELS, true)
 	pick("justifyV", "Vertical Justify", textCore.JUSTIFY_V, JUSTIFY_LABELS, true)
 	slide("spacing", "Line Spacing", 0, 20)
+	local shadowColorKey = keyName(aliases, "shadowColor")
 	row({
-		type = "color", name = "Shadow Color", key = "shadowColor",
-		get = function() return get("shadowColor") or DEFAULTS.shadowColor end,
-		set = function(v) set("shadowColor", v) end,
+		type = "color", name = "Shadow Color", key = shadowColorKey,
+		get = function() return get(shadowColorKey) or DEFAULTS.shadowColor end,
+		set = function(v) set(shadowColorKey, v) end,
 	})
 	slide("shadowX", "Shadow X", -10, 10, true)
 	slide("shadowY", "Shadow Y", -10, 10, true)

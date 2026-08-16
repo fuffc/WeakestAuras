@@ -38,6 +38,7 @@ WA.dynamic_texts = {
 	p = {
 		get = function(state)
 			if state.progressType == "timed" then
+				if state.paused then return tonumber(state.remaining) or 0 end
 				if not state.expirationTime then return nil end
 				local remaining = state.expirationTime - GetTime()
 				return remaining >= 0 and remaining or nil
@@ -633,7 +634,7 @@ WA.CustomTextIndex = customIndex
 -- "%N.sym" scopes to trigger N's state (region.states[N]); "%sym" uses the
 -- active state (region.state). A formatter is keyed by the whole symbol, "2.p"
 -- included, since each occurrence is configured separately.
-local function valueForSymbol(symbol, region, formatters)
+local function valueForSymbol(symbol, region, formatters, customValues)
 	local formatter = formatters and formatters[symbol]
 	local _, _, trigStr, sym = string.find(symbol, "^(%d+)%.(.+)$")
 	if trigStr and sym then
@@ -642,7 +643,8 @@ local function valueForSymbol(symbol, region, formatters)
 	end
 	local index = customIndex(symbol)
 	if index and not (region.state and region.state[symbol] ~= nil) then
-		local v = region.customValues and region.customValues[index]
+		local values = customValues or region.customValues
+		local v = values and values[index]
 		if v == nil then return "" end
 		if formatter then v = formatter(v, region.state) end
 		return v ~= nil and tostring(v) or ""
@@ -719,12 +721,12 @@ local function walk(text, onLiteral, onSymbol)
 	end
 end
 
-function WA.ReplacePlaceHolders(text, region, formatters)
+function WA.ReplacePlaceHolders(text, region, formatters, customValues)
 	if not text or text == "" then return "" end
 	local out = {}
 	walk(text,
 		function(lit) table.insert(out, lit) end,
-		function(sym) table.insert(out, valueForSymbol(sym, region, formatters)) end)
+		function(sym) table.insert(out, valueForSymbol(sym, region, formatters, customValues)) end)
 	local s = table.concat(out)
 	return (string.gsub(s, "\\n", "\n"))
 end

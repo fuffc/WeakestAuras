@@ -2,7 +2,7 @@
 ## Title: WeakestAuras
 ## Notes: WeakAuras-style buff/debuff/cooldown display addon for the 1.12 client. Requires the ClassicAPI client patch.
 ## Author: fuffc
-## Version: 0.8.0
+## Version: 0.9.0
 ## SavedVariables: WeakestAurasDB
 
 libs\LibStub\LibStub.lua
@@ -10,11 +10,15 @@ libs\LibWidgets\LibWidgets.lua
 WeakestAuras.lua
 Compat.lua
 AuraEnv.lua
+Actions.lua
 Data.lua
+CustomOptions.lua
 StateMachine.lua
+TSU.lua
 Widgets.lua
 FrameChooser.lua
 RegionPrototype.lua
+Animations.lua
 TextReplace.lua
 TextCore.lua
 Regions.lua
@@ -23,11 +27,15 @@ SubBorder.lua
 SubGlow.lua
 SubTick.lua
 Triggers.lua
+AuraOverflow.lua
 TriggerAura.lua
+EventCatalog.lua
 GenericTrigger.lua
 Conditions.lua
 Load.lua
 ImportExport.lua
+WA2Decode.lua
+WA2Import.lua
 Comm.lua
 MoverSizer.lua
 Debug.lua

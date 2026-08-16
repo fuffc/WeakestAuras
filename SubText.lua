@@ -42,10 +42,10 @@ WA.RegisterSubRegionType("subtext", {
 		type = "subtext",
 		text_text = "%s",
 		text_color = { 1, 1, 1, 1 },
-		text_size = 12,
-		text_anchorPoint = "CENTER",
-		text_x = 0,
-		text_y = 0,
+		text_fontSize = 12,
+		anchor_point = "CENTER",
+		anchorXOffset = 0,
+		anchorYOffset = 0,
 		text_visible = true,
 	},
 	-- Icon: a %s stacks text bottom-right. Bar: %n name at the left, %p time at
@@ -54,7 +54,7 @@ WA.RegisterSubRegionType("subtext", {
 		if data.regionType == "icon" then
 			table.insert(data.subRegions, {
 				type = "subtext", text_text = "%s", text_color = { 1, 1, 1, 1 },
-				text_size = 12, text_anchorPoint = "BOTTOMRIGHT", text_x = -2, text_y = 2,
+				text_fontSize = 12, anchor_point = "BOTTOMRIGHT", anchorXOffset = -2, anchorYOffset = 2,
 				text_visible = true,
 			})
 		elseif data.regionType == "progressbar" then
@@ -62,12 +62,12 @@ WA.RegisterSubRegionType("subtext", {
 			-- so neither has to leave room for an icon that may not be there.
 			table.insert(data.subRegions, {
 				type = "subtext", text_text = "%n", text_color = { 1, 1, 1, 1 },
-				text_size = 10, text_anchorPoint = "LEFT", text_x = 3, text_y = 0,
+				text_fontSize = 10, anchor_point = "LEFT", anchorXOffset = 3, anchorYOffset = 0,
 				text_visible = true,
 			})
 			table.insert(data.subRegions, {
 				type = "subtext", text_text = "%p", text_color = { 1, 1, 1, 1 },
-				text_size = 10, text_anchorPoint = "RIGHT", text_x = -3, text_y = 0,
+				text_fontSize = 10, anchor_point = "RIGHT", anchorXOffset = -3, anchorYOffset = 0,
 				text_visible = true,
 			})
 		end
@@ -77,6 +77,7 @@ WA.RegisterSubRegionType("subtext", {
 	properties = {
 		text_visible = { display = "Visible", setter = "SetVisible", type = "bool" },
 		text_color = { display = "Color", setter = "SetTextColor", type = "color" },
+		text_fontSize = { display = "Font Size", setter = "SetTextHeight", type = "number", min = 6, max = 48, step = 1 },
 	},
 	create = function(parent)
 		local region = { parent = parent }
@@ -104,24 +105,29 @@ WA.RegisterSubRegionType("subtext", {
 		function region:SetTextColor(r, g, b, a)
 			self.fontString:SetTextColor(r, g, b, a or 1)
 		end
+		function region:SetTextHeight(size)
+			WA.textCore.Apply(self.fontString, self.subData, "text_", size, WA.textCore.SUBTEXT_KEYS)
+			self.fontString:SetTextHeight(size)
+		end
 		return region
 	end,
 	modify = function(parent, region, parentData, subData)
+		region.subData = subData
 		region.text = subData.text_text or ""
 		region.visible = subData.text_visible ~= false
 		region.formatters, region.everyFrameFormatters =
 			WA.CreateFormatters(region.text, formatGetter(subData), parentData)
 
 		local fs = region.fontString
-		WA.textCore.Apply(fs, subData, "text_")
+		WA.textCore.Apply(fs, subData, "text_", nil, WA.textCore.SUBTEXT_KEYS)
 
 		region.frame:SetFrameLevel(parent:GetFrameLevel() + WA.regionPrototype.SUB_LEVEL)
 
 		proto.AnchorSubRegion(fs, parent, subData, {
 			mode = subData.anchor_mode or "point", target = parent.subRegionAnchor and "bar" or "region",
-			anchorPoint = subData.anchor_point or subData.text_anchorPoint or "CENTER",
-			selfPoint = subData.text_anchorPoint or "CENTER",
-			x = subData.text_x or 0, y = subData.text_y or 0,
+			anchorPoint = subData.anchor_point or "CENTER",
+			selfPoint = subData.anchor_point or "CENTER",
+			x = subData.anchorXOffset or 0, y = subData.anchorYOffset or 0,
 		})
 
 		if region.visible then fs:Show() else fs:Hide() end
@@ -164,9 +170,9 @@ WA.RegisterSubRegionType("subtext", {
 				end,
 			},
 			{
-				type = "range", name = "Size", key = "text_size", min = 6, max = 48, step = 1, half = true,
-				get = function() return subData.text_size end,
-				set = function(v) subData.text_size = v; WA.Add(parentData, true) end,
+				type = "range", name = "Size", key = "text_fontSize", min = 6, max = 48, step = 1, half = true,
+				get = function() return subData.text_fontSize end,
+				set = function(v) subData.text_fontSize = v; WA.Add(parentData, true) end,
 			},
 			{
 				type = "color", name = "Color", key = "text_color",
@@ -176,9 +182,9 @@ WA.RegisterSubRegionType("subtext", {
 		}
 		local anchorFields = WA.regionPrototype.SubRegionAnchorFields(parentData, subData, {
 			mode = subData.anchor_mode or "point", target = parentData.regionType == "progressbar" and "bar" or "region",
-			anchorPoint = subData.anchor_point or subData.text_anchorPoint or "CENTER",
-			selfPoint = subData.text_anchorPoint or "CENTER",
-			x = subData.text_x or 0, y = subData.text_y or 0,
+			anchorPoint = subData.anchor_point or "CENTER",
+			selfPoint = subData.anchor_point or "CENTER",
+			x = subData.anchorXOffset or 0, y = subData.anchorYOffset or 0,
 		})
 		for i = 1, table.getn(anchorFields) do table.insert(fields, anchorFields[i]) end
 
@@ -195,7 +201,7 @@ WA.RegisterSubRegionType("subtext", {
 			function(key, v)
 				subData["text_" .. key] = v
 				WA.Add(parentData, true)
-			end)
+			end, WA.textCore.SUBTEXT_KEYS)
 		for i = 1, table.getn(fontFields) do table.insert(fields, fontFields[i]) end
 
 		local get = formatGetter(subData)

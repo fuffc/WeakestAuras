@@ -14,17 +14,23 @@ if WeakestAuras.disabled then return end
 local WA = WeakestAuras
 
 -- triggerState[id] (§3): per-display combination state + per-trigger
--- allstates. [triggernum] = allstates (cloneId -> state; "" is the sole,
--- non-clone key produced). Kept file-local; Debug reads it via
--- WA.GetDisplayTriggerState.
+-- allstates. [triggernum] = allstates (cloneId -> state; "" is the base key).
+-- Kept file-local; Debug reads it via WA.GetDisplayTriggerState.
 local triggerState = {}
 
 -- regions[id] = { regionType = "icon", byClone = { [cloneId] = frame } }. Keyed
 -- by display id and re-keyed on rename (WA.Rename) -- everything the engine owns
--- is id-keyed, matching upstream. CloneId is plumbed throughout but "" is the
--- only value ever produced, so the "pool" is a create-on-demand stub; real
--- pooling arrives with clones.
+-- is id-keyed, matching upstream. The base clone "" is display-owned; non-empty
+-- clones are acquired from clonePools and returned when they leave the state set.
 local regions = {}
+local clonePools = {}
+
+-- Monotonic per-region-frame stamp, in acquisition order. `pairs(entry.byClone)` is a
+-- hash walk whose order can differ between two passes over the same set, so a dynamic
+-- group with no opinion about two clones would move them relative to each other for want
+-- of a tiebreak. This is that tiebreak, and it reproduces upstream's ordering rule: a
+-- clone sits where it was inserted, and a clone released and re-acquired goes to the end.
+local cloneSeq = 0
 
 -- loaded[id] = true while a display's load conditions pass (Load.lua, §11).
 -- "Loaded" is distinct from "added": WA.Add compiles every display's
@@ -97,8 +103,96 @@ local function eachSystem(fn)
 end
 
 -- ---------------------------------------------------------------------------
--- Regions (create-on-demand stub pool)
+-- Regions and clone pools
 -- ---------------------------------------------------------------------------
+
+local function clonePool(regionType)
+	local pool = clonePools[regionType]
+	if not pool then
+		pool = {}
+		clonePools[regionType] = pool
+	end
+	return pool
+end
+
+local function resetRegionState(frame)
+	frame.state = nil
+	frame.states = {}
+	frame.toShow = false
+	frame.limited = false
+end
+
+local function acquireClone(rt, data, cloneId)
+	local pool = clonePool(data.regionType)
+	local frame
+	for i = table.getn(pool), 1, -1 do
+		if pool[i]._waRegionSpec == rt then
+			frame = table.remove(pool, i)
+			break
+		end
+	end
+	if not frame then frame = rt.create(UIParent, data) end
+	WA.CancelAnimation(frame, true, true, true, true, true, false)
+	frame.animatingFinish = false
+	frame.pendingRelease = false
+	if frame.SetParent then frame:SetParent(UIParent) end
+	if frame.ClearAllPoints then frame:ClearAllPoints() end
+	if frame.Collapse then frame:Collapse() end
+	frame:Hide()
+	resetRegionState(frame)
+	frame.id = data.id
+	frame.cloneId = cloneId
+	cloneSeq = cloneSeq + 1
+	frame.cloneSeq = cloneSeq
+	frame._waRegionType = data.regionType
+	frame._waRegionSpec = rt
+	if rt.modify then rt.modify(frame, data) end
+	return frame
+end
+
+local function collapseFrame(frame, data)
+	if data and data.uid then WA.RunConditions(frame, data.uid, true) end
+	if frame.Collapse then frame:Collapse() end
+end
+
+local function releaseClone(entry, cloneId, frame, data)
+	if cloneId == "" or entry.byClone[cloneId] ~= frame then return end
+	if frame.pendingRelease then return end
+	frame.pendingRelease = true
+	if data and data.uid then WA.ReleaseConditionsForClone(data.uid, cloneId) end
+	-- A state-owned hide (TSU's state.autoHide) outlives the state that scheduled
+	-- it, and would fire against a clone key this frame no longer represents.
+	if WA.StopStateTimersForClone then
+		WA.StopStateTimersForClone(frame.id or (data and data.id), cloneId)
+	end
+	entry.byClone[cloneId] = nil
+	local function recycle()
+		if not frame.pendingRelease then return end
+		frame.pendingRelease = false
+		resetRegionState(frame)
+		frame.id = nil
+		frame.cloneId = nil
+		frame._waRegionType = entry.regionType
+		frame._waRegionSpec = entry.spec
+		local pool = clonePool(entry.regionType)
+		for i = 1, table.getn(pool) do
+			if pool[i] == frame then return end
+		end
+		table.insert(pool, frame)
+	end
+	if frame.Collapse then frame:Collapse(recycle) else recycle() end
+end
+
+local function releaseNonBaseClones(entry, data)
+	local stale = {}
+	for cloneId in pairs(entry.byClone) do
+		if cloneId ~= "" then table.insert(stale, cloneId) end
+	end
+	for i = 1, table.getn(stale) do
+		local cloneId = stale[i]
+		releaseClone(entry, cloneId, entry.byClone[cloneId], data)
+	end
+end
 
 -- Creates or returns the region frame for (id, cloneId). Rebuilds the whole
 -- entry when the display's regionType changed under it. Regions are created
@@ -117,7 +211,9 @@ local function EnsureRegion(id, cloneId)
 	-- real type has since been registered gets rebuilt rather than kept.
 	if not entry or entry.regionType ~= data.regionType or entry.spec ~= rt then
 		if entry then
-			for _, frame in pairs(entry.byClone) do frame:Hide() end
+			releaseNonBaseClones(entry, data)
+			local base = entry.byClone[""]
+			if base then collapseFrame(base, data); base:Hide() end
 		end
 		entry = { regionType = data.regionType, spec = rt, byClone = {} }
 		regions[id] = entry
@@ -125,15 +221,19 @@ local function EnsureRegion(id, cloneId)
 
 	local frame = entry.byClone[cloneId]
 	if not frame then
-		frame = rt.create(UIParent, data)
-		-- Its own identity, upstream's region.id/region.cloneId pair: anything
-		-- reached *through* a region and needing to know which aura it belongs to
-		-- (the aura environment, an error message naming the aura) has only the
-		-- frame to ask. WA.Rename re-stamps it.
-		frame.id = id
-		frame.cloneId = cloneId
+		if cloneId == "" then
+			frame = rt.create(UIParent, data)
+			frame.id = id
+			frame.cloneId = cloneId
+			cloneSeq = cloneSeq + 1
+			frame.cloneSeq = cloneSeq
+			frame._waRegionType = data.regionType
+			frame._waRegionSpec = rt
+			if rt.modify then rt.modify(frame, data) end
+		else
+			frame = acquireClone(rt, data, cloneId)
+		end
 		entry.byClone[cloneId] = frame
-		if rt.modify then rt.modify(frame, data) end
 	end
 	return frame
 end
@@ -150,18 +250,23 @@ local function SetRegion(data)
 			rt.modify(frame, data)
 		end
 	end
+	local entry = regions[data.id]
+	if entry and WA.CancelAnimation then
+		for _, frame in pairs(entry.byClone) do
+			if WA.CancelAnimation(frame, true, true, true, true, true, false) then
+				WA.Animate("display", data.uid, "main", data.animation and data.animation.main, frame, false, nil, true, frame.cloneId)
+			end
+		end
+	end
 end
 
 local function CollapseAll(id)
 	local entry = regions[id]
 	if not entry then return end
 	local data = WeakestAurasDB.displays[id]
-	for _, frame in pairs(entry.byClone) do
-		-- Re-run conditions in hide mode first (restores base property values,
-		-- clears activation bookkeeping) while the region still has its states.
-		if data and data.uid then WA.RunConditions(frame, data.uid, true) end
-		frame:Collapse()
-	end
+	local base = entry.byClone[""]
+	if base then collapseFrame(base, data) end
+	releaseNonBaseClones(entry, data)
 end
 
 -- Collapse clones whose cloneId no longer has a state (Show->Show pruning).
@@ -169,11 +274,15 @@ local function CollapseStaleClones(id, allstates)
 	local entry = regions[id]
 	if not entry then return end
 	local data = WeakestAurasDB.displays[id]
-	for cloneId, frame in pairs(entry.byClone) do
-		if not allstates[cloneId] then
-			if data and data.uid then WA.RunConditions(frame, data.uid, true) end
-			frame:Collapse()
-		end
+	local base = entry.byClone[""]
+	if base and not allstates[""] then collapseFrame(base, data) end
+	local stale = {}
+	for cloneId in pairs(entry.byClone) do
+		if cloneId ~= "" and not allstates[cloneId] then table.insert(stale, cloneId) end
+	end
+	for i = 1, table.getn(stale) do
+		local cloneId = stale[i]
+		releaseClone(entry, cloneId, entry.byClone[cloneId], data)
 	end
 end
 
@@ -232,25 +341,51 @@ function WA.RunConditions(region, uid, hide) end
 -- Apply states to regions (§3 ApplyStatesToRegions)
 -- ---------------------------------------------------------------------------
 
+-- The state a non-active trigger contributes for one clone (§3): its own state
+-- under the exact clone key, else -- for a dotted key like "unit.3" -- whatever
+-- the part before the first dot owns, else the base "" state. The dotted step is
+-- how a producer namespaces sub-clones under one parent identity and still reads
+-- the parent's other triggers; a plain find, since a clone key is data and "." in
+-- a pattern would match anything.
+local function secondaryState(as, cloneId)
+	if not as then return nil end
+	local state = as[cloneId]
+	if state then return state end
+	if type(cloneId) == "string" then
+		local dot = string.find(cloneId, ".", 1, true)
+		if dot then
+			local prefix = string.sub(cloneId, 1, dot - 1)
+			return as[prefix] or as[""]
+		end
+	end
+	return as[""]
+end
+
 local function ApplyStatesToRegions(id, activeTrigger, allstates)
 	local ts = triggerState[id]
 	local data = WeakestAurasDB.displays[id]
 	for cloneId, state in pairs(allstates) do
 		local region = EnsureRegion(id, cloneId)
 		if region then
+			local applyChanges = region.state ~= state or state.changed or not region.toShow
 			region.state = state
 			if data.anchorFrameType == "NAMEPLATE" or data.anchorFrameType == "UNITFRAME" then
 				WA.regionPrototype.ApplyPosition(region, data)
 			end
 			region.states = region.states or {}
-			-- Every trigger's state for this clone is readable (falling back to
-			-- the "" state), so text can say %2.p and conditions can check
-			-- trigger 3 while another trigger drives the display (§3).
+			-- Every trigger's state for this clone is readable (through
+			-- secondaryState's fallback chain), so text can say %2.p and
+			-- conditions can check trigger 3 while another trigger drives the
+			-- display (§3).
 			for triggernum = 1, ts.numTriggers do
-				local as = ts[triggernum]
-				region.states[triggernum] = as and (as[cloneId] or as[""]) or nil
+				local triggerState = secondaryState(ts[triggernum], cloneId)
+				if region.states[triggernum] ~= triggerState
+					or (triggerState and triggerState.changed) then
+					applyChanges = true
+				end
+				region.states[triggernum] = triggerState
 			end
-			if state.changed or not region.toShow then
+			if applyChanges then
 				WA.safecall(id, region.Update, region)
 				region.subRegionEvents:Notify("Update", state, region.states)
 				region:Expand()
@@ -359,7 +494,7 @@ function WA.UpdatedTriggerState(id)
 	ts.show = newShow
 	if newShow then
 		ApplyStatesToRegions(id, activeTrigger, allstates)
-		if wasShown then CollapseStaleClones(id, allstates) end
+		CollapseStaleClones(id, allstates)
 	elseif wasShown then
 		CollapseAll(id)
 	end
@@ -478,7 +613,9 @@ local function applyLoad(data, shouldLoad)
 	setStandby(data, shouldLoad)
 	if shouldLoad then
 		eachSystem(function(system) if system.LoadDisplays then system.LoadDisplays({ id }) end end)
+		if not wasLoaded and WA.RunActionCodeForLoad then WA.RunActionCodeForLoad(data, "load") end
 	else
+		if wasLoaded and WA.RunActionCodeForLoad then WA.RunActionCodeForLoad(data, "unload") end
 		eachSystem(function(system) if system.UnloadDisplays then system.UnloadDisplays({ id }) end end)
 		local ts = triggerState[id]
 		if ts then
@@ -489,6 +626,7 @@ local function applyLoad(data, shouldLoad)
 			ts.show = false
 		end
 		CollapseAll(id)
+		if data.parent then WA.RelayoutGroup(data.parent) end
 	end
 	if (loaded[id] ~= wasLoaded or standby[id] ~= wasStandby) and WA.RefreshList then
 		WA.RefreshList()
@@ -584,6 +722,10 @@ function WA.RefreshMembership(childId, oldParent, newParent)
 		local cf = WA.PeekRegion(childId, "")
 		if cf then WA.regionPrototype.ApplyPosition(cf, cd) end
 	end
+	-- The group this child is leaving no longer iterates it, so a clone left
+	-- behind its limit would stay invisible forever. The relayout below
+	-- re-applies the new parent's limit (if any) once it does iterate it.
+	WA.ForEachClone(childId, function(frame) frame:SetLimited(false) end)
 	if oldParent then WA.RelayoutGroup(oldParent) end
 	if newParent and newParent ~= oldParent then WA.RelayoutGroup(newParent) end
 end
@@ -598,6 +740,7 @@ function WA.Add(data, simpleChange)
 	resetAnchorCycle(data)
 
 	local id = data.id
+	if WA.CompileActions then WA.CompileActions(data) end
 
 	-- Fast-path (WA2's pAdd simpleChange): a pure-visual edit (region/subregion
 	-- appearance) doesn't change which states are produced or the load status, so
@@ -713,13 +856,15 @@ function WA.Remove(data)
 	CollapseAll(id)
 	local entry = regions[id]
 	if entry then
-		for _, frame in pairs(entry.byClone) do frame:Hide() end
+		local base = entry.byClone[""]
+		if base then base:Hide(); base.state = nil; base.states = {} end
 		regions[id] = nil
 	end
 	triggerState[id] = nil
 	loaded[id] = nil
 	standby[id] = nil
 	WA.ClearAuraEnv(id)
+	if WA.ClearActionFunctions then WA.ClearActionFunctions(id) end
 	WA.UnloadConditions(data)
 	eachSystem(function(system) if system.Delete then system.Delete(id) end end)
 	-- Its group's box no longer needs to cover this child.
@@ -745,6 +890,7 @@ function WA.Rename(oldId, newId)
 		standby[oldId] = nil
 	end
 	WA.RenameAuraEnv(oldId, newId)
+	if WA.RenameActionFunctions then WA.RenameActionFunctions(oldId, newId) end
 	eachSystem(function(system) if system.Rename then system.Rename(oldId, newId) end end)
 end
 
@@ -782,6 +928,31 @@ end
 -- Debug read-only accessor (Debug.lua's /wa states).
 function WA.GetDisplayTriggerState(id)
 	return triggerState[id]
+end
+
+-- Read-only clone lifecycle accounting, grouped by region type.
+function WA.GetClonePoolStats(regionType)
+	local stats = {}
+	local function bucket(kind)
+		local out = stats[kind]
+		if not out then
+			out = { live = 0, pooled = 0 }
+			stats[kind] = out
+		end
+		return out
+	end
+	for _, entry in pairs(regions) do
+		local out = bucket(entry.regionType)
+		for cloneId in pairs(entry.byClone) do
+			if cloneId ~= "" then out.live = out.live + 1 end
+		end
+	end
+	for kind, pool in pairs(clonePools) do
+		local out = bucket(kind)
+		out.pooled = table.getn(pool)
+	end
+	if regionType then return stats[regionType] or { live = 0, pooled = 0 } end
+	return stats
 end
 
 -- ---------------------------------------------------------------------------

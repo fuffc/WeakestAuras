@@ -1,0 +1,11 @@
+These bundled faces are unchanged copies from SharedMedia r201:
+
+Celestia Medium Redux, DejaVu Sans, DejaVu Serif, Gentium Plus, Hack,
+Liberation Mono, Liberation Sans, Liberation Serif, swf!t, and Yellowjacket.
+
+Source: https://www.curseforge.com/wow/addons/sharedmedia/files/7508371
+Project: https://www.curseforge.com/wow/addons/sharedmedia
+
+The applicable license and attribution files are under
+fonts/licenses/SharedMedia. The source registration names are retained in
+TextCore.lua because WeakAuras exports store LibSharedMedia font names.

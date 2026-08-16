@@ -1,6 +1,6 @@
 -- WeakestAuras -- in-game probes and verification commands for the runtime
--- engine. Registers /wa probe, states, libs, addons, gen, load, conditions,
--- codeprobe, textprobe, texprobe, and cdtest.
+-- engine. Registers /wa probe, soundprobe, states, libs, addons, gen, load,
+-- conditions, codeprobe, textprobe, texprobe, wa2probe, wa2, and cdtest.
 
 if WeakestAuras.disabled then return end
 
@@ -290,6 +290,345 @@ function D.ToggleEventLog(rest)
 	else
 		D.Log("[events] started on: " .. table.concat(eventLogNames, ", "))
 	end
+end
+
+-- ---------------------------------------------------------------------------
+-- /wa auraprobe [unit|all] -- Nampower's aura-cast events, decoded against the
+-- watched unit's harmful descriptor. The question is whether a debuff the
+-- descriptor never transmits (only 16 harmful slots exist, and a raid boss
+-- carries more) is still knowable: whether AURA_CAST_ON_OTHER carries *other*
+-- players' casts and not only ours, whether arg9's debuff-bar-full bit sets,
+-- whether arg8 is a real talented duration, and whether an aura it reports is
+-- one /wa dump cannot see.
+--
+-- Arg order is taken from two working consumers on this client,
+-- ../SuperCleveRoidMacros/NampowerAPI.lua and ../pfUI/libs/libdebuff.lua:
+--   arg1 spellId  arg2 casterGuid  arg3 targetGuid  arg4 effect
+--   arg5 effectAuraName (a numeric aura type, whatever the name suggests)
+--   arg6 effectAmplitude (a periodic effect's tick period, ms)
+--   arg7 effectMiscValue  arg8 durationMs
+--   arg9 auraCapStatus (bit 1 buff bar full, bit 2 debuff bar full)
+-- The SELF/OTHER split is by *target*, not by caster.
+-- ---------------------------------------------------------------------------
+
+local AURA_CAST_EVENTS = { "AURA_CAST_ON_SELF", "AURA_CAST_ON_OTHER" }
+local AURA_CAST_CVAR = "NP_EnableAuraCastEvents"
+local AURA_CAST_MIN = "2.20.0"
+local AURA_CAST_DEDUPE = 0.1 -- pfUI's window: one event fires per spell *effect*
+local AURA_CAST_SETTLE = 2   -- the cast event precedes the descriptor update
+local HARMFUL_SLOTS = 16     -- descriptor slots 32..47; see design/client/gotchas.md
+
+local auraProbe = { registered = {}, session = 0, stats = {} }
+
+local function auraProbeReset()
+	auraProbe.n = 0
+	auraProbe.last = {}
+	auraProbe.pending = 0
+	auraProbe.stats = {
+		seen = 0, elsewhere = 0, onSelf = 0, onOther = 0,
+		byPlayer = 0, byOther = 0, dupes = 0,
+		capDebuff = 0, capBuff = 0, capNil = 0, zeroDur = 0,
+		hit = 0, miss = 0, overflow = 0,
+	}
+end
+
+-- GUIDs arrive as strings from two different sources here (Nampower's event and
+-- the client's UnitGUID), so they are compared case-insensitively rather than
+-- assumed to agree on hex case.
+local function sameGuid(a, b)
+	if not a or not b then return false end
+	return string.lower(tostring(a)) == string.lower(tostring(b))
+end
+
+local function shortGuid(guid)
+	local s = tostring(guid)
+	if string.len(s) > 6 then return "~" .. string.sub(s, -6) end
+	return s
+end
+
+-- nil when the token is not addressable at all, which a raw GUID used as a unit
+-- token may well not be -- that is one of the things being probed.
+local function harmfulScan(unit, wantSpellId)
+	local count, highest, slot = 0, 0, nil
+	local ok = pcall(function()
+		for i = 1, MAX_SLOT do
+			local aura = C_UnitAuras.GetAuraDataByIndex(unit, i, "HARMFUL")
+			if aura then
+				count = count + 1
+				highest = i
+				if wantSpellId and not slot and aura.spellId == wantSpellId then slot = i end
+			end
+		end
+	end)
+	if not ok then return nil end
+	return count, highest, slot
+end
+
+local function capBits(status)
+	local n = tonumber(status)
+	if not n then return nil end
+	return math.mod(n, 2) == 1, math.mod(math.floor(n / 2), 2) == 1
+end
+
+-- The descriptor lags the cast event, so the read that settles "did this one get
+-- a slot?" is the one taken a couple of seconds later.
+local function auraProbeCheckLater(unit, guid, spellId, name)
+	local session = auraProbe.session
+	auraProbe.pending = auraProbe.pending + 1
+	C_Timer.After(AURA_CAST_SETTLE, function()
+		if auraProbe.session ~= session then return end
+		auraProbe.pending = auraProbe.pending - 1
+		local label = string.format("[auraprobe]   +%ds %s(%s):", AURA_CAST_SETTLE, tostring(name), tostring(spellId))
+		if not sameGuid(UnitGUID and UnitGUID(unit), guid) then
+			D.Log(label .. " " .. unit .. " is a different unit now, cross-check skipped")
+			return
+		end
+		local count, _, slot = harmfulScan(unit, spellId)
+		if not count then
+			D.Log(label .. " " .. unit .. " is no longer readable, cross-check skipped")
+		elseif slot then
+			auraProbe.stats.hit = auraProbe.stats.hit + 1
+			D.Log(string.format("%s descriptor HIT slot %d (harm=%d)", label, slot, count))
+		else
+			auraProbe.stats.miss = auraProbe.stats.miss + 1
+			if count >= HARMFUL_SLOTS then
+				auraProbe.stats.overflow = auraProbe.stats.overflow + 1
+				D.Log(string.format("%s descriptor MISS at harm=%d -- OVERFLOW, /wa dump cannot see this one", label, count))
+			else
+				D.Log(string.format("%s descriptor MISS at harm=%d -- not full, so it expired, was resisted, or never applied", label, count))
+			end
+		end
+	end)
+end
+
+local function auraProbeEvent()
+	local spellId, casterGuid, targetGuid = arg1, arg2, arg3
+	local effect, auraName, amplitude, misc = arg4, arg5, arg6, arg7
+	local durationMs, capStatus = arg8, arg9
+	local st = auraProbe.stats
+	st.seen = st.seen + 1
+
+	if auraProbe.unit and not sameGuid(targetGuid, UnitGUID and UnitGUID(auraProbe.unit)) then
+		st.elsewhere = st.elsewhere + 1
+		return
+	end
+
+	if event == "AURA_CAST_ON_SELF" then st.onSelf = st.onSelf + 1 else st.onOther = st.onOther + 1 end
+
+	local now = GetTime()
+	local key = tostring(targetGuid) .. "|" .. tostring(spellId) .. "|" .. tostring(casterGuid)
+	local prev = auraProbe.last[key]
+	local dup = prev and (now - prev) < AURA_CAST_DEDUPE
+	auraProbe.last[key] = now
+	if dup then st.dupes = st.dupes + 1 end
+
+	local mine = sameGuid(casterGuid, auraProbe.playerGuid)
+	if mine then st.byPlayer = st.byPlayer + 1 else st.byOther = st.byOther + 1 end
+	local casterLabel = "you"
+	if not mine then
+		casterLabel = "OTHER " .. shortGuid(casterGuid)
+		-- SuperWoW makes a GUID a unit token, but whether an arbitrary caster
+		-- resolves through one is part of what this probe answers.
+		local ok, nm = pcall(UnitName, casterGuid)
+		if ok and nm then casterLabel = casterLabel .. " " .. nm end
+	end
+
+	local buffFull, debuffFull = capBits(capStatus)
+	if capStatus == nil then st.capNil = st.capNil + 1 end
+	if debuffFull then st.capDebuff = st.capDebuff + 1 end
+	if buffFull then st.capBuff = st.capBuff + 1 end
+	local capText = tostring(capStatus)
+	if debuffFull then capText = capText .. "(debuff-full)" end
+	if buffFull then capText = capText .. "(buff-full)" end
+
+	local ms = tonumber(durationMs)
+	if not ms or ms == 0 then st.zeroDur = st.zeroDur + 1 end
+
+	local count, highest = harmfulScan(auraProbe.unit or targetGuid)
+	local name = C_Spell and C_Spell.GetSpellName and C_Spell.GetSpellName(spellId)
+
+	auraProbe.n = auraProbe.n + 1
+	D.Log(string.format(
+		"[auraprobe] #%d %s %s(%s) by %s -> %s harm=%s%s dur=%s cap=%s eff=%s aura=%s amp=%s misc=%s%s",
+		auraProbe.n,
+		event == "AURA_CAST_ON_SELF" and "SELF " or "OTHER",
+		tostring(name), tostring(spellId), casterLabel, shortGuid(targetGuid),
+		tostring(count), (count and count >= HARMFUL_SLOTS) and " FULL" or "",
+		ms and string.format("%.1fs", ms / 1000) or tostring(durationMs),
+		capText, tostring(effect), tostring(auraName), tostring(amplitude), tostring(misc),
+		dup and " DUP" or ""))
+	if highest and count and highest > count then
+		D.Log(string.format("[auraprobe]   ^ descriptor has a gap: %d aura(s) but highest slot %d", count, highest))
+	end
+
+	if auraProbe.unit and not dup then
+		auraProbeCheckLater(auraProbe.unit, targetGuid, spellId, name)
+	end
+end
+
+local function auraProbeStop()
+	auraProbe.active = false
+	for i = 1, table.getn(auraProbe.registered) do
+		auraProbe.frame:UnregisterEvent(auraProbe.registered[i])
+	end
+	auraProbe.registered = {}
+
+	local st = auraProbe.stats
+	local where = auraProbe.unit or "any unit"
+	D.Log("--- auraprobe summary ---")
+	D.Log(string.format("  %d event(s) fired, %d on another unit, %d logged on %s",
+		st.seen, st.elsewhere, auraProbe.n, where))
+	D.Log(string.format("  event split on %s: ON_SELF %d, ON_OTHER %d", where, st.onSelf, st.onOther))
+	D.Log(string.format("  caster split on %s: you %d, someone else %d   <- Q2, the load-bearing one",
+		where, st.byPlayer, st.byOther))
+	D.Log(string.format("  arg9: debuff-bar-full %d, buff-bar-full %d, nil %d   <- Q3",
+		st.capDebuff, st.capBuff, st.capNil))
+	D.Log(string.format("  arg8: %d carried a duration, %d were zero   <- Q4",
+		auraProbe.n - st.zeroDur, st.zeroDur))
+	D.Log(string.format("  descriptor at +%ds: %d hit, %d miss, %d of those missed while full   <- Q5",
+		AURA_CAST_SETTLE, st.hit, st.miss, st.overflow))
+	D.Log(string.format("  %d event(s) landed inside the %.1fs dedupe window (multi-effect spells)",
+		st.dupes, AURA_CAST_DEDUPE))
+	if auraProbe.pending > 0 then
+		D.Log(string.format("  %d cross-check(s) still pending; their lines follow this summary",
+			auraProbe.pending))
+	end
+	D.Log("--- end auraprobe ---")
+end
+
+function D.AuraProbe(rest)
+	if auraProbe.active then
+		auraProbeStop()
+		return
+	end
+
+	local _, _, word = string.find(string.lower(rest or ""), "^%s*(%S*)")
+	local unit = "target"
+	if word == "all" then unit = nil
+	elseif word ~= "" then unit = word end
+
+	auraProbe.session = auraProbe.session + 1
+	auraProbeReset()
+	auraProbe.unit = unit
+	auraProbe.playerGuid = (UnitGUID and UnitGUID("player")) or (GetPlayerGuid and GetPlayerGuid())
+
+	D.Log("--- auraprobe ---")
+
+	if not WA.hasNampower then
+		D.Log("  GetNampowerVersion absent -- no aura-cast events on this client")
+	else
+		local ok, major, minor, patch = pcall(GetNampowerVersion)
+		if not ok or not major then
+			D.Log("  GetNampowerVersion did not answer")
+		else
+			minor, patch = minor or 0, patch or 0
+			local have = WA.ParseVersion(major .. "." .. minor .. "." .. patch)
+			local need = WA.ParseVersion(AURA_CAST_MIN)
+			D.Log(string.format("  Nampower %s.%s.%s, aura-cast events need %s: %s   <- Q1",
+				tostring(major), tostring(minor), tostring(patch), AURA_CAST_MIN,
+				(have and have >= need) and "OK" or "TOO OLD"))
+		end
+	end
+
+	-- Nampower sends nothing at all with this CVar off, so the probe turns it on
+	-- rather than reporting an empty stream as a negative result.
+	if type(GetCVar) ~= "function" then
+		D.Log("  GetCVar absent -- cannot read " .. AURA_CAST_CVAR .. "   <- Q1")
+	else
+		local ok, value = pcall(GetCVar, AURA_CAST_CVAR)
+		D.Log(string.format("  %s = %s   <- Q1", AURA_CAST_CVAR, ok and tostring(value) or "unreadable"))
+		if ok and value ~= "1" and type(SetCVar) == "function" then
+			pcall(SetCVar, AURA_CAST_CVAR, "1")
+			local reread, after = pcall(GetCVar, AURA_CAST_CVAR)
+			D.Log("  set it to 1 -> reads back " .. (reread and tostring(after) or "unreadable"))
+		end
+	end
+
+	-- The overflow cache drops helpful auras on this classifier's word, so a
+	-- client whose ClassicAPI does not carry it caches more than it needs to.
+	if not (C_Spell and C_Spell.IsSpellHarmful) then
+		D.Log("  C_Spell.IsSpellHarmful absent -- helpful auras cannot be filtered out")
+	else
+		local okHarm, harmful = pcall(C_Spell.IsSpellHarmful, 9835)
+		local okHelp, helpful = pcall(C_Spell.IsSpellHarmful, 1126)
+		D.Log(string.format("  C_Spell.IsSpellHarmful: Moonfire(9835)=%s, Mark of the Wild(1126)=%s (want true, false)",
+			okHarm and tostring(harmful) or "errored", okHelp and tostring(helpful) or "errored"))
+	end
+
+	if not auraProbe.frame then
+		auraProbe.frame = CreateFrame("Frame")
+		auraProbe.frame:SetScript("OnEvent", function() WA.safecall("auraprobe", auraProbeEvent) end)
+	end
+	for i = 1, table.getn(AURA_CAST_EVENTS) do
+		local name = AURA_CAST_EVENTS[i]
+		-- RegisterEvent throws on an event this client does not know, which is
+		-- itself the answer when the question is whether it exists here.
+		if pcall(function() auraProbe.frame:RegisterEvent(name) end) then
+			table.insert(auraProbe.registered, name)
+		else
+			D.Log("  " .. name .. " -- refused by the client, no such event")
+		end
+	end
+	D.Log("  registered: " .. (table.getn(auraProbe.registered) > 0
+		and table.concat(auraProbe.registered, ", ") or "nothing"))
+
+	D.Log("  player GUID " .. tostring(auraProbe.playerGuid))
+	if unit then
+		local count, highest = harmfulScan(unit)
+		D.Log(string.format("  watching %s (guid %s): %s harmful aura(s) now, highest slot %s",
+			unit, tostring(UnitGUID and UnitGUID(unit)), tostring(count), tostring(highest)))
+	else
+		D.Log("  watching every target -- no descriptor cross-check without a unit token, and a raid is a firehose")
+	end
+	auraProbe.active = true
+	D.Log("  running -- /wa auraprobe again to stop and print the summary")
+end
+
+-- ---------------------------------------------------------------------------
+-- /wa overflow [unit] -- what the overflow cache holds for a unit, how long each
+-- entry has left, and whether the trust gate currently lets any of it be used.
+-- Runs the same reconcile a trigger would, so it evicts as it reports: the dump
+-- is the state a scan would see, not the state before one.
+-- ---------------------------------------------------------------------------
+
+function D.Overflow(rest)
+	local _, _, word = string.find(string.lower(rest or ""), "^%s*(%S*)")
+	local unit = (word ~= "" and word) or "target"
+	local AO = WA.AuraOverflow
+
+	D.Log("--- overflow " .. unit .. " ---")
+	if not (AO and AO.Enabled()) then
+		D.Log("  the cache is not running -- Nampower absent or below 2.20")
+		D.Log("--- end overflow ---")
+		return
+	end
+	D.Log("  global toggle: " .. (WA.Options().auraOverflow == false and "OFF" or "on"))
+
+	local guid = UnitGUID and UnitGUID(unit)
+	if not guid then
+		D.Log("  " .. unit .. " has no GUID")
+		D.Log("--- end overflow ---")
+		return
+	end
+
+	local gate, count = AO.Reconcile(unit, guid)
+	D.Log(string.format("  %s guid %s, harmful descriptor %s/%d -- trust gate %s",
+		unit, tostring(guid), tostring(count), HARMFUL_SLOTS, gate and "PASSES" or "fails"))
+
+	local now = GetTime()
+	local entries = AO.EntriesFor(guid) or {}
+	local n = table.getn(entries)
+	for i = 1, n do
+		local e = entries[i]
+		local remain = "unknown"
+		if e.duration > 0 then remain = string.format("%.1fs", (e.start + e.duration) - now) end
+		D.Log(string.format("  %s(%s) caster=%s remain=%s age=%.1fs capped=%s",
+			tostring(e.name), tostring(e.spellId), tostring(e.caster), remain,
+			now - e.start, tostring(AO.WasCapped(e))))
+	end
+	D.Log(string.format("  %d entry(ies)%s", n,
+		gate and "" or " -- none of them can be surfaced while the gate fails"))
+	D.Log("--- end overflow ---")
 end
 
 -- ---------------------------------------------------------------------------
@@ -863,6 +1202,48 @@ function D.Rows()
 	D.Log("--- end rows ---")
 end
 
+-- A leaf carrying one custom option of every type, for exercising the Custom
+-- tab by hand. Built here rather than shipped as an import string because an
+-- export string can only be produced by the client's own C_EncodingUtil --
+-- a hand-rolled CBOR/zlib/base64 blob cannot be checked against tinycbor
+-- offline, so it is not a fixture anything can trust.
+function D.ConfigTest()
+	local data = WA.NewAura("icon")
+	data.authorOptions = {
+		{ type = "toggle", key = "showIt", name = "Show It", default = true, width = 1 },
+		{ type = "input", key = "label", name = "Label", default = "hello", width = 1 },
+		{ type = "number", key = "count", name = "Count", default = 3, min = 0, max = 10, step = 1, width = 1 },
+		{ type = "range", key = "size", name = "Size", default = 32, min = 8, max = 64, step = 1, width = 1 },
+		{ type = "select", key = "mode", name = "Mode", default = 2,
+			values = { "Alpha", "Beta", "Gamma" }, width = 1 },
+		{ type = "color", key = "tint", name = "Tint", default = { 1, 0.5, 0, 1 }, width = 1 },
+		{ type = "multiselect", key = "flags", name = "Flags", default = { true, false, true },
+			values = { "One", "Two", "Three" }, width = 1 },
+		{ type = "description", text = "Change a control, switch tabs, come back.", width = 2 },
+		{ type = "header", useName = true, name = "Groups", text = "", width = 2 },
+		{ type = "group", key = "grp", name = "Simple Group", groupType = "simple",
+			useCollapse = true, collapse = false, width = 2, subOptions = {
+				{ type = "toggle", key = "inner", name = "Inner Toggle", default = false, width = 1 },
+				{ type = "input", key = "innerText", name = "Inner Text", default = "nested", width = 1 },
+			} },
+		{ type = "group", key = "arr", name = "Array Group", groupType = "array",
+			limitType = "none", size = 10, nameSource = 1, hideReorder = false,
+			useCollapse = true, collapse = false, width = 2, subOptions = {
+				{ type = "input", key = "entryName", name = "Entry Name", default = "entry", width = 1 },
+				{ type = "toggle", key = "entryOn", name = "Enabled", default = true, width = 1 },
+			} },
+	}
+	data.config = {}
+	WA.MergeDefaults(data)
+	WA.Add(data)
+	if WA.RefreshList then WA.RefreshList() end
+	D.Log("--- configtest ---")
+	D.Log("  created \"" .. tostring(data.id) .. "\" with "
+		.. table.getn(data.authorOptions) .. " custom options")
+	D.Log("  open the options window, pick it, and use the Custom tab")
+	return data
+end
+
 -- Which vendored LibWidgets actually won, and whether it still has everything
 -- this addon calls. Every addon vendoring the library shares one global
 -- instance (highest MINOR wins, ties to whoever registered first), so a sibling
@@ -968,6 +1349,120 @@ function D.Addons()
 	if table.getn(line) > 0 then D.Log("  " .. table.concat(line, ", ")) end
 end
 
+-- Both spell-cooldown sources for one spell, side by side. The slot read is what
+-- the watcher uses; the C_Spell read is the documented spellID call it fell back
+-- from. Run it while the spell is on cooldown -- if the slot reports a window and
+-- C_Spell reports zeros, the spellID form does not see this client's cooldowns.
+function D.CdProbe(rest)
+	D.Log("--- cdprobe ---")
+	if not rest or rest == "" then
+		D.Log("  usage: /wa cdprobe <spell name or id>")
+		D.Log("--- end cdprobe ---")
+		return
+	end
+	local book = BOOKTYPE_SPELL or "spell"
+	local id = WA.ResolveSpellID(rest)
+	D.Log("  input " .. rest .. " -> spellID " .. tostring(id))
+	if not id then
+		D.Log("  does not resolve: a name only resolves through the player's own spellbook")
+		D.Log("--- end cdprobe ---")
+		return
+	end
+	local name = C_Spell and C_Spell.GetSpellName and C_Spell.GetSpellName(id)
+	D.Log("  name = " .. tostring(name))
+
+	local slot = WA.SpellSlotByID(id)
+	if slot then
+		local sname, srank = GetSpellName(slot, book)
+		D.Log("  slot " .. slot .. " = " .. tostring(sname) .. " " .. tostring(srank))
+		local start, duration = WA.SpellSlotCooldown(slot)
+		if start then
+			D.Log(string.format("  slot cooldown: start %.2f, duration %.2f, %.2f left",
+				start, duration, (start + duration) - GetTime()))
+		else
+			D.Log("  slot cooldown: unreadable")
+		end
+	else
+		D.Log("  slot: none -- this spell is not in the player's book")
+	end
+
+	local info = C_Spell and C_Spell.GetSpellCooldown and C_Spell.GetSpellCooldown(id)
+	if info then
+		D.Log(string.format("  C_Spell.GetSpellCooldown(%d): start %s, duration %s",
+			id, tostring(info.startTime), tostring(info.duration)))
+		if (info.startTime or 0) < 0 then
+			D.Log("    ^ signed-wrapped tick (ClassicAPI reads it into an int; uptime is past")
+			D.Log("      2^31 ms). Repaired to " .. string.format("%.2f", WA.UnwrapTick(info.startTime)))
+		end
+	else
+		D.Log("  C_Spell.GetSpellCooldown(" .. id .. ") = nil")
+	end
+	D.Log(string.format("  GetTime() = %.2f (uptime %.1f days -- ticks wrap signed past 24.9)",
+		GetTime(), GetTime() / 86400))
+
+	local wStart, wDuration = WA.SpellCdInfo(id)
+	D.Log("  watcher answers: start " .. tostring(wStart) .. ", duration " .. tostring(wDuration))
+	D.Log("  IsGcdCooldown(that duration) = " .. tostring(WA.IsGcdCooldown(wDuration)))
+	D.Log("  => a Cooldown Ready trigger reads "
+		.. (((wDuration or 0) <= 0 or WA.IsGcdCooldown(wDuration) or ((wStart or 0) + (wDuration or 0)) <= GetTime())
+			and "READY" or "on cooldown"))
+
+	-- Every rank, since a name resolves to one specific rank's ID and only the
+	-- rank actually cast carries the cooldown.
+	if name and GetNumSpellTabs then
+		local shown = 0
+		for tab = 1, (GetNumSpellTabs() or 0) do
+			local _, _, offset, numSlots = GetSpellTabInfo(tab)
+			for i = (offset or 0) + 1, (offset or 0) + (numSlots or 0) do
+				local n, r = GetSpellName(i, book)
+				if n == name then
+					local s, d = WA.SpellSlotCooldown(i)
+					D.Log("    rank slot " .. i .. " (" .. tostring(r) .. "): start "
+						.. tostring(s) .. ", duration " .. tostring(d))
+					shown = shown + 1
+				end
+			end
+		end
+		if shown == 0 then D.Log("    no spellbook slot carries that name") end
+	end
+	D.Log("--- end cdprobe ---")
+end
+
+-- Live view of the global-cooldown watcher, plus the two reads it deliberately
+-- does not make. Upstream's GCD spells (29515 Classic, 61304 elsewhere) and the
+-- spellID-shaped GetSpellCooldown call are both reported here rather than only
+-- argued about in a comment: this is what settles whether they are dead on a
+-- given build.
+function D.Gcd()
+	D.Log("--- gcd ---")
+	local book = BOOKTYPE_SPELL or "spell"
+	if not WA.GcdDebug then D.Log("  no GCD watcher in this build"); D.Log("--- end gcd ---"); return end
+	WA.WatchGCD()
+	local g = WA.GcdDebug()
+	D.Log("  watching = " .. tostring(g.watching)
+		.. ", book tabs = " .. tostring(GetNumSpellTabs and GetNumSpellTabs()))
+	if g.probeSlot then
+		local name, rank = GetSpellName(g.probeSlot, book)
+		local ok, start, duration = pcall(GetSpellCooldown, g.probeSlot, book)
+		D.Log("  probe slot " .. g.probeSlot .. " = " .. tostring(name) .. " " .. tostring(rank))
+		D.Log("  slot reads " .. (ok and (tostring(start) .. " + " .. tostring(duration)) or ("ERROR " .. tostring(start))))
+	else
+		D.Log("  probe slot: none learned -- cast an instant that has no cooldown of its own, then run this again")
+	end
+	D.Log("  measured GCD length = " .. tostring(g.measured or "none yet (assuming 1.5)"))
+	local start, duration = WA.GcdInfo()
+	if duration > 0 then
+		D.Log(string.format("  window: start %.2f, length %.2f, %.2f left", start, duration, (start + duration) - GetTime()))
+	else
+		D.Log("  window: closed")
+	end
+	local info = C_Spell and C_Spell.GetSpellCooldown and C_Spell.GetSpellCooldown(61304)
+	D.Log("  C_Spell.GetSpellCooldown(61304) = " .. (info and (tostring(info.startTime) .. " + " .. tostring(info.duration)) or "nil (no Spell.dbc row)"))
+	local ok, err = pcall(GetSpellCooldown, 61304, book)
+	D.Log("  GetSpellCooldown(61304, bookType) = " .. (ok and "returned a value" or ("ERROR " .. tostring(err))))
+	D.Log("--- end gcd ---")
+end
+
 function D.Probe()
 	local E = C_EncodingUtil
 	D.Log("--- probe ---")
@@ -1038,6 +1533,271 @@ function D.Probe()
 	probeFrame:Show()
 	D.Log("  border texture: spawned a red WHITE8X8-edged test icon at CENTER,0,150 -- if you see a red border in-world, the border subregion renders here.")
 	D.Log("--- end probe ---")
+end
+
+-- ---------------------------------------------------------------------------
+-- /wa soundprobe -- measures the sound, combat-text and speech entry points
+-- used by the action system. The scheduled files are judged by ear in-game;
+-- return values only describe whether the call reached the client cleanly.
+-- ---------------------------------------------------------------------------
+
+local SOUND_PROBE_FILES = {
+	"Sound\\interface\\RaidWarning.wav",
+	"Sound\\interface\\levelup2.wav",
+	"Sound\\interface\\iQuestComplete.wav",
+	"Sound\\interface\\iTellMessage.wav",
+	"Sound\\Spells\\LevelUp.wav",
+	"Sound\\Spells\\ReputationLevelUp.wav",
+	"Sound\\Spells\\PVPThroughQueue.wav",
+	"Sound\\Spells\\ShaysBell.wav",
+	"Sound\\Doodad\\BellTollNightElf.wav",
+	"Sound\\Doodad\\BellTollAlliance.wav",
+	"Sound\\Doodad\\BellTollHorde.wav",
+	"Sound\\Doodad\\BellTollTribal.wav",
+	"Sound\\Doodad\\DwarfHorn.wav",
+	"Sound\\Doodad\\G_GongTroll01.wav",
+	"Sound\\Doodad\\LightHouseFogHorn.wav",
+	"Sound\\Doodad\\HornGoober.wav",
+	"Sound\\interface\\AuctionWindowOpen.wav",
+	"Sound\\Interface\\igQuestFailed.wav",
+}
+
+local soundProbeSession = 0
+
+local function soundProbeCall(path, label)
+	if type(PlaySoundFile) ~= "function" then
+		D.Log("  " .. label .. " " .. path .. " -- PlaySoundFile absent")
+		return
+	end
+	local ok, first, second, third = pcall(PlaySoundFile, path)
+	D.Log(string.format("  %s %s -- call=%s return1=%s return2=%s return3=%s",
+		label, path, tostring(ok and true or false), tostring(first), tostring(second), tostring(third)))
+end
+
+local function soundProbeSchedule(session, delay, path, label)
+	if type(C_Timer) ~= "table" or type(C_Timer.After) ~= "function" then
+		D.Log("  playback sequence unavailable: C_Timer.After absent")
+		return false
+	end
+	C_Timer.After(delay, function()
+		if soundProbeSession ~= session then return end
+		soundProbeCall(path, label)
+	end)
+	return true
+end
+
+function D.SoundProbe()
+	soundProbeSession = soundProbeSession + 1
+	local session = soundProbeSession
+	D.Log("--- soundprobe ---")
+
+	if type(PlaySoundFile) == "function" then
+		D.Log("  MPQ internal paths: scheduled 18 curated SoundEntries paths; judge playback by ear")
+	else
+		D.Log("  MPQ internal paths: PlaySoundFile absent")
+	end
+
+	local delay = 0
+	local scheduled = 0
+	for i = 1, table.getn(SOUND_PROBE_FILES) do
+		if soundProbeSchedule(session, delay, SOUND_PROBE_FILES[i], "[curated]") then
+			scheduled = scheduled + 1
+		end
+		delay = delay + 1
+	end
+
+	local extensionFiles = {
+		{ path = "Interface\\AddOns\\BigWigs\\Sounds\\bandage.wav", label = "[extension wav]" },
+		{ path = "Interface\\AddOns\\BigWigs\\Sounds\\1.ogg", label = "[extension ogg]" },
+		{ path = "Interface\\AddOns\\BigWigs\\Sounds\\Alarm.mp3", label = "[extension mp3]" },
+	}
+	for i = 1, table.getn(extensionFiles) do
+		local item = extensionFiles[i]
+		if soundProbeSchedule(session, delay, item.path, item.label) then
+			scheduled = scheduled + 1
+		end
+		delay = delay + 1
+	end
+	D.Log("  playback sequence: " .. scheduled .. " file(s) scheduled")
+
+	D.Log("  PlaySoundFile return probe: read the return values on the first [curated] line")
+
+	if type(PlaySound) == "function" then
+		local ok, err = pcall(PlaySound, "RaidWarning")
+		D.Log("  PlaySound(\"RaidWarning\"): " .. (ok and "call returned cleanly" or ("ERROR " .. tostring(err))))
+	else
+		D.Log("  PlaySound(\"RaidWarning\"): PlaySound absent")
+	end
+
+	if type(LoadAddOn) == "function" then
+		local ok, result, reason = pcall(LoadAddOn, "Blizzard_CombatText")
+		D.Log(string.format("  LoadAddOn(Blizzard_CombatText): call=%s return=%s reason=%s CombatText_AddMessage=%s COMBAT_TEXT_SCROLL_FUNCTION=%s",
+			tostring(ok and true or false), tostring(result), tostring(reason),
+			type(CombatText_AddMessage), type(COMBAT_TEXT_SCROLL_FUNCTION)))
+	else
+		D.Log("  LoadAddOn(Blizzard_CombatText): LoadAddOn absent")
+	end
+
+	if type(C_VoiceChat) == "table" and type(C_VoiceChat.GetTtsVoices) == "function" then
+		local ok, voices = pcall(C_VoiceChat.GetTtsVoices)
+		if ok and type(voices) == "table" then
+			D.Log("  C_VoiceChat.GetTtsVoices: " .. table.getn(voices) .. " voice(s)")
+			for i = 1, table.getn(voices) do
+				D.Log(string.format("    voice %d: id=%s name=%s", i, tostring(voices[i].voiceID), tostring(voices[i].name)))
+			end
+		else
+			D.Log("  C_VoiceChat.GetTtsVoices: " .. (ok and ("returned " .. type(voices)) or ("ERROR " .. tostring(voices))))
+		end
+	else
+		D.Log("  C_VoiceChat.GetTtsVoices: unavailable")
+	end
+
+	if UIErrorsFrame and type(UIErrorsFrame.AddMessage) == "function" then
+		local ok, err = pcall(function()
+			UIErrorsFrame:AddMessage("[soundprobe] UIErrorsFrame", 0.2, 1, 0.2)
+		end)
+		D.Log("  UIErrorsFrame:AddMessage(msg, r, g, b): " .. (ok and "call returned cleanly" or ("ERROR " .. tostring(err))))
+	else
+		D.Log("  UIErrorsFrame:AddMessage(msg, r, g, b): unavailable")
+	end
+
+	if DEFAULT_CHAT_FRAME and type(DEFAULT_CHAT_FRAME.AddMessage) == "function" then
+		local ok, err = pcall(function()
+			DEFAULT_CHAT_FRAME:AddMessage("[soundprobe] DEFAULT_CHAT_FRAME", 0.2, 0.8, 1)
+		end)
+		D.Log("  DEFAULT_CHAT_FRAME:AddMessage(msg, r, g, b): " .. (ok and "call returned cleanly" or ("ERROR " .. tostring(err))))
+	else
+		D.Log("  DEFAULT_CHAT_FRAME:AddMessage(msg, r, g, b): unavailable")
+	end
+
+	D.Log("  listen for the 18 curated MPQ files, then wav, ogg, and mp3 in that order")
+	D.Log("--- end soundprobe ---")
+end
+
+-- ---------------------------------------------------------------------------
+-- /wa wa2probe -- can this client inflate what WeakAuras2 exports?
+--
+-- WeakAuras2 ships raw deflate (LibDeflate's CompressDeflate): no zlib header,
+-- no checksum, and therefore no magic bytes to auto-detect from. The method has
+-- to be passed to DecompressString explicitly, and the negative test here is the
+-- load-bearing one -- it proves that omitting it actually fails on this client
+-- rather than being harmlessly redundant. The zlib cases are controls: they are
+-- the path ImportExport.lua already takes, so a failure there means the probe
+-- itself is wrong, not the client.
+-- ---------------------------------------------------------------------------
+
+local function wa2Try(fn, a, b)
+	if type(fn) ~= "function" then return nil, "absent" end
+	local ok, result = pcall(fn, a, b)
+	if not ok then return nil, tostring(result) end
+	return result
+end
+
+local function wa2Yesno(v)
+	if v then return "yes" end
+	return "NO"
+end
+
+function D.Wa2Probe()
+	D.Log("--- wa2probe ---")
+	local E = C_EncodingUtil
+	if type(E) ~= "table" then
+		D.Log("C_EncodingUtil: ABSENT")
+		D.Log("VERDICT: NO-GO -- no compression API, WeakAuras2 import is impossible")
+		D.Log("--- end wa2probe ---")
+		return
+	end
+
+	D.Log("CompressString=" .. type(E.CompressString)
+		.. " DecompressString=" .. type(E.DecompressString))
+
+	local enum = Enum and Enum.CompressionMethod
+	local deflate = enum and enum.Deflate
+	local zlib = enum and enum.Zlib
+	D.Log("Enum.CompressionMethod: " .. (enum and ("Deflate=" .. tostring(deflate)
+		.. " Zlib=" .. tostring(zlib)) or "ABSENT (assuming Deflate=0, Zlib=1)"))
+	local RAW = deflate or 0
+	local ZLIB = zlib or 1
+
+	-- Repetitive so compression is measurable, with a NUL and bytes above 0x7F
+	-- so the round trip proves the API is 8-bit clean rather than string-safe.
+	local sample = string.rep("weakauras", 20)
+		.. string.char(0) .. string.char(127) .. string.char(128) .. string.char(255)
+		.. string.rep("aura", 10)
+	D.Log("sample: " .. string.len(sample) .. " bytes, includes NUL and >0x7F")
+
+	local rawBlob, rawErr = wa2Try(E.CompressString, sample, RAW)
+	if not rawBlob then
+		D.Log("CompressString(s, Deflate): FAILED -- " .. tostring(rawErr))
+		D.Log("VERDICT: NO-GO -- cannot produce raw deflate")
+		D.Log("--- end wa2probe ---")
+		return
+	end
+	D.Log("CompressString(s, Deflate): " .. string.len(rawBlob) .. " bytes"
+		.. "  first2=" .. string.byte(rawBlob, 1) .. "," .. string.byte(rawBlob, 2))
+
+	local rawBack = wa2Try(E.DecompressString, rawBlob, RAW)
+	local rawOk = rawBack == sample
+	D.Log("round trip, explicit Deflate: " .. wa2Yesno(rawOk))
+
+	-- The negative test. A raw deflate payload has no magic bytes, so the
+	-- two-argument-less call should NOT be able to read it.
+	local sniffed, sniffErr = wa2Try(E.DecompressString, rawBlob)
+	local sniffFailed = (sniffed ~= sample)
+	D.Log("round trip, method OMITTED: " .. (sniffFailed and "refused (correct)" or "SUCCEEDED -- unexpected")
+		.. (sniffErr and ("  [" .. string.sub(tostring(sniffErr), 1, 40) .. "]") or ""))
+
+	-- Controls: the zlib path ImportExport.lua already relies on.
+	local zBlob = wa2Try(E.CompressString, sample, ZLIB)
+	local zBack = zBlob and wa2Try(E.DecompressString, zBlob, ZLIB)
+	local zSniff = zBlob and wa2Try(E.DecompressString, zBlob)
+	D.Log("control, zlib explicit: " .. wa2Yesno(zBack == sample)
+		.. "   zlib auto-detected: " .. wa2Yesno(zSniff == sample))
+
+	if rawOk and sniffFailed then
+		D.Log("VERDICT: GO -- raw deflate round-trips, and the method argument is required")
+	elseif rawOk then
+		D.Log("VERDICT: GO, with a caveat -- raw deflate round-trips, but omitting the")
+		D.Log("  method also worked. Pass it anyway; do not rely on auto-detection.")
+	else
+		D.Log("VERDICT: NO-GO -- raw deflate does not round-trip on this client")
+	end
+	D.Log("--- end wa2probe ---")
+end
+
+-- ---------------------------------------------------------------------------
+-- /wa wa2 <string> -- run a WeakAuras export string through WA.WA2Decode and
+-- report what came out. The chat edit box caps input at 255 characters, so a
+-- full wago string cannot be pasted here; the usable subjects are short strings
+-- and the refusal paths.
+-- ---------------------------------------------------------------------------
+
+function D.Wa2(text)
+	if not text or text == "" then
+		D.Log("[wa2] usage: /wa wa2 <!WA:2! string> (chat caps the paste at 255 characters)")
+		return
+	end
+
+	local bytes, reason = WA.WA2Decode(text)
+	if not bytes then
+		D.Log("[wa2] refused: " .. tostring(reason))
+		return
+	end
+
+	local payload, payloadReason = WA.WA2Deserialize(bytes)
+	if type(payload) ~= "table" or payload.m ~= "d" or type(payload.d) ~= "table"
+		or type(payload.d.regionType) ~= "string" then
+		D.Log("[wa2] " .. string.len(bytes) .. " bytes, but the payload is not aura-shaped"
+			.. (payloadReason and (" [" .. tostring(payloadReason) .. "]") or ""))
+		return
+	end
+
+	local head = {}
+	for i = 1, math.min(16, string.len(bytes)) do
+		table.insert(head, string.format("%02X", string.byte(bytes, i)))
+	end
+	D.Log("[wa2] " .. string.len(bytes) .. " bytes  id=" .. tostring(payload.d.id)
+		.. "  regionType=" .. payload.d.regionType .. "  head=" .. table.concat(head, " "))
 end
 
 -- ---------------------------------------------------------------------------
@@ -1946,6 +2706,86 @@ function D.Version(rest)
 	D.Log("--- end version ---")
 end
 
+-- A Trigger State Updater's clones and the hide timers holding them, side by
+-- side. The two disagree exactly when a clone is going away for a reason other
+-- than its own deadline: a state with no armed record is being removed by
+-- something else, and a record whose armedDelay does not match the deadline the
+-- aura asked for is the timer being given the wrong length.
+function D.Tsu(id)
+	if not id or id == "" then
+		D.Log("[tsu] usage: /wa tsu <aura id>")
+		return
+	end
+	local ts = WA.GetDisplayTriggerState and WA.GetDisplayTriggerState(id)
+	if not ts then
+		D.Log(string.format("[tsu] no triggerState for %q", id))
+		return
+	end
+	local now = GetTime()
+	local armed = {}
+	if WA.ForEachStateTimer then
+		WA.ForEachStateTimer(id, function(triggernum, cloneId, record)
+			armed[triggernum .. "\001" .. tostring(cloneId)] = record
+		end)
+	end
+	D.Log(string.format("--- tsu %q at t=%.2f ---", id, now))
+	for triggernum = 1, ts.numTriggers do
+		local allstates = ts[triggernum]
+		if allstates then
+			for cloneId, state in pairs(allstates) do
+				local record = armed[triggernum .. "\001" .. tostring(cloneId)]
+				D.Log(string.format(
+					"  [%d] %q show=%s autoHide=%s paused=%s expiration=%s (in %s) remaining=%s",
+					triggernum, tostring(cloneId), tostring(state.show), tostring(state.autoHide),
+					tostring(state.paused), tostring(state.expirationTime),
+					state.expirationTime and string.format("%.2f", state.expirationTime - now) or "n/a",
+					tostring(state.remaining)))
+				if record and record.handle then
+					D.Log(string.format(
+						"        timer armed %.2f ago for %.2f -> fires in %.2f",
+						now - (record.armedAt or now), record.armedDelay or -1,
+						(record.armedAt or now) + (record.armedDelay or 0) - now))
+				else
+					D.Log("        timer: NONE ARMED")
+				end
+			end
+		end
+	end
+	D.Log("--- end tsu ---")
+end
+
+-- Logs every arm/fire/cancel of a state-owned hide timer. A clone vanishing
+-- with no "fire" line ahead of it was removed by something other than its own
+-- timer, which is the distinction /wa tsu can only sample.
+function D.ToggleTsuTrace()
+	if WA.OnStateTimer then
+		WA.OnStateTimer = nil
+		D.Log("[tsu] timer trace off")
+		return
+	end
+	WA.OnStateTimer = function(what, id, triggernum, cloneId, seconds)
+		D.Log(string.format("[tsu] %s %s[%s] clone %q %.2fs (t=%.2f)",
+			what, tostring(id), tostring(triggernum), tostring(cloneId),
+			tonumber(seconds) or -1, GetTime()))
+		-- A cancel is the interesting one: it means something took the timer away
+		-- rather than the deadline arriving, and the only thing that identifies
+		-- *what* is the caller. Guarded because the debug library's presence on
+		-- this client is not something to assume.
+		if what == "cancel" and debug and debug.traceback then
+			local ok, trace = pcall(debug.traceback, "", 2)
+			if ok and trace then
+				local n = 0
+				for line in string.gfind(trace, "[^\n]+") do
+					n = n + 1
+					if n > 6 then break end
+					D.Log("        " .. line)
+				end
+			end
+		end
+	end
+	D.Log("[tsu] timer trace on -- /wa tsutrace again to stop")
+end
+
 -- ---------------------------------------------------------------------------
 -- Slash dispatch. Called from OptionsFrame.lua's /wa handler whenever the
 -- command has an argument; a bare /wa still opens the options window.
@@ -1962,6 +2802,10 @@ function D.HandleSlash(msg)
 		D.ToggleWatch(rest)
 	elseif cmd == "events" then
 		D.ToggleEventLog(rest)
+	elseif cmd == "auraprobe" then
+		D.AuraProbe(rest)
+	elseif cmd == "overflow" then
+		D.Overflow(rest)
 	elseif cmd == "timers" then
 		D.Timers()
 	elseif cmd == "linkprobe" then
@@ -1978,6 +2822,10 @@ function D.HandleSlash(msg)
 		D.Track(rest)
 	elseif cmd == "states" then
 		D.States(rest)
+	elseif cmd == "tsu" then
+		D.Tsu(rest)
+	elseif cmd == "tsutrace" then
+		D.ToggleTsuTrace()
 	elseif cmd == "conditions" then
 		D.Conditions(rest)
 	elseif cmd == "gen" then
@@ -1986,6 +2834,12 @@ function D.HandleSlash(msg)
 		D.Load(rest)
 	elseif cmd == "probe" then
 		D.Probe()
+	elseif cmd == "soundprobe" then
+		D.SoundProbe()
+	elseif cmd == "gcd" then
+		D.Gcd()
+	elseif cmd == "cdprobe" then
+		D.CdProbe(rest)
 	elseif cmd == "ver" then
 		D.Version(rest)
 	elseif cmd == "codeprobe" then
@@ -1994,6 +2848,10 @@ function D.HandleSlash(msg)
 		D.TextProbe()
 	elseif cmd == "texprobe" then
 		D.TexProbe()
+	elseif cmd == "wa2probe" then
+		D.Wa2Probe()
+	elseif cmd == "wa2" then
+		D.Wa2(rest)
 	elseif cmd == "codelive" then
 		D.CodeLive()
 	elseif cmd == "codetab" then
@@ -2002,6 +2860,8 @@ function D.HandleSlash(msg)
 		D.CodeFont(rest)
 	elseif cmd == "rows" then
 		D.Rows()
+	elseif cmd == "configtest" then
+		D.ConfigTest()
 	elseif cmd == "libs" then
 		D.Libs()
 	elseif cmd == "addons" then
@@ -2018,6 +2878,6 @@ function D.HandleSlash(msg)
 		ensureFrame()
 		frame:Hide()
 	else
-		D.Log("[debug] unknown command \"" .. cmd .. "\". Available: dump [unit] [filter], watch [unit], events [EVENT ...], timers, linkprobe, commprobe [charname|throttle [channel] [rate] [secs]], cdtest, swipetest [sizes/WxH...], swipenudge <k> [yflat], track <spellName>, states <id>, conditions <id>, gen <id>, load <id>, probe, ver [version], codeprobe, textprobe, texprobe, codelive, codetab <1-8|tabs>, codefont <6-16>, rows, libs, addons, export <id>, import, clear, show, hide")
+		D.Log("[debug] unknown command \"" .. cmd .. "\". Available: dump [unit] [filter], watch [unit], events [EVENT ...], auraprobe [unit|all], overflow [unit], timers, linkprobe, commprobe [charname|throttle [channel] [rate] [secs]], cdtest, swipetest [sizes/WxH...], swipenudge <k> [yflat], track <spellName>, states <id>, conditions <id>, gen <id>, load <id>, probe, soundprobe, gcd, cdprobe <spell>, ver [version], codeprobe, textprobe, texprobe, wa2probe, wa2 <string>, codelive, codetab <1-8|tabs>, codefont <6-16>, rows, configtest, libs, addons, export <id>, import, clear, show, hide")
 	end
 end

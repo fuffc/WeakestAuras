@@ -83,10 +83,15 @@ function proto.create(region)
 	region.anchorPoint = "CENTER"
 	region.regionAlpha = 1
 	region.animAlpha = nil
+	region.animatingFinish = false
+	region.pendingRelease = false
 	region.toShow = false
+	region.limited = false
+	region.shown = false
 	region.state = nil
 	region.states = {}
 	region.subRegionEvents = CreateSubscribers()
+	if WA.AttachActionMethods then WA.AttachActionMethods(region) end
 
 	-- Effective position composes config + animation + relative(condition)
 	-- offsets, so those three never fight over SetPoint (§7). Anim/relative
@@ -111,6 +116,7 @@ function proto.create(region)
 	function region:SetYOffsetRelative(y) self.yOffsetRelative = y; self:UpdatePosition() end
 
 	function region:SetRegionAlpha(a)
+		a = a or 1
 		self.regionAlpha = a
 		self:SetAlpha(a * (self.animAlpha or 1))
 	end
@@ -148,19 +154,77 @@ function proto.create(region)
 	-- toShow guards keep repeated Expand/Collapse idempotent (the state machine
 	-- may re-apply a shown state many times). Actions/animations hook these
 	-- later without another refactor (§7).
+	--
+	-- toShow (state machine: has a state to render) and limited (owning dynamic
+	-- group: past its visible-clone cap) are independent flags; region.shown --
+	-- the actual Show/Hide -- is toShow AND NOT limited. setShown is the only
+	-- place that compares against it, so a limit flip and an Expand/Collapse both
+	-- go through the same idempotent gate instead of each guarding separately.
+	local function setShown(self, want)
+		if self.shown == want then return end
+		self.shown = want
+		if want then
+			self.subRegionEvents:Notify("PreShow")
+			self:Show()
+			if self._hasFrameTick then proto.RegisterForFrameTick(self) end
+		else
+			self.subRegionEvents:Notify("PreHide")
+			proto.UnregisterForFrameTick(self)
+			self:Hide()
+		end
+	end
+
 	function region:Expand()
 		if self.toShow then return end
+		if self.animatingFinish then
+			WA.CancelAnimation(self, true, true, true, true, true, false)
+			self.animatingFinish = false
+		end
 		self.toShow = true
-		self.subRegionEvents:Notify("PreShow")
-		self:Show()
-		if self._hasFrameTick then proto.RegisterForFrameTick(self) end
+		setShown(self, not self.limited)
+		WA.PerformActions(WeakestAurasDB.displays[self.id], "start", self)
+		local data = WeakestAurasDB.displays[self.id]
+		local function startMainAnimation()
+			if not data then return end
+			WA.Animate("display", data.uid, "main", data.animation and data.animation.main,
+				self, false, nil, true, self.cloneId)
+		end
+		if not data or not WA.Animate("display", data.uid, "start", data.animation and data.animation.start,
+			self, true, startMainAnimation, false, self.cloneId) then
+			startMainAnimation()
+		end
 	end
-	function region:Collapse()
+
+	function region:Collapse(onFinished)
 		if not self.toShow then return end
 		self.toShow = false
-		self.subRegionEvents:Notify("PreHide")
-		proto.UnregisterForFrameTick(self)
-		self:Hide()
+		self.limited = false
+		if self.SoundRepeatStop then self:SoundRepeatStop() end
+		if self.StopExternalGlows then self:StopExternalGlows() end
+		WA.PerformActions(WeakestAurasDB.displays[self.id], "finish", self)
+		local data = WeakestAurasDB.displays[self.id]
+		local function hideRegion()
+			self.animatingFinish = false
+			WA.CancelAnimation(self, true, true, true, true, true, false)
+			setShown(self, false)
+			if onFinished then onFinished() end
+		end
+		self.animatingFinish = true
+		if not data or not WA.Animate("display", data.uid, "finish", data.animation and data.animation.finish,
+			self, false, hideRegion, false, self.cloneId) then
+			hideRegion()
+		end
+	end
+
+	-- The dynamic group's visible-clone cap. Toggling this alone (toShow already
+	-- true) can flip the actual Show/Hide without going through Expand/Collapse,
+	-- which is what lets a clone stay fully alive -- state, conditions, pooling
+	-- identity -- while only its paint is suppressed.
+	function region:SetLimited(limited)
+		limited = limited and true or false
+		if self.limited == limited then return end
+		self.limited = limited
+		if self.toShow then setShown(self, not limited) end
 	end
 
 	-- The two custom-text update modes are different *call counts*, not
@@ -329,10 +393,63 @@ end
 -- Rebuilds a region's sub-region instances from data.subRegions and re-wires
 -- their event subscriptions (§8). Called at the end of each region type's
 -- modify, so config edits, a new state, and a regionType switch all funnel
--- through one place. No pooling yet (acquire = create, release = hide), but
--- instances are reused in place by index+type across edits so a slider drag
--- doesn't leak a FontString per tick. Pooling proper is deferred with clones.
+-- through one place. Instances are reused in place by index+type across edits
+-- so a slider drag doesn't leak a FontString per tick. Clone pooling reuses the
+-- whole owning region frame; it does not detach individual sub-regions.
 function proto.modifyFinish(region, data)
+	local setWidth, setHeight = region.SetRegionWidth, region.SetRegionHeight
+	if setWidth and setHeight and not WA.IsGroup(data) then
+		region.configWidth = region.configWidth or data.width
+		region.configHeight = region.configHeight or data.height
+		region.scaleX, region.scaleY = region.scaleX or 1, region.scaleY or 1
+		function region:SetRegionWidth(width)
+			self.configWidth = width
+			setWidth(self, math.max(math.abs(width * (self.scaleX or 1)), 0.01))
+		end
+		function region:SetRegionHeight(height)
+			self.configHeight = height
+			setHeight(self, math.max(math.abs(height * (self.scaleY or 1)), 0.01))
+		end
+		function region:Scale(x, y)
+			self.scaleX, self.scaleY = x or 1, y or 1
+			self:SetRegionWidth(self.configWidth or data.width)
+			self:SetRegionHeight(self.configHeight or data.height)
+		end
+		region:SetRegionWidth(data.width)
+		region:SetRegionHeight(data.height)
+	else
+		region.Scale = nil
+	end
+
+	local setColor = region.Color
+	if setColor then
+		local color = data.color or data.text_color or data.barColor or data.foregroundColor or { 1, 1, 1, 1 }
+		region.configColorR, region.configColorG = color[1], color[2]
+		region.configColorB, region.configColorA = color[3], color[4] or 1
+		function region:Color(r, g, b, a)
+			self.configColorR, self.configColorG = r, g
+			self.configColorB, self.configColorA = b, a or 1
+			setColor(self, self.colorAnimR or r, self.colorAnimG or g,
+				self.colorAnimB or b, self.colorAnimA or (a or 1))
+		end
+		function region:ColorAnim(r, g, b, a)
+			self.colorAnimR, self.colorAnimG = r, g
+			self.colorAnimB, self.colorAnimA = b, a
+			setColor(self, r or self.configColorR, g or self.configColorG,
+				b or self.configColorB, a or self.configColorA)
+		end
+		function region:GetColor()
+			return self.configColorR, self.configColorG, self.configColorB, self.configColorA
+		end
+		region:Color(color[1], color[2], color[3], color[4])
+	else
+		region.ColorAnim, region.GetColor = nil, nil
+	end
+
+	-- A clone parked behind a *former* parent's limit has nobody left to release
+	-- it once it's reconfigured under new ownership -- the dynamic group that owns
+	-- it now re-applies its own limit on the relayout that follows every WA.Add.
+	region:SetLimited(false)
 	region.subRegionEvents:Clear()
 	applyCustomText(region, data)
 	-- Ahead of every sub-region's own subscription, because subscribers fire in
@@ -391,6 +508,7 @@ end
 -- number or nil plus a relative-percent fallback), shared by every progress
 -- source below -- automatic, manual and per-trigger all clamp the same way.
 local function applyStatic(region, value, total)
+	region.progressType = "static"
 	value = value or 0
 	total = total or 0
 	local adjustMin
@@ -404,10 +522,19 @@ local function applyStatic(region, value, total)
 	region.minProgress, region.maxProgress = adjustMin, max
 	region.value = value - adjustMin
 	region.total = max - adjustMin
+	region.paused = false
+	region.remaining = nil
 	if region.UpdateValue then region:UpdateValue() end
 end
 
-local function applyTimed(region, duration, expirationTime)
+-- paused/remaining ride along separately from duration/expirationTime rather
+-- than through a re-anchored expirationTime (upstream's approach): the bar
+-- and progress-texture regions animate off region.expirationTime in their own
+-- per-frame OnUpdate, so re-anchoring once would still visibly drain between
+-- applies. UpdateTime freezes explicitly instead of computing a fake
+-- expirationTime that only holds still until the next frame.
+local function applyTimed(region, duration, expirationTime, paused, remaining)
+	region.progressType = "timed"
 	duration = duration or 0
 	expirationTime = expirationTime or 0
 	local adjustMin
@@ -422,6 +549,8 @@ local function applyTimed(region, duration, expirationTime)
 	region.minProgress, region.maxProgress = adjustMin, max
 	region.duration = max - adjustMin
 	region.expirationTime = expirationTime - adjustMin
+	region.paused = paused and true or false
+	region.remaining = (type(remaining) == "number" and remaining) or (paused and 0) or nil
 	if region.UpdateTime then region:UpdateTime() end
 end
 
@@ -449,8 +578,9 @@ function proto.UpdateProgress(region)
 	-- cleared/zeroed fill for a hidden region would be dead work at best and
 	-- a flash of "0%" at worst if it's ever shown before this trigger fires.
 	if not state then return end
+	region.stateInverse = state.inverse and true or false
 	if state.progressType == "timed" then
-		applyTimed(region, state.duration, state.expirationTime)
+		applyTimed(region, state.duration, state.expirationTime, state.paused, state.remaining)
 	else
 		applyStatic(region, state.value, state.total)
 	end
@@ -599,7 +729,7 @@ function proto.AnchorSubRegion(frame, parent, subData, defaults)
 		elseif subData.anchor_target then
 			targetPoint = proto.GetSubRegionAnchorPoint(targetKey, defaults.anchorPoint)
 		else
-			targetPoint = subRegionAnchorValue(parent, subData, "anchor_point", subData.text_anchorPoint or defaults.anchorPoint or "CENTER")
+			targetPoint = subRegionAnchorValue(parent, subData, "anchor_point", defaults.anchorPoint or "CENTER")
 		end
 		selfPoint = subRegionAnchorValue(parent, subData, "self_point", defaults.selfPoint or targetPoint or "CENTER")
 		xOffset = subRegionAnchorValue(parent, subData, "anchorXOffset", defaults.x or 0)
@@ -685,6 +815,10 @@ end
 -- Injects the universal conditionable properties into a region type's registry
 -- (§7 AddProperties). Lives beside the setters it names so the two stay honest.
 function proto.AddProperties(properties)
+	properties.sound = { display = "Sound", action = "SoundPlay", type = "sound" }
+	properties.chat = { display = "Chat Message", action = "SendChat", type = "chat" }
+	properties.customcode = { display = "Run Custom Code", action = "RunCode", type = "customcode" }
+	properties.glowexternal = { display = "Glow External Element", action = "GlowExternal", type = "glowexternal" }
 	properties.alpha = { display = "Alpha", setter = "SetRegionAlpha", type = "number", min = 0, max = 1, step = 0.05 }
 	-- These are *relative* deltas only conditions set (no data.<key> backing
 	-- them), so their restored base is an explicit 0, not data[key] (§7).
@@ -876,6 +1010,11 @@ local function queueAnchorRetry(data)
 	end)
 end
 
+-- How anchorFrameFrame names another aura rather than a global frame. Public
+-- because both the frame chooser and the WeakAuras2 import build the string, and
+-- three spellings of one prefix is a bug nothing would catch.
+WA.ANCHOR_AURA_PREFIX = "WeakestAuras:"
+
 function WA.GetAnchorAuraID(data)
 	if not data or data.anchorFrameType ~= "SELECTFRAME" then return nil end
 	local ref = data.anchorFrameFrame
@@ -912,6 +1051,14 @@ nameplateFor = function(unit, guid)
 	end
 	return nil
 end
+
+-- The plate showing `unit`, for anything anchoring to one -- a display's own
+-- NAMEPLATE anchor below, and a dynamic group anchoring its clones per unit.
+function WA.GetUnitNameplate(unit, guid) return nameplateFor(unit, guid) end
+
+-- Where a region goes when its anchor target is not there: a real frame, shown
+-- to nothing, so the region keeps a valid anchor instead of an error.
+function WA.HiddenAnchorFrame() return hiddenAnchorFrame() end
 
 function WA.GetUnitFrame(unit)
 	if not unit then return nil end
@@ -1111,6 +1258,9 @@ dynamicAnchorWatcher:SetScript("OnEvent", function()
 	else
 		proto.ReanchorDynamic("UNITFRAME")
 	end
+	-- A dynamic group's children anchor per unit through the group's layout, not
+	-- through their own anchorFrameType, so ReanchorDynamic never reaches them.
+	if WA.RelayoutUnitAnchoredGroups then WA.RelayoutUnitAnchoredGroups() end
 end)
 
 function proto.ApplyPosition(region, data)

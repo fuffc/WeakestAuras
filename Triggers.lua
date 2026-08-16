@@ -39,6 +39,7 @@ local CATEGORIES = {
 	{ key = "spell",  name = "Spell",         default = "spellcooldown" },
 	{ key = "item",   name = "Item",          default = "itemcooldown" },
 	{ key = "unit",   name = "Player & Unit", default = "health" },
+	{ key = "event",  name = "Events",        default = "readycheck" },
 	{ key = "custom", name = "Custom",        default = "custom" },
 }
 
@@ -172,7 +173,7 @@ WA.RegisterTriggerType("aura", {
 		-- comes back when the override is switched off.
 		table.insert(fields, {
 			type = "select", name = "Unit", key = "unit", half = true,
-			values = WA.unit_tokens, labels = WA.unit_labels,
+			values = WA.unit_tokens_multi, labels = WA.unit_labels_multi,
 			get = function() return t.unit end,
 			set = function(v) t.unit = v; WA.Add(data); WA.RefreshOptions() end,
 		})

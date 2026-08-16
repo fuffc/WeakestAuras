@@ -52,7 +52,9 @@ local function groupHasVisibleChild(data)
 	for i = 1, table.getn(kids) do
 		local id = kids[i]
 		local shown = false
-		WA.ForEachClone(id, function(frame) if frame.toShow then shown = true end end)
+		WA.ForEachClone(id, function(frame)
+			if frame.toShow and not frame.limited then shown = true end
+		end)
 		if shown then return true end
 		local cd = WeakestAurasDB.displays[id]
 		if cd and WA.IsGroup(cd) and groupHasVisibleChild(cd) then return true end
@@ -93,43 +95,409 @@ local function applyGroupBounds(region, data)
 	drawGroupBox(region, data, blx, bly, trx, try)
 end
 
+-- Deterministic clone ordering: the comparator algebra a dynamicgroup's `sort`
+-- and a `customSort` are built from (WA2 DynamicGroup.lua's sort helpers,
+-- ported onto WA under upstream's exact names so a user's customSort composes
+-- the way upstream's own documentation shows). A comparator takes two values
+-- and answers true/false/**nil** -- nil means "no opinion". That is what lets
+-- WA.ComposeSorts fall through to the next comparator, and what stops
+-- WA.InvertSort turning "no opinion" into an opinion. Every comparator here is
+-- called with exactly two values, so `function(a, b)` replaces upstream's
+-- `function(...)`.
+function WA.InvertSort(sortFunc)
+	if type(sortFunc) ~= "function" then
+		error("InvertSort requires a function to invert.")
+	end
+	return function(a, b)
+		local result = sortFunc(a, b)
+		if result == nil then return nil end
+		return not result
+	end
+end
+
+-- Fixed parameters, not a vararg: this client has no `...` expression. Six is
+-- the cap because nothing in this addon composes more than that; nil slots
+-- are skipped without assuming they're contiguous.
+function WA.ComposeSorts(f1, f2, f3, f4, f5, f6)
+	local sorts = {}
+	if type(f1) == "function" then table.insert(sorts, f1) end
+	if type(f2) == "function" then table.insert(sorts, f2) end
+	if type(f3) == "function" then table.insert(sorts, f3) end
+	if type(f4) == "function" then table.insert(sorts, f4) end
+	if type(f5) == "function" then table.insert(sorts, f5) end
+	if type(f6) == "function" then table.insert(sorts, f6) end
+	return function(a, b)
+		for i = 1, table.getn(sorts) do
+			local result = sorts[i](a, b)
+			if result ~= nil then return result end
+		end
+		return nil
+	end
+end
+
+function WA.SortNilLast(a, b)
+	if a == nil and b == nil then
+		return false
+	elseif a == nil then
+		return false
+	elseif b == nil then
+		return true
+	else
+		return nil
+	end
+end
+
+local sortNilFirst = WA.InvertSort(WA.SortNilLast)
+function WA.SortNilFirst(a, b)
+	if a == nil and b == nil then
+		return false
+	else
+		return sortNilFirst(a, b)
+	end
+end
+
+function WA.SortGreaterLast(a, b)
+	if a == b then return nil end
+	if type(a) ~= type(b) then return type(a) > type(b) end
+	if type(a) == "number" then
+		if math.abs(b - a) < 0.001 then return nil end
+		return a < b
+	elseif type(a) == "string" then
+		return a < b
+	else
+		return nil
+	end
+end
+
+WA.SortGreaterFirst = WA.InvertSort(WA.SortGreaterLast)
+
+function WA.SortRegionData(path, sortFunc)
+	if type(path) ~= "table" then path = {} end
+	if type(sortFunc) ~= "function" then sortFunc = WA.SortGreaterLast end
+	return function(a, b)
+		local aValue, bValue = a, b
+		for i = 1, table.getn(path) do
+			local key = path[i]
+			if type(aValue) ~= "table" then return nil end
+			if type(bValue) ~= "table" then return nil end
+			aValue, bValue = aValue[key], bValue[key]
+		end
+		return sortFunc(aValue, bValue)
+	end
+end
+
+function WA.SortAscending(path)
+	return WA.SortRegionData(path, WA.ComposeSorts(WA.SortNilFirst, WA.SortGreaterLast))
+end
+
+-- Composed rather than upstream's `InvertSort(SortAscending(path))`, and this is
+-- the one place the port deliberately parts company with it. Both nil-partition
+-- helpers answer *false* for two nils on purpose -- "no swap", which is what
+-- keeps equal entries stable -- but inverting that turns it into *true*, so
+-- upstream's descending swaps two entries with no sort key on every pass and
+-- never reaches the tiebreaker behind it. Ordering is identical for every other
+-- pair; only the degenerate one is fixed.
+function WA.SortDescending(path)
+	return WA.SortRegionData(path, WA.ComposeSorts(WA.SortNilLast, WA.SortGreaterFirst))
+end
+
+-- Not table.sort: a comparator here may answer nil (no opinion), and
+-- customSort is user code that can answer inconsistently -- 5.0's table.sort
+-- raises "invalid order function for sorting" on either, where an insertion
+-- pass just leaves the pair where it found it. That's the point: a pair the
+-- comparator has no opinion about keeps the order the list arrived in.
+local function stableSort(list, cmp)
+	if not cmp then return end
+	for i = 2, table.getn(list) do
+		local item = list[i]
+		local j = i
+		while j > 1 and cmp(item, list[j - 1]) do
+			list[j] = list[j - 1]
+			j = j - 1
+		end
+		list[j] = item
+	end
+end
+
 -- The currently-shown child region frames of a dynamicgroup, in controlledChildren
 -- order, one entry per visible clone. Each carries its size (from data, falling
--- back to the live frame). Order is the grower's input; sort reorders it below.
+-- back to the live frame) plus the fields WA2's regionData carries (id, cloneId,
+-- dataIndex, region, data) so a customSort can read them.
+--
+-- WA.ForEachClone walks entry.byClone with pairs(), a hash whose iteration order
+-- can differ between two passes over the same set -- without this stableSort, a
+-- clone the eventual sort key ties on would take whatever position the hash gave
+-- it and drift between layouts. (dataIndex, cloneSeq) is the deterministic base
+-- order every sort mode composes on top of: dataIndex groups by
+-- controlledChildren order, cloneSeq (stamped on the frame at acquisition)
+-- breaks ties within one display, base clone first.
+--
+-- Built once: this runs on every state update of every child, and each
+-- SortAscending is six closures and two tables.
+local baseOrder = WA.ComposeSorts(WA.SortAscending({ "dataIndex" }), WA.SortAscending({ "cloneSeq" }))
+
 local function activeChildren(data)
 	local list = {}
 	local kids = data.controlledChildren or {}
 	for i = 1, table.getn(kids) do
-		local cd = WeakestAurasDB.displays[kids[i]]
+		local childId = kids[i]
+		local dataIndex = i
+		local cd = WeakestAurasDB.displays[childId]
 		if cd then
-			WA.ForEachClone(kids[i], function(frame)
-				if frame.toShow then
+			WA.ForEachClone(childId, function(frame, cloneId)
+				if frame.toShow or frame.animatingFinish then
 					local w = cd.width or (frame:GetWidth() or 0)
 					local h = cd.height or (frame:GetHeight() or 0)
-					table.insert(list, { region = frame, width = w, height = h })
+					table.insert(list, {
+						region = frame, data = cd, id = childId, cloneId = cloneId,
+						dataIndex = dataIndex, cloneSeq = frame.cloneSeq or 0,
+						width = w, height = h,
+					})
 				end
 			end)
 		end
 	end
+	stableSort(list, baseOrder)
 	return list
 end
 
--- Axis-aligned grower: assigns each visible child a CENTER-relative position,
--- stacking successive children by their own dimension + spacing (WA2's
--- DynamicGroup.lua growers, minus stagger/limit/anchor-per-unit/animation).
--- HORIZONTAL/VERTICAL center the run on the group's center; the four cardinals
--- grow from it. Returns the child list (with .x/.y set) and the box extents.
-local function growChildren(data)
-	local list = activeChildren(data)
-	local sort = data.sort
-	if sort == "ascending" or sort == "descending" then
-		-- By time remaining; a child with no timer sorts last (ref the aura-bar
-		-- convention). expirationTime is the region's live value.
-		table.sort(list, function(a, b)
-			local ta = a.region.expirationTime or WA.INF
-			local tb = b.region.expirationTime or WA.INF
-			if sort == "ascending" then return ta < tb else return ta > tb end
-		end)
+-- data.sort's comparator, one per mode. Each entry returns a comparator (or
+-- nil for "no opinion", i.e. leave activeChildren's deterministic base order).
+local sorters = {
+	none = function(data)
+		return WA.ComposeSorts(
+			WA.SortAscending({ "dataIndex" }),
+			WA.SortAscending({ "region", "state", "index" })
+		)
+	end,
+	ascending = function(data)
+		return WA.ComposeSorts(
+			WA.SortAscending({ "region", "state", "expirationTime" }),
+			WA.SortAscending({ "dataIndex" })
+		)
+	end,
+	descending = function(data)
+		return WA.ComposeSorts(
+			WA.SortDescending({ "region", "state", "expirationTime" }),
+			WA.SortAscending({ "dataIndex" })
+		)
+	end,
+	hybrid = function(data)
+		local sortHybridTable = data.sortHybridTable or {}
+		local hybridSortAscending = data.hybridSortMode == "ascending"
+		local hybridFirst = data.hybridPosition == "hybridFirst"
+		local function sortHybridStatus(a, b)
+			if not b then return true end
+			if not a then return false end
+			local aIsHybrid = sortHybridTable[a.id]
+			local bIsHybrid = sortHybridTable[b.id]
+			if aIsHybrid and not bIsHybrid then
+				return hybridFirst
+			elseif bIsHybrid and not aIsHybrid then
+				return not hybridFirst
+			else
+				return nil
+			end
+		end
+		local sortExpirationTime
+		if hybridSortAscending then
+			sortExpirationTime = WA.SortAscending({ "region", "state", "expirationTime" })
+		else
+			sortExpirationTime = WA.SortDescending({ "region", "state", "expirationTime" })
+		end
+		return WA.ComposeSorts(sortHybridStatus, sortExpirationTime, WA.SortAscending({ "dataIndex" }))
+	end,
+	custom = function(data)
+		-- Blank is not broken: an aura arriving through import has `sort =
+		-- "custom"` and an empty editor, and compiling that would report a
+		-- failure on every WA.Add. Same whitespace test the generic trigger's
+		-- optional code fields use.
+		local source = data.customSort
+		if not source or not string.find(source, "%S") then return nil end
+		local errTag = tostring(data.id) .. ": custom sort"
+		local sortFunc = WA.LoadFunction(source, errTag)
+		if not sortFunc then return nil end
+		-- A comparator is the only user-code site this addon calls O(n^2) times
+		-- per pass, and the pass repeats on every state update -- so one that
+		-- throws would bury its own first report under thousands of copies and
+		-- take the chat frame with it. It is consulted until it throws and not
+		-- again for the rest of that pass: exactly one report, and the pairs it
+		-- never saw keep the deterministic base order. `WA.safecall` stays
+		-- honest for every other site rather than growing a dedup nobody else
+		-- needs.
+		local broken = false
+		return function(a, b)
+			if broken then return nil end
+			local ok, result = WA.RunAuraFunc(data.id, errTag, sortFunc, a, b)
+			if ok then return result end
+			broken = true
+			return nil
+		end, function() broken = false end
+	end,
+}
+
+-- Returns the comparator, plus (custom sort only) the per-pass reset that
+-- re-arms its one-report budget.
+local function createSortFunc(data)
+	local sorter = sorters[data.sort] or sorters.none
+	return sorter(data)
+end
+
+-- Upstream's staggerCoefficient verbatim: which end of a staggered run sits at
+-- offset 0. Upstream's alignment argument is direction-dependent (LEFT/RIGHT
+-- name an edge of whichever axis is perpendicular to that grow); reused below
+-- against our flat LEFT/CENTER/RIGHT align, which only carries meaning for the
+-- vertical grows.
+local function staggerCoefficient(align, stagger)
+	if align == "LEFT" then
+		if stagger < 0 then return 1 else return 0 end
+	elseif align == "RIGHT" then
+		if stagger > 0 then return 1 else return 0 end
+	end
+	return 0.5
+end
+
+-- Per-unit anchoring (WA2 DynamicGroup.lua's `anchorers`): each clone is placed
+-- against the frame showing *its own* unit rather than against the group, so one
+-- dynamic group can put an icon on every nameplate or party frame at once. The
+-- clone's unit comes from the producer's `state.unit` -- Stage 10c's families
+-- write it, and a clone with no unit has nothing to anchor to.
+--
+-- Upstream anchors a pooled control point per unit; ours anchors the child
+-- region itself, which is why there is no control-point pool here. The child
+-- stays parented to the group (scale, strata and dragging still cascade) and
+-- only its SetPoint target changes -- an anchor tracks a moving nameplate by
+-- itself, so a plate sliding across the screen costs nothing per frame.
+local function regionUnit(entry)
+	local state = entry.region and entry.region.state
+	if not state then return nil, nil end
+	return state.unit or state.unitId, state.guid
+end
+
+local anchorers = {
+	NAMEPLATE = function(region, data, entry)
+		local unit, guid = regionUnit(entry)
+		return unit and WA.GetUnitNameplate and WA.GetUnitNameplate(unit, guid) or nil
+	end,
+	UNITFRAME = function(region, data, entry)
+		local unit = regionUnit(entry)
+		return unit and WA.GetUnitFrame and WA.GetUnitFrame(unit) or nil
+	end,
+}
+
+-- The custom anchorer keeps upstream's signature -- function(frames,
+-- activeRegions), filling frames[frame] with the regionDatas that belong to it
+-- -- so an upstream custom anchor runs here unchanged.
+local function customAnchorFrames(region, data, list)
+	local source = data.customAnchorPerUnit
+	if not source or not string.find(source, "%S") then return nil end
+	local errTag = tostring(data.id) .. ": custom anchor"
+	if not region.anchorFuncBuilt then
+		region.anchorFunc = WA.LoadFunction(source, errTag)
+		region.anchorFuncBuilt = true
+	end
+	if not region.anchorFunc then return nil end
+	local frames = {}
+	local ok = WA.RunAuraFunc(data.id, errTag, region.anchorFunc, frames, list)
+	if not ok then
+		-- The layout re-runs on every state update of every child, so an anchor
+		-- that throws would report on every one. It is dropped for the rest of
+		-- this compile instead: one report, and the next WA.Add -- which any edit
+		-- to the aura is -- hands it back.
+		region.anchorFunc = nil
+		return nil
+	end
+	return frames
+end
+
+-- Groups the ordered child list by the frame each clone anchors to. Returns an
+-- array of { frame, entries }, with `frame` nil for the run the group itself
+-- anchors. Partition order follows the first entry of each run, so the layout
+-- does not inherit the iteration order of a hash -- the same reason
+-- activeChildren sorts before anything reads it.
+local function anchorPartitions(region, data, list)
+	local total = table.getn(list)
+	if not data.useAnchorPerUnit then return { { entries = list } } end
+
+	local buckets, order = {}, {}
+	local function bucketFor(frame)
+		local bucket = buckets[frame]
+		if not bucket then
+			bucket = { frame = frame, entries = {} }
+			buckets[frame] = bucket
+			table.insert(order, bucket)
+		end
+		return bucket
+	end
+
+	local mode = data.anchorPerUnit or "NAMEPLATE"
+	if mode == "CUSTOM" then
+		local frames = customAnchorFrames(region, data, list)
+		if not frames then return { { entries = list } } end
+		-- The custom anchorer hands back a frame-keyed hash, so the runs come out
+		-- in whatever order `pairs` feels like. Ordering them by their earliest
+		-- member, and letting the first run that claims a clone keep it, is what
+		-- makes a custom anchor that assigns one clone to two frames lay out the
+		-- same way twice running instead of flipping between them.
+		local rank = {}
+		for i = 1, total do rank[list[i]] = i end
+		local ranked = {}
+		for frame, entries in pairs(frames) do
+			local first = total + 1
+			for i = 1, table.getn(entries) do
+				local at = rank[entries[i]]
+				if at and at < first then first = at end
+			end
+			table.insert(ranked, { frame = frame, entries = entries, first = first })
+		end
+		stableSort(ranked, WA.SortAscending({ "first" }))
+		local claimed = {}
+		for r = 1, table.getn(ranked) do
+			local entries = ranked[r].entries
+			for i = table.getn(entries), 1, -1 do
+				if claimed[entries[i]] then table.remove(entries, i)
+				else claimed[entries[i]] = true end
+			end
+		end
+		return ranked
+	end
+
+	-- A clone whose unit has no frame right now still exists and still holds its
+	-- state; it parks on the hidden anchor frame rather than being dropped, so it
+	-- reappears in place the moment the frame does. With the options window open
+	-- there is no real unit behind a preview clone at all, so the group anchors
+	-- its own children and the editor shows the layout instead of nothing.
+	local anchorer = anchorers[mode] or anchorers.NAMEPLATE
+	local fallback = WA.optionsOpen and nil or (WA.HiddenAnchorFrame and WA.HiddenAnchorFrame())
+	for i = 1, total do
+		local entry = list[i]
+		local frame = anchorer(region, data, entry)
+		table.insert(bucketFor(frame or fallback).entries, entry)
+	end
+	return order
+end
+
+-- Axis-aligned grower: assigns each visible child of one run a position relative
+-- to that run's anchor, stacking successive children by their own dimension +
+-- spacing (WA2's DynamicGroup.lua growers, minus animation). HORIZONTAL/VERTICAL
+-- center the run on the anchor; the four cardinals grow from it. Shortens the
+-- list to the visible ones (parking the rest) and returns the box extents.
+local function growRun(data, list)
+	local total = table.getn(list)
+	local visible = total
+	if data.useLimit then
+		visible = tonumber(data.limit) or 0
+		if visible < 0 then visible = 0 end
+		if visible > total then visible = total end
+	end
+	-- A clone past the limit gives up its painted region without giving up its
+	-- state (region:SetLimited) -- it comes back in place the moment the limit
+	-- frees up rather than losing its spot in the order.
+	for i = 1, total do
+		list[i].region:SetLimited(i > visible)
+	end
+	for i = total, visible + 1, -1 do
+		table.remove(list, i)
 	end
 
 	local space = data.space or 0
@@ -148,18 +516,36 @@ local function growChildren(data)
 		else return 0 end
 	end
 
+	-- Perpendicular stagger offset for child i (1-based) of an n-run. Our
+	-- grower is CENTER-origin where upstream's is corner-origin, and our align
+	-- vocabulary is LEFT/CENTER/RIGHT only (upstream's is direction-dependent),
+	-- so the vertical grows (UP/DOWN/VERTICAL) stagger on x via crossX using
+	-- staggerCoefficient(align, stagger), while the horizontal grows (LEFT/
+	-- RIGHT/HORIZONTAL) stagger on y with a flat 0.5 (run centred), since
+	-- local align says nothing about that axis there.
+	local stagger = data.stagger or 0
+	local vertical = (grow == "UP" or grow == "DOWN" or grow == "VERTICAL")
+	local staggerCoeff = vertical and staggerCoefficient(align, stagger) or 0.5
+	local function perpOffset(i)
+		return (i - 1) * stagger - (n - 1) * stagger * staggerCoeff
+	end
+
 	if grow == "HORIZONTAL" or grow == "VERTICAL" then
-		local total = 0
+		local runLength = 0
 		for i = 1, n do
-			total = total + (grow == "HORIZONTAL" and list[i].width or list[i].height)
+			runLength = runLength + (grow == "HORIZONTAL" and list[i].width or list[i].height)
 		end
-		if n > 1 then total = total + space * (n - 1) end
-		local cursor = -total / 2
+		if n > 1 then runLength = runLength + space * (n - 1) end
+		local cursor = -runLength / 2
 		for i = 1, n do
 			local c = list[i]
 			local dim = (grow == "HORIZONTAL") and c.width or c.height
 			local center = cursor + dim / 2
-			if grow == "HORIZONTAL" then c.x, c.y = center, 0 else c.x, c.y = crossX(c.width), -center end
+			if grow == "HORIZONTAL" then
+				c.x, c.y = center, perpOffset(i)
+			else
+				c.x, c.y = crossX(c.width) + perpOffset(i), -center
+			end
 			cursor = cursor + dim + space
 		end
 	else
@@ -167,13 +553,13 @@ local function growChildren(data)
 		for i = 1, n do
 			local c = list[i]
 			if grow == "LEFT" then
-				c.x = cursor - c.width / 2; c.y = 0; cursor = cursor - c.width - space
+				c.x = cursor - c.width / 2; c.y = perpOffset(i); cursor = cursor - c.width - space
 			elseif grow == "RIGHT" then
-				c.x = cursor + c.width / 2; c.y = 0; cursor = cursor + c.width + space
+				c.x = cursor + c.width / 2; c.y = perpOffset(i); cursor = cursor + c.width + space
 			elseif grow == "UP" then
-				c.x = crossX(c.width); c.y = cursor + c.height / 2; cursor = cursor + c.height + space
+				c.x = crossX(c.width) + perpOffset(i); c.y = cursor + c.height / 2; cursor = cursor + c.height + space
 			else -- DOWN
-				c.x = crossX(c.width); c.y = cursor - c.height / 2; cursor = cursor - c.height - space
+				c.x = crossX(c.width) + perpOffset(i); c.y = cursor - c.height / 2; cursor = cursor - c.height - space
 			end
 		end
 	end
@@ -188,17 +574,59 @@ local function growChildren(data)
 	return list, blx, bly, trx, try
 end
 
+-- Orders the group's clones, splits them into anchor runs, and grows each run
+-- from its own anchor. Returns every placed child (each carrying the frame it
+-- anchors to) plus the box extents of the run the group itself holds -- with
+-- per-unit anchoring nothing is anchored to the group, so the box collapses to
+-- the group's own point, which is what a border around a set of nameplates
+-- would have to mean anyway.
+local function growChildren(region, data)
+	local list = activeChildren(data)
+	if not region.sortFuncBuilt then
+		region.sortFunc, region.sortBeginPass = createSortFunc(data)
+		region.sortFuncBuilt = true
+	end
+	if region.sortBeginPass then region.sortBeginPass() end
+	stableSort(list, region.sortFunc)
+
+	local placed = {}
+	local blx, bly, trx, try = 0, 0, 0, 0
+	local runs = anchorPartitions(region, data, list)
+	for r = 1, table.getn(runs) do
+		local run = runs[r]
+		local entries, a, b, c, d = growRun(data, run.entries)
+		for i = 1, table.getn(entries) do
+			entries[i].anchorFrame = run.frame
+			table.insert(placed, entries[i])
+		end
+		if not run.frame then blx, bly, trx, try = a, b, c, d end
+	end
+	return placed, blx, bly, trx, try
+end
+
 -- Dynamic group: run the grower, push each visible child's computed position
 -- onto its region (CENTER-to-CENTER + offset, via the region's own offset slot
 -- so UpdatePosition stays authoritative), then draw the box around the result.
 local function layoutDynamicGroup(region, data)
-	local list, blx, bly, trx, try = growChildren(data)
+	local list, blx, bly, trx, try = growChildren(region, data)
 	for i = 1, table.getn(list) do
 		local c = list[i]
-		c.region:SetAnchor("CENTER", region, "CENTER")
+		c.region:SetAnchor("CENTER", c.anchorFrame or region, "CENTER")
 		c.region:SetOffset(c.x, c.y)
 	end
 	drawGroupBox(region, data, blx, bly, trx, try)
+end
+
+-- Every dynamic group anchoring per unit, re-laid-out because the frames it
+-- anchors to changed -- a plate appearing or leaving, a roster shuffle moving a
+-- unit to another party frame. A plate that merely *moves* needs nothing: the
+-- child is anchored to it, so it travels along.
+function WA.RelayoutUnitAnchoredGroups()
+	for id, data in pairs(WeakestAurasDB and WeakestAurasDB.displays or {}) do
+		if data.regionType == "dynamicgroup" and data.useAnchorPerUnit then
+			WA.RelayoutGroup(id)
+		end
+	end
 end
 
 -- Refresh a group after a child's position/size/visibility/membership changed:
@@ -242,6 +670,9 @@ local function groupModify(region, data)
 	WA.regionPrototype.ApplyPosition(region, data)
 	WA.regionPrototype.ApplyFrameStrata(region, data)
 	if data.regionType == "dynamicgroup" then
+		region.sortFunc, region.sortBeginPass = createSortFunc(data)
+		region.sortFuncBuilt = true
+		region.anchorFunc, region.anchorFuncBuilt = nil, false
 		layoutDynamicGroup(region, data)
 	else
 		applyGroupBounds(region, data)
@@ -274,8 +705,13 @@ local function groupCreateThumbnail(parent)
 end
 
 local function groupModifyThumbnail(frame, data)
-	local path = data and data.groupIcon
-	if path and path ~= "" then
+	-- WA.DrawableTexture first, and the read-back second: a fileID or an atlas
+	-- name is not a path at all, and `GetTexture` hands one straight back rather
+	-- than reporting the failure, so the read-back alone let both through to the
+	-- engine's missing-texture block. The stored value is left alone -- it is
+	-- still what the author chose, and it is what the options tab shows.
+	local path = WA.DrawableTexture(data and data.groupIcon)
+	if path then
 		frame.icon:SetTexture(path)
 		-- SetTexture returns nothing here, so upstream's `if success` has no
 		-- equivalent: a path the client can't load leaves GetTexture nil, and
@@ -386,6 +822,12 @@ WA.RegisterRegionType("dynamicgroup", {
 		space = 2,
 		align = "CENTER",
 		groupIcon = "",
+		stagger = 0,
+		useLimit = false,
+		limit = 5,
+		useAnchorPerUnit = false,
+		anchorPerUnit = "NAMEPLATE",
+		customAnchorPerUnit = "",
 	},
 	create = groupCreate,
 	modify = groupModify,
@@ -403,10 +845,11 @@ WA.RegisterRegionType("dynamicgroup", {
 			},
 			{
 				type = "select", name = "Sort", key = "sort",
-				values = { "none", "ascending", "descending" },
-				labels = { none = "None", ascending = "Ascending", descending = "Descending" },
+				values = { "none", "ascending", "descending", "hybrid", "custom" },
+				labels = { none = "None", ascending = "Ascending", descending = "Descending",
+					hybrid = "Hybrid", custom = "Custom" },
 				get = function() return data.sort end,
-				set = function(v) data.sort = v; WA.Add(data) end,
+				set = function(v) data.sort = v; WA.Add(data); WA.RefreshOptions() end,
 			},
 			{
 				type = "range", name = "Spacing", key = "space", min = 0, max = 20, step = 1,
@@ -419,17 +862,119 @@ WA.RegisterRegionType("dynamicgroup", {
 				get = function() return data.align end,
 				set = function(v) data.align = v; WA.Add(data) end,
 			},
-			{
-				type = "toggle", name = "Border", key = "border",
-				get = function() return data.border end,
-				set = function(v) data.border = v; WA.Add(data) end,
-			},
-			{
-				type = "range", name = "Scale", key = "scale", min = 0.1, max = 3, step = 0.05,
-				get = function() return data.scale end,
-				set = function(v) data.scale = v; WA.Add(data) end,
-			},
 		}
+		if data.sort == "hybrid" then
+			table.insert(fields, {
+				type = "select", name = "Hybrid Position", key = "hybridPosition",
+				values = { "hybridFirst", "hybridLast" },
+				labels = { hybridFirst = "Marked First", hybridLast = "Marked Last" },
+				get = function() return data.hybridPosition end,
+				set = function(v) data.hybridPosition = v; WA.Add(data) end,
+			})
+			table.insert(fields, {
+				type = "select", name = "Hybrid Sort Mode", key = "hybridSortMode",
+				values = { "ascending", "descending" },
+				get = function() return data.hybridSortMode end,
+				set = function(v) data.hybridSortMode = v; WA.Add(data) end,
+			})
+			local kids = data.controlledChildren or {}
+			for i = 1, table.getn(kids) do
+				local childId = kids[i]
+				table.insert(fields, {
+					type = "toggle", name = childId, key = "sortHybrid_" .. childId,
+					get = function() return data.sortHybridTable and data.sortHybridTable[childId] or false end,
+					set = function(v)
+						data.sortHybridTable = data.sortHybridTable or {}
+						data.sortHybridTable[childId] = v
+						WA.Add(data)
+					end,
+				})
+			end
+		elseif data.sort == "custom" then
+			table.insert(fields, {
+				type = "code", name = "Custom Sort", key = "customSort", height = 160,
+				get = function() return data.customSort end,
+				set = function(v) data.customSort = v; WA.Add(data) end,
+				-- Seeded nil-safe on purpose: a comparator sees the options
+				-- preview's synthesised state as well as the real ones, and that
+				-- carries no producer fields at all. Answering nil is "no
+				-- opinion", which leaves the pair in the deterministic base order.
+				default = "function(a, b)\n"
+					.. "    local x = a.region.state and a.region.state.index\n"
+					.. "    local y = b.region.state and b.region.state.index\n"
+					.. "    if x == nil or y == nil then return nil end\n"
+					.. "    return x < y\nend",
+				validate = function(txt)
+					return WA.Widgets.LuaSyntaxError(WA.WrapFunctionSource(txt), "custom sort")
+				end,
+			})
+		end
+		table.insert(fields, {
+			type = "range", name = "Stagger", key = "stagger", min = -50, max = 50, step = 1,
+			get = function() return data.stagger end,
+			set = function(v) data.stagger = v; WA.Add(data) end,
+		})
+		table.insert(fields, {
+			type = "toggle", name = "Limit visible clones", key = "useLimit",
+			get = function() return data.useLimit end,
+			set = function(v) data.useLimit = v; WA.Add(data); WA.RefreshOptions() end,
+		})
+		if data.useLimit then
+			table.insert(fields, {
+				type = "range", name = "Limit", key = "limit", min = 0, max = 20, step = 1,
+				get = function() return data.limit end,
+				set = function(v) data.limit = v; WA.Add(data) end,
+			})
+		end
+		table.insert(fields, {
+			type = "toggle", name = "Anchor per unit", key = "useAnchorPerUnit",
+			get = function() return data.useAnchorPerUnit end,
+			set = function(v) data.useAnchorPerUnit = v; WA.Add(data); WA.RefreshOptions() end,
+		})
+		if data.useAnchorPerUnit then
+			table.insert(fields, {
+				type = "select", name = "Anchor each clone to", key = "anchorPerUnit",
+				values = { "NAMEPLATE", "UNITFRAME", "CUSTOM" },
+				labels = { NAMEPLATE = "Its unit's nameplate", UNITFRAME = "Its unit's frame",
+					CUSTOM = "Custom" },
+				get = function() return data.anchorPerUnit end,
+				set = function(v) data.anchorPerUnit = v; WA.Add(data); WA.RefreshOptions() end,
+			})
+			if data.anchorPerUnit == "CUSTOM" then
+				table.insert(fields, {
+					type = "code", name = "Custom Anchor", key = "customAnchorPerUnit", height = 160,
+					get = function() return data.customAnchorPerUnit end,
+					set = function(v) data.customAnchorPerUnit = v; WA.Add(data) end,
+					-- Upstream's signature: fill `frames[frame]` with the clones that
+					-- belong to that frame. Seeded with the nameplate the built-in
+					-- anchorer would find, since that is the shape most custom
+					-- anchors start from.
+					default = "function(frames, regions)\n"
+						.. "    for i = 1, table.getn(regions) do\n"
+						.. "        local state = regions[i].region.state\n"
+						.. "        local frame = state and state.unit\n"
+						.. "            and WeakestAuras.GetUnitNameplate(state.unit)\n"
+						.. "        if frame then\n"
+						.. "            frames[frame] = frames[frame] or {}\n"
+						.. "            table.insert(frames[frame], regions[i])\n"
+						.. "        end\n"
+						.. "    end\nend",
+					validate = function(txt)
+						return WA.Widgets.LuaSyntaxError(WA.WrapFunctionSource(txt), "custom anchor")
+					end,
+				})
+			end
+		end
+		table.insert(fields, {
+			type = "toggle", name = "Border", key = "border",
+			get = function() return data.border end,
+			set = function(v) data.border = v; WA.Add(data) end,
+		})
+		table.insert(fields, {
+			type = "range", name = "Scale", key = "scale", min = 0.1, max = 3, step = 0.05,
+			get = function() return data.scale end,
+			set = function(v) data.scale = v; WA.Add(data) end,
+		})
 		for _, f in ipairs(WA.regionPrototype.PositionOptions(data)) do
 			table.insert(fields, f)
 		end
@@ -522,7 +1067,7 @@ WA.RegisterRegionType("texture", {
 		texture:SetPoint("CENTER", frame, "CENTER")
 		texture:SetWidth(width)
 		texture:SetHeight(height)
-		texture:SetTexture(data.texture or TEXTURE_DEFAULT)
+		texture:SetTexture(WA.DrawableTexture(data.texture) or TEXTURE_DEFAULT)
 		local color = data.color or { 1, 1, 1, 1 }
 		texture:SetVertexColor(color[1] or 1, color[2] or 1, color[3] or 1, color[4] or 1)
 		texture:SetBlendMode(data.blendMode or "BLEND")
@@ -600,12 +1145,14 @@ WA.RegisterRegionType("texture", {
 	modify = function(region, data)
 		function region:SetRegionWidth(width) self.regionWidth = width; self:SetWidth(width) end
 		function region:SetRegionHeight(height) self.regionHeight = height; self:SetHeight(height) end
-		function region:SetTexture(path) self.texture:SetTexture(path or TEXTURE_DEFAULT) end
+		function region:SetTexture(path) self.texture:SetTexture(WA.DrawableTexture(path) or TEXTURE_DEFAULT) end
 		function region:Color(r, g, b, a) self.texture:SetVertexColor(r, g, b, a or 1) end
 		function region:SetDesaturated(value) self.texture:SetDesaturated(value and true or false) end
 		function region:SetBlendMode(value) self.texture:SetBlendMode(value or "BLEND") end
 		function region:SetMirror(value) self.mirror = value and true or false; applyTextureCoords(self.texture, self.mirror, self.rotation) end
 		function region:SetRotation(value) self.rotation = value or 0; applyTextureCoords(self.texture, self.mirror, self.rotation) end
+		function region:SetAnimRotation(value) self.animRotation = value; applyTextureCoords(self.texture, self.mirror, value or self.rotation) end
+		function region:GetBaseRotation() return self.rotation or 0 end
 
 		region:SetRegionWidth(data.width)
 		region:SetRegionHeight(data.height)
@@ -786,7 +1333,12 @@ WA.RegisterRegionType("icon", {
 		-- UpdateProgress dispatches here after setting duration/expirationTime:
 		-- a timed state drives the swipe (when enabled), a static one clears it.
 		function region:UpdateTime()
-			if self.cooldownSwipe then
+			-- The swipe is a 3D Model armed with a start and duration, not a value
+			-- it can hold part-way -- a paused aura clears it rather than leaving a
+			-- swipe running on regardless of the freeze.
+			if self.paused then
+				WA.regionPrototype.ArmSwipe(self.swipe, 0, 0)
+			elseif self.cooldownSwipe then
 				WA.regionPrototype.ArmSwipe(self.swipe, self.expirationTime, self.duration)
 			else
 				WA.regionPrototype.ArmSwipe(self.swipe, 0, 0)
@@ -834,8 +1386,7 @@ WA.RegisterRegionType("icon", {
 			else
 				path = (self.state and self.state.icon) or self.displayIcon
 			end
-			if path == "" then path = nil end
-			self.iconTex:SetTexture(path or "Interface\\Icons\\INV_Misc_QuestionMark")
+			self.iconTex:SetTexture(WA.DrawableTexture(path) or "Interface\\Icons\\INV_Misc_QuestionMark")
 		end
 
 		region:SetRegionWidth(data.width)
@@ -876,6 +1427,11 @@ local BAR_ORIENTATIONS = { "HORIZONTAL", "HORIZONTAL_INVERSE", "VERTICAL", "VERT
 -- Upstream's own wording (Types.lua orientation_types): the label names the
 -- direction the *leading edge travels as the bar drains*, not where the fill
 -- sits -- so "Right to Left" is the familiar left-anchored bar.
+-- The client's own casting-bar spark, and what an unusable one falls back to:
+-- an atlas name or a foreign addon's file would otherwise paint the engine's
+-- missing-texture block at the full spark width and height.
+local SPARK_DEFAULT = "Interface\\CastingBar\\UI-CastingBar-Spark"
+
 local BAR_ORIENTATION_LABELS = {
 	HORIZONTAL = "Right to Left",
 	HORIZONTAL_INVERSE = "Left to Right",
@@ -1027,10 +1583,11 @@ local SMOOTH_EPSILON = 0.001
 
 -- Clamps a raw 0..1 fraction and applies `inverse` -- shared by SetProgress
 -- and the static path's smoothing target, so a tween settles on exactly the
--- same number a snap would have used.
+-- same number a snap would have used. The aura's configured inverse and the
+-- active state's inverse combine by XOR, matching upstream's effectiveInverse.
 local function clampProgress(region, p)
 	if not p or p < 0 then p = 0 elseif p > 1 then p = 1 end
-	if region.inverse then p = 1 - p end
+	if (region.inverse and true or false) ~= (region.stateInverse and true or false) then p = 1 - p end
 	return p
 end
 
@@ -1286,7 +1843,7 @@ WA.RegisterRegionType("progressbar", {
 		progressSourceManualValue = 0,
 		progressSourceManualTotal = 100,
 		spark = false,
-		sparkTexture = "Interface\\CastingBar\\UI-CastingBar-Spark",
+		sparkTexture = SPARK_DEFAULT,
 		sparkColor = { 1, 1, 1, 1 },
 		sparkWidth = 10,
 		sparkHeight = 30,
@@ -1820,6 +2377,16 @@ WA.RegisterRegionType("progressbar", {
 		-- StatusBarOnUpdate) -- that's the region's own animation, separate from
 		-- the %p subtext (which repaints via FrameTick). Text no longer lives here.
 		function region:UpdateTime()
+			if self.paused then
+				local remain = self.remaining or 0
+				if self.duration and self.duration > 0 then
+					self:SetProgress(remain / self.duration)
+				else
+					self:SetProgress(1)
+				end
+				self:SetScript("OnUpdate", nil)
+				return
+			end
 			if self.duration and self.duration > 0 then
 				self:SetScript("OnUpdate", function()
 					if not this:IsShown() then this:SetScript("OnUpdate", nil); return end
@@ -1850,7 +2417,7 @@ WA.RegisterRegionType("progressbar", {
 		-- clampProgress has already flipped, and flipping again there would be
 		-- double-counted.
 		function region:GetInverse()
-			return self.inverse and true or false
+			return (self.inverse and true or false) ~= (self.stateInverse and true or false)
 		end
 
 		-- The fourth door: the displayed fill fraction, 0..1, with `inverse`
@@ -1925,7 +2492,7 @@ WA.RegisterRegionType("progressbar", {
 		end
 
 		function region:SetSparkEnabled(b) self.sparkEnabled = b and true or false; fillBar(self) end
-		function region:SetSparkTexture(path) self.spark:SetTexture(path) end
+		function region:SetSparkTexture(path) self.spark:SetTexture(WA.DrawableTexture(path) or SPARK_DEFAULT) end
 		function region:SetSparkColor(r, g, b, a) self.spark:SetVertexColor(r, g, b, a or 1) end
 		function region:SetSparkWidth(w) self.spark:SetWidth(w) end
 		function region:SetSparkHeight(h) self.spark:SetHeight(h) end
@@ -1955,8 +2522,7 @@ WA.RegisterRegionType("progressbar", {
 			else
 				path = (self.state and self.state.icon) or self.displayIcon
 			end
-			if path == "" then path = nil end
-			self.iconTex:SetTexture(path or "Interface\\Icons\\INV_Misc_QuestionMark")
+			self.iconTex:SetTexture(WA.DrawableTexture(path) or "Interface\\Icons\\INV_Misc_QuestionMark")
 		end
 
 		-- ApplyPosition may SetParent, which resets child frame levels (and
@@ -2073,9 +2639,9 @@ local TEXT_ANCHORS_BY_JUSTIFY = {
 
 local function textAnchorPoint(data)
 	local D = WA.textCore.DEFAULTS
-	local row = TEXT_ANCHORS_BY_JUSTIFY[data.text_justifyV or D.justifyV]
+	local row = TEXT_ANCHORS_BY_JUSTIFY[data.justifyV or D.justifyV]
 		or TEXT_ANCHORS_BY_JUSTIFY.MIDDLE
-	return row[data.text_justifyH or D.justifyH] or "CENTER"
+	return row[data.justify or D.justifyH] or "CENTER"
 end
 
 -- Auto mode: size the region to whatever the string just rendered as. Both
@@ -2163,7 +2729,7 @@ local function textModify(region, data)
 	-- keeps a face the client refuses from leaving the string unrendered. Routed
 	-- through textCore rather than opening a second SetFont call site.
 	function region:SetTextHeight(size)
-		WA.textCore.Apply(self.text, data, "text_", size)
+		WA.textCore.Apply(self.text, data, "", size, WA.textCore.REGION_KEYS)
 		self.text:SetTextHeight(size)
 	end
 
@@ -2199,7 +2765,7 @@ local function textModify(region, data)
 	region.formatters, region.everyFrameFormatters =
 		WA.CreateFormatters(texts, textFormatGetter(data), data)
 
-	WA.textCore.Apply(region.text, data, "text_")
+	WA.textCore.Apply(region.text, data, "", nil, WA.textCore.REGION_KEYS)
 	local point = textAnchorPoint(data)
 	region.text:ClearAllPoints()
 	region.text:SetPoint(point, region, point)
@@ -2230,7 +2796,7 @@ local function textModify(region, data)
 	end
 
 	region:SetRegionAlpha(data.alpha)
-	local col = data.text_color or { 1, 1, 1, 1 }
+	local col = data.color or { 1, 1, 1, 1 }
 	region:Color(col[1], col[2], col[3], col[4])
 
 	-- ApplyPosition may SetParent, which resets child frame levels, so the text
@@ -2333,6 +2899,7 @@ local PROGTEX_ALIGN = {
 -- together, exactly as in fillBar: the texture is cropped to the same fraction
 -- of the same axis it is scaled to, or the art squashes instead of revealing.
 local function progTexFill(region)
+	-- SetTexCoord(progTexCoords(o, p, region.rotation, region.mirror, region.crop_x, region.crop_y, region.user_x, region.user_y))
 	local o = region.orientation or "HORIZONTAL"
 	local align = PROGTEX_ALIGN[o] or PROGTEX_ALIGN.HORIZONTAL
 	local p = region.progress or 0
@@ -2351,7 +2918,7 @@ local function progTexFill(region)
 	-- Two corners on one edge fix the cross axis, leaving the fill axis free to
 	-- be set explicitly.
 	if vertical then fg:SetHeight(extent) else fg:SetWidth(extent) end
-	fg:SetTexCoord(progTexCoords(o, p, region.rotation, region.mirror, region.cropX, region.cropY, region.userX, region.userY))
+	fg:SetTexCoord(progTexCoords(o, p, region.animRotation or region.rotation, region.mirror, region.crop_x, region.crop_y, region.user_x, region.user_y))
 	fg:Show()
 end
 
@@ -2359,7 +2926,7 @@ local function progTexBackground(region)
 	local background = region.background
 	if not background then return end
 	local o = region.orientation or "HORIZONTAL"
-	background:SetTexCoord(progTexCoords(o, 1, region.rotation, region.mirror, region.cropX, region.cropY, region.userX, region.userY))
+	background:SetTexCoord(progTexCoords(o, 1, region.animRotation or region.rotation, region.mirror, region.crop_x, region.crop_y, region.user_x, region.user_y))
 end
 
 WA.RegisterRegionType("progresstexture", {
@@ -2375,7 +2942,7 @@ WA.RegisterRegionType("progresstexture", {
 		desaturateBackground = false,
 		width = 200, height = 32, alpha = 1,
 		orientation = "HORIZONTAL", inverse = false, mirror = false, rotation = 0,
-		cropX = 0, cropY = 0,
+		crop_x = 0, crop_y = 0, user_x = 0, user_y = 0,
 		progressSource = -1, progressSourceManualValue = 0, progressSourceManualTotal = 100,
 		anchorFrameType = "SCREEN", selfPoint = "CENTER", anchorPoint = "CENTER",
 		xOffset = 0, yOffset = 0, frameStrata = 1,
@@ -2391,10 +2958,10 @@ WA.RegisterRegionType("progresstexture", {
 		inverse = { display = "Inverse", setter = "SetInverse", type = "bool" },
 		mirror = { display = "Mirror", setter = "SetMirror", type = "bool" },
 		rotation = { display = "Texture Rotation", setter = "SetTexRotation", type = "number", min = 0, max = 360, step = 1 },
-		cropX = { display = "Crop X", setter = "SetCropX", type = "number", min = 0, max = 0.5, step = 0.01 },
-		cropY = { display = "Crop Y", setter = "SetCropY", type = "number", min = 0, max = 0.5, step = 0.01 },
-		userX = { display = "Re-center X", setter = "SetUserX", type = "number", min = -0.5, max = 0.5, step = 0.01 },
-		userY = { display = "Re-center Y", setter = "SetUserY", type = "number", min = -0.5, max = 0.5, step = 0.01 },
+		crop_x = { display = "Crop X", setter = "SetCropX", type = "number", min = 0, max = 0.5, step = 0.01 },
+		crop_y = { display = "Crop Y", setter = "SetCropY", type = "number", min = 0, max = 0.5, step = 0.01 },
+		user_x = { display = "Re-center X", setter = "SetUserX", type = "number", min = -0.5, max = 0.5, step = 0.01 },
+		user_y = { display = "Re-center Y", setter = "SetUserY", type = "number", min = -0.5, max = 0.5, step = 0.01 },
 		foregroundTexture = { display = "Foreground Texture", setter = "SetForegroundTexture", type = "texture" },
 		backgroundTexture = { display = "Background Texture", setter = "SetBackgroundTexture", type = "texture" },
 	})),
@@ -2412,7 +2979,7 @@ WA.RegisterRegionType("progresstexture", {
 		frame.bg:SetWidth(vertical and thick or long); frame.bg:SetHeight(vertical and long or thick)
 		frame.bg:SetPoint("CENTER", frame, "CENTER")
 		frame.bg:SetTexture((data.backgroundColor or { 0.5, 0.5, 0.5, 0.5})[1], (data.backgroundColor or { 0.5, 0.5, 0.5, 0.5})[2], (data.backgroundColor or { 0.5, 0.5, 0.5, 0.5})[3], (data.backgroundColor or { 0.5, 0.5, 0.5, 0.5})[4])
-		frame.fg:SetTexture(data.foregroundTexture or PROGTEX_DEFAULT)
+		frame.fg:SetTexture(WA.DrawableTexture(data.foregroundTexture) or PROGTEX_DEFAULT)
 		local c = data.foregroundColor or { 1, 1, 1, 1 }
 		frame.fg:SetVertexColor(c[1], c[2], c[3], c[4] or 1)
 		local p = 0.6
@@ -2434,10 +3001,10 @@ WA.RegisterRegionType("progresstexture", {
 			{ type = "toggle", name = "Mirror", key = "mirror", half = true, get = function() return data.mirror end, set = function(v) data.mirror = v; WA.Add(data, true) end },
 			{ type = "range", name = "Texture rotation", key = "rotation", min = 0, max = 360, step = 1, half = true, get = function() return data.rotation end, set = function(v) data.rotation = v; WA.Add(data, true) end },
 			{ type = "range", name = "Alpha", key = "alpha", min = 0, max = 1, step = 0.05, half = true, get = function() return data.alpha end, set = function(v) data.alpha = v; WA.Add(data, true) end },
-			{ type = "range", name = "Crop X", key = "cropX", min = 0, max = 0.5, step = 0.01, half = true, get = function() return data.cropX end, set = function(v) data.cropX = v; WA.Add(data, true) end },
-			{ type = "range", name = "Crop Y", key = "cropY", min = 0, max = 0.5, step = 0.01, half = true, get = function() return data.cropY end, set = function(v) data.cropY = v; WA.Add(data, true) end },
-			{ type = "range", name = "Re-center X", key = "userX", min = -0.5, max = 0.5, step = 0.01, half = true, get = function() return data.userX end, set = function(v) data.userX = v; WA.Add(data, true) end },
-			{ type = "range", name = "Re-center Y", key = "userY", min = -0.5, max = 0.5, step = 0.01, half = true, get = function() return data.userY end, set = function(v) data.userY = v; WA.Add(data, true) end },
+			{ type = "range", name = "Crop X", key = "crop_x", min = 0, max = 0.5, step = 0.01, half = true, get = function() return data.crop_x end, set = function(v) data.crop_x = v; WA.Add(data, true) end },
+			{ type = "range", name = "Crop Y", key = "crop_y", min = 0, max = 0.5, step = 0.01, half = true, get = function() return data.crop_y end, set = function(v) data.crop_y = v; WA.Add(data, true) end },
+			{ type = "range", name = "Re-center X", key = "user_x", min = -0.5, max = 0.5, step = 0.01, half = true, get = function() return data.user_x end, set = function(v) data.user_x = v; WA.Add(data, true) end },
+			{ type = "range", name = "Re-center Y", key = "user_y", min = -0.5, max = 0.5, step = 0.01, half = true, get = function() return data.user_y end, set = function(v) data.user_y = v; WA.Add(data, true) end },
 			{ type = "header", name = "Size" },
 			{ type = "range", name = "Width", key = "width", min = 8, max = 512, step = 1, half = true, get = function() return data.width end, set = function(v) data.width = v; WA.Add(data, true) end },
 			{ type = "range", name = "Height", key = "height", min = 8, max = 512, step = 1, half = true, get = function() return data.height end, set = function(v) data.height = v; WA.Add(data, true) end },
@@ -2476,6 +3043,16 @@ WA.RegisterRegionType("progresstexture", {
 		-- the fraction once per state change leaves a timed aura frozen at
 		-- whatever fraction it held when the state arrived.
 		function region:UpdateTime()
+			if self.paused then
+				local remain = self.remaining or 0
+				if self.duration and self.duration > 0 then
+					self:SetProgress(remain / self.duration)
+				else
+					self:SetProgress(1)
+				end
+				self:SetScript("OnUpdate", nil)
+				return
+			end
 			if self.duration and self.duration > 0 then
 				self:SetScript("OnUpdate", function()
 					if not this:IsShown() then this:SetScript("OnUpdate", nil); return end
@@ -2494,8 +3071,8 @@ WA.RegisterRegionType("progresstexture", {
 	modify = function(region, data)
 		function region:SetRegionWidth(v) self.regionWidth = v; self:SetWidth(v); progTexFill(self) end
 		function region:SetRegionHeight(v) self.regionHeight = v; self:SetHeight(v); progTexFill(self) end
-		function region:SetForegroundTexture(v) self.foreground:SetTexture(v or PROGTEX_DEFAULT); progTexFill(self) end
-		function region:SetBackgroundTexture(v) self.background:SetTexture(v or PROGTEX_DEFAULT); progTexBackground(self) end
+		function region:SetForegroundTexture(v) self.foreground:SetTexture(WA.DrawableTexture(v) or PROGTEX_DEFAULT); progTexFill(self) end
+		function region:SetBackgroundTexture(v) self.background:SetTexture(WA.DrawableTexture(v) or PROGTEX_DEFAULT); progTexBackground(self) end
 		function region:Color(r, g, b, a) self.foreground:SetVertexColor(r, g, b, a or 1) end
 		function region:SetBackgroundColor(r, g, b, a) self.background:SetVertexColor(r, g, b, a or 1) end
 		function region:SetForegroundDesaturated(v) self.foreground:SetDesaturated(v and true or false) end
@@ -2504,10 +3081,12 @@ WA.RegisterRegionType("progresstexture", {
 		function region:SetInverse(v) self.inverse = v and true or false; if self.state then WA.regionPrototype.UpdateProgress(self) end end
 		function region:SetMirror(v) self.mirror = v and true or false; progTexBackground(self); progTexFill(self) end
 		function region:SetTexRotation(v) self.rotation = v or 0; progTexBackground(self); progTexFill(self) end
-		function region:SetCropX(v) self.cropX = math.max(0, math.min(0.5, v or 0)); progTexBackground(self); progTexFill(self) end
-		function region:SetCropY(v) self.cropY = math.max(0, math.min(0.5, v or 0)); progTexBackground(self); progTexFill(self) end
-		function region:SetUserX(v) self.userX = math.max(-0.5, math.min(0.5, v or 0)); progTexBackground(self); progTexFill(self) end
-		function region:SetUserY(v) self.userY = math.max(-0.5, math.min(0.5, v or 0)); progTexBackground(self); progTexFill(self) end
+		function region:SetAnimRotation(v) self.animRotation = v; progTexBackground(self); progTexFill(self) end
+		function region:GetBaseRotation() return self.rotation or 0 end
+		function region:SetCropX(v) self.crop_x = math.max(0, math.min(0.5, v or 0)); progTexBackground(self); progTexFill(self) end
+		function region:SetCropY(v) self.crop_y = math.max(0, math.min(0.5, v or 0)); progTexBackground(self); progTexFill(self) end
+		function region:SetUserX(v) self.user_x = math.max(-0.5, math.min(0.5, v or 0)); progTexBackground(self); progTexFill(self) end
+		function region:SetUserY(v) self.user_y = math.max(-0.5, math.min(0.5, v or 0)); progTexBackground(self); progTexFill(self) end
 		region:SetRegionWidth(data.width); region:SetRegionHeight(data.height)
 		region:SetRegionAlpha(data.alpha)
 		region:SetForegroundTexture(data.foregroundTexture); region:SetBackgroundTexture(data.sameTexture and data.foregroundTexture or data.backgroundTexture)
@@ -2516,8 +3095,8 @@ WA.RegisterRegionType("progresstexture", {
 		region:SetForegroundDesaturated(data.desaturateForeground); region:SetBackgroundDesaturated(data.desaturateBackground)
 		region.orientation = data.orientation; region.inverse = data.inverse
 		region.rotation = data.rotation; region.mirror = data.mirror and true or false
-		region.cropX = data.cropX or 0; region.cropY = data.cropY or 0
-		region.userX = data.userX or 0; region.userY = data.userY or 0
+		region.crop_x = data.crop_x or 0; region.crop_y = data.crop_y or 0
+		region.user_x = data.user_x or 0; region.user_y = data.user_y or 0
 		region.progress = region.progress or 1
 		progTexBackground(region)
 		progTexFill(region)
@@ -2544,8 +3123,8 @@ WA.RegisterRegionType("text", {
 		-- one of its keys through a default, so a saved aura needs no migration to
 		-- pick up a key added later. Size and colour are here because a condition
 		-- restores a property's base from data, and a nil base is not a size.
-		text_size = 12,
-		text_color = { 1, 1, 1, 1 },
+		fontSize = 12,
+		color = { 1, 1, 1, 1 },
 		-- The three customText* keys are deliberately absent, not seeded. Their
 		-- defaults belong to the region prototype, which owns the function for
 		-- every region type -- and for the source itself a nil is what tells the
@@ -2562,8 +3141,8 @@ WA.RegisterRegionType("text", {
 	-- Auto mode the box is a measurement rather than a setting, and a condition
 	-- offering to change it would silently do nothing.
 	properties = WA.regionPrototype.AddProperties({
-		text_color = { display = "Color", setter = "Color", type = "color" },
-		text_size = { display = "Font Size", setter = "SetTextHeight", type = "number", min = 6, max = 72, step = 1 },
+		color = { display = "Color", setter = "Color", type = "color" },
+		fontSize = { display = "Font Size", setter = "SetTextHeight", type = "number", min = 6, max = 72, step = 1 },
 		displayText = { display = "Text", setter = "ChangeText", type = "string" },
 	}),
 	-- List-row preview: the configured string, not a resolved one -- there is no
@@ -2584,7 +3163,7 @@ WA.RegisterRegionType("text", {
 		local fs = frame.fs
 		local size = math.floor(box / 3)
 		if size < 6 then size = 6 end
-		WA.textCore.Apply(fs, data, "text_", size)
+		WA.textCore.Apply(fs, data, "", size, WA.textCore.REGION_KEYS)
 		fs:SetJustifyH("CENTER")
 		fs:SetJustifyV("MIDDLE")
 		fs:SetWidth(box)
@@ -2611,9 +3190,9 @@ WA.RegisterRegionType("text", {
 				end,
 			},
 			{
-				type = "range", name = "Size", key = "text_size", min = 6, max = 72, step = 1, half = true,
-				get = function() return data.text_size end,
-				set = function(v) data.text_size = v; WA.Add(data, true) end,
+				type = "range", name = "Size", key = "fontSize", min = 6, max = 72, step = 1, half = true,
+				get = function() return data.fontSize end,
+				set = function(v) data.fontSize = v; WA.Add(data, true) end,
 			},
 			{
 				type = "range", name = "Alpha", key = "alpha", min = 0, max = 1, step = 0.05, half = true,
@@ -2621,9 +3200,9 @@ WA.RegisterRegionType("text", {
 				set = function(v) data.alpha = v; WA.Add(data, true) end,
 			},
 			{
-				type = "color", name = "Color", key = "text_color",
-				get = function() return data.text_color end,
-				set = function(v) data.text_color = v; WA.Add(data, true) end,
+				type = "color", name = "Color", key = "color",
+				get = function() return data.color end,
+				set = function(v) data.color = v; WA.Add(data, true) end,
 			},
 		}
 
@@ -2633,8 +3212,8 @@ WA.RegisterRegionType("text", {
 		if hint then table.insert(fields, 2, { type = "description", name = hint }) end
 
 		local fontFields = WA.textCore.OptionFields(data, "region:textfont",
-			function(key) return data["text_" .. key] end,
-			function(key, v) data["text_" .. key] = v; WA.Add(data, true) end)
+			function(key) return data[key] end,
+			function(key, v) data[key] = v; WA.Add(data, true) end, WA.textCore.REGION_KEYS)
 		for i = 1, table.getn(fontFields) do table.insert(fields, fontFields[i]) end
 
 		local get = textFormatGetter(data)
@@ -2724,7 +3303,7 @@ WA.RegisterRegionType("fallback", {
 		region.formatters, region.everyFrameFormatters = nil, nil
 		region.customTextFunc = nil
 
-		WA.textCore.Apply(region.text, data, "text_")
+		WA.textCore.Apply(region.text, data, "", nil, WA.textCore.REGION_KEYS)
 		region.text:SetWidth(0)
 		region.text:ClearAllPoints()
 		region.text:SetPoint("CENTER", region, "CENTER")

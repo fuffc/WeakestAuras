@@ -727,3 +727,64 @@ WA.RegisterSubRegionType("subglow", {
 		return fields
 	end,
 })
+
+function WA.CreateExternalGlow(frame)
+	if not frame then return nil end
+	local glow = getOverlay("buttonOverlay")
+	local region = {
+		parent = frame, host = frame, parentData = { regionType = "icon" },
+		anchorData = { anchor_area = "region", anchorXOffset = 0, anchorYOffset = 0 },
+		glowType = "buttonOverlay", glowScale = 1, glowShape = "rectangular",
+		glowXOffset = 0, glowYOffset = 0, glowLines = 8, glowFrequency = 0.25,
+		glowLength = 10, glowThickness = 1, glowBorder = false,
+		useGlowColor = false, glowColor = DEFAULT_GLOW_COLOR,
+		overlay = glow,
+	}
+	glow:SetParent(frame)
+	glow.bgFrame:SetParent(frame)
+	glow.renderer = getRenderer("buttonOverlay")
+	function region:StartGlow(options)
+		local types = { buttonOverlay = true, Pixel = true, ACShine = true, Soft = true, Pulse = true }
+		local glowType = types[options.glow_type] and options.glow_type or "buttonOverlay"
+		if self.overlay.poolType ~= glowType then
+			self:StopGlow()
+			self.overlay = getOverlay(glowType)
+		end
+		self.glowType = glowType
+		self.useGlowColor = options.use_glow_color and true or false
+		self.glowColor = options.glow_color or DEFAULT_GLOW_COLOR
+		self.glowScale = options.glow_scale or 1
+		self.glowXOffset = options.glow_XOffset or 0
+		self.glowYOffset = options.glow_YOffset or 0
+		self.glowLines = options.glow_lines or 8
+		self.glowFrequency = options.glow_frequency or 0.25
+		self.glowLength = options.glow_length or 10
+		self.glowThickness = options.glow_thickness or 1
+		self.glowBorder = options.glow_border and true or false
+		self.overlay.renderer = getRenderer(glowType)
+		self.overlay.params = { lines = self.glowLines, frequency = self.glowFrequency,
+			length = self.glowLength, thickness = self.glowThickness, border = self.glowBorder,
+			scale = self.glowScale, shape = "rectangular" }
+		applyGeometry(self)
+		self:ReapplyTint()
+		self.overlay:Show(); self.overlay.bgFrame:Show()
+		light(self.overlay)
+	end
+	function region:ReapplyTint()
+		local c = self.useGlowColor and self.glowColor or DEFAULT_GLOW_COLOR
+		self.overlay.bg:SetVertexColor(c[1], c[2], c[3], c[4] or 1)
+		self.overlay.antTex:SetVertexColor(1, 1, 1, 1)
+	end
+	function region:StopGlow()
+		if not self.overlay then return end
+		douse(self.overlay)
+		self.overlay:Hide(); self.overlay.bgFrame:Hide()
+		self.overlay:SetParent(UIParent); self.overlay.bgFrame:SetParent(UIParent)
+		releaseOverlay(self.overlay.poolType, self.overlay)
+		self.overlay = nil
+	end
+	function region:Destroy()
+		self:StopGlow()
+	end
+	return region
+end
