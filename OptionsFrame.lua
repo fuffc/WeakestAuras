@@ -2406,7 +2406,7 @@ function S.ensureIEDialog()
 	loadBtn:SetScript("OnClick", function()
 		if f.pending then
 			local id, err = WA.ConfirmImport(f.pending, f.confirmMode, f.duplicateOf)
-			if id then f:Hide(); S.refreshList(); S.setSelection(id)
+			if id then S.finishImport(f, id)
 			else f.status:SetText("Import failed: " .. (err or "unknown")); f.status:SetTextColor(1, 0.4, 0.4) end
 		else
 			S.stageImport(f, "copy")
@@ -2420,7 +2420,7 @@ function S.ensureIEDialog()
 	updateBtn:SetScript("OnClick", function()
 		if f.pending then
 			local id, err = WA.ConfirmImport(f.pending, "update", f.duplicateOf)
-			if id then f:Hide(); S.refreshList(); S.setSelection(id)
+			if id then S.finishImport(f, id)
 			else f.status:SetText("Update failed: " .. (err or "unknown")); f.status:SetTextColor(1, 0.4, 0.4) end
 		else
 			S.stageImport(f, "update")
@@ -2435,6 +2435,15 @@ function S.ensureIEDialog()
 
 	S.ieDialog = f
 	return f
+end
+
+-- The received-transfer dialog is independent from the list. A received import
+-- may have no list state.
+function S.finishImport(f, id)
+	f:Hide()
+	if not S.panel or not S.updateVisibleRows then return end
+	S.refreshList()
+	S.setSelection(id)
 end
 
 function S.stageImport(f, requestedMode)
