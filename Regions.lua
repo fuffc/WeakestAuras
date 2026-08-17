@@ -477,11 +477,79 @@ local function anchorPartitions(region, data, list)
 	return order
 end
 
+-- Two-axis grower: `gridType` is a fill direction then a wrap direction -- "RD"
+-- fills rightward and wraps down, "UL" upward then left -- with an H or V in
+-- the first letter centering each finished row on the anchor and in the second
+-- centering the whole block. Swapping the two descriptors is what lets one loop
+-- serve all eighteen combinations.
+--
+-- Ours is CENTER-origin where upstream's is corner-origin, so each axis converts
+-- by half the child's own dimension and the centering passes work on box edges.
+-- Upstream's take min/max over corners instead, which leaves a row half its last
+-- child's width off center -- identical for same-size icons, wrong for anything
+-- else. `align` and `stagger` say nothing about a two-axis layout and are
+-- ignored here, as they are upstream.
+local function growGrid(data, list, n)
+	local gridType = data.gridType or "RD"
+	local perLine = tonumber(data.gridWidth) or 5
+	if perLine < 1 then perLine = 1 end
+
+	local primary = { axis = "x", dim = "width", space = data.columnSpace or 0,
+		mul = string.find(gridType, "L", 1, true) and -1 or 1 }
+	local secondary = { axis = "y", dim = "height", space = data.rowSpace or 0,
+		mul = string.find(gridType, "D", 1, true) and -1 or 1 }
+	if not string.find(gridType, "^[RLH]") then
+		primary, secondary = secondary, primary
+	end
+	local first, second = string.sub(gridType, 1, 1), string.sub(gridType, 2, 2)
+	local centerRows = (first == "H" or first == "V")
+	local centerBlock = (second == "H" or second == "V")
+
+	local function centerSpan(from, to, on)
+		local low, high
+		for i = from, to do
+			local c = list[i]
+			local half = c[on.dim] / 2
+			if not low or c[on.axis] - half < low then low = c[on.axis] - half end
+			if not high or c[on.axis] + half > high then high = c[on.axis] + half end
+		end
+		if not low then return end
+		local shift = (low + high) / 2
+		for i = from, to do
+			local c = list[i]
+			c[on.axis] = c[on.axis] - shift
+		end
+	end
+
+	-- Every child of one line sits at the same secondary coordinate, so a line of
+	-- mixed heights aligns on its leading edge; the line's own tallest child is
+	-- what the secondary axis then advances by.
+	local pCursor, sCursor, tallest, lineStart = 0, 0, 0, 1
+	for i = 1, n do
+		local c = list[i]
+		local pDim, sDim = c[primary.dim], c[secondary.dim]
+		c[primary.axis] = pCursor + primary.mul * pDim / 2
+		c[secondary.axis] = sCursor + secondary.mul * sDim / 2
+		if sDim > tallest then tallest = sDim end
+		if math.mod(i, perLine) == 0 then
+			if centerRows then centerSpan(lineStart, i, primary) end
+			pCursor, lineStart = 0, i + 1
+			sCursor = sCursor + (secondary.space + tallest) * secondary.mul
+			tallest = 0
+		else
+			pCursor = pCursor + (primary.space + pDim) * primary.mul
+		end
+	end
+	if centerRows and lineStart <= n then centerSpan(lineStart, n, primary) end
+	if centerBlock then centerSpan(1, n, secondary) end
+end
+
 -- Axis-aligned grower: assigns each visible child of one run a position relative
 -- to that run's anchor, stacking successive children by their own dimension +
 -- spacing (WA2's DynamicGroup.lua growers, minus animation). HORIZONTAL/VERTICAL
--- center the run on the anchor; the four cardinals grow from it. Shortens the
--- list to the visible ones (parking the rest) and returns the box extents.
+-- center the run on the anchor; the four cardinals grow from it; GRID wraps
+-- (growGrid). Shortens the list to the visible ones (parking the rest) and
+-- returns the box extents.
 local function growRun(data, list)
 	local total = table.getn(list)
 	local visible = total
@@ -530,7 +598,9 @@ local function growRun(data, list)
 		return (i - 1) * stagger - (n - 1) * stagger * staggerCoeff
 	end
 
-	if grow == "HORIZONTAL" or grow == "VERTICAL" then
+	if grow == "GRID" then
+		growGrid(data, list, n)
+	elseif grow == "HORIZONTAL" or grow == "VERTICAL" then
 		local runLength = 0
 		for i = 1, n do
 			runLength = runLength + (grow == "HORIZONTAL" and list[i].width or list[i].height)
@@ -668,7 +738,6 @@ end
 local function groupModify(region, data)
 	region:SetScale(data.scale and data.scale > 0 and data.scale or 1)
 	WA.regionPrototype.ApplyPosition(region, data)
-	WA.regionPrototype.ApplyFrameStrata(region, data)
 	if data.regionType == "dynamicgroup" then
 		region.sortFunc, region.sortBeginPass = createSortFunc(data)
 		region.sortFuncBuilt = true
@@ -801,6 +870,25 @@ WA.RegisterRegionType("group", {
 	end,
 })
 
+-- Upstream's own eighteen (Types.lua's grid_types), verbatim, so an imported
+-- grid keeps its author's value rather than landing on an approximation.
+local GRID_TYPES = {
+	"RD", "RU", "LD", "LU", "DR", "DL", "UR", "UL",
+	"HD", "HU", "VR", "VL", "DH", "UH", "LV", "RV", "HV", "VH",
+}
+local GRID_TYPE_LABELS = {
+	RD = "Right, then Down", RU = "Right, then Up",
+	LD = "Left, then Down", LU = "Left, then Up",
+	DR = "Down, then Right", DL = "Down, then Left",
+	UR = "Up, then Right", UL = "Up, then Left",
+	HD = "Centered Horizontal, then Down", HU = "Centered Horizontal, then Up",
+	VR = "Centered Vertical, then Right", VL = "Centered Vertical, then Left",
+	DH = "Down, then Centered Horizontal", UH = "Up, then Centered Horizontal",
+	LV = "Left, then Centered Vertical", RV = "Right, then Centered Vertical",
+	HV = "Centered Horizontal, then Centered Vertical",
+	VH = "Centered Vertical, then Centered Horizontal",
+}
+
 WA.RegisterRegionType("dynamicgroup", {
 	displayName = "Dynamic Group",
 	description = "Arranges its children itself, closing the gaps as they come and go.",
@@ -821,6 +909,10 @@ WA.RegisterRegionType("dynamicgroup", {
 		sort = "none",
 		space = 2,
 		align = "CENTER",
+		gridType = "RD",
+		gridWidth = 5,
+		rowSpace = 2,
+		columnSpace = 2,
 		groupIcon = "",
 		stagger = 0,
 		useLimit = false,
@@ -839,9 +931,9 @@ WA.RegisterRegionType("dynamicgroup", {
 			groupIconOption(data),
 			{
 				type = "select", name = "Grow direction", key = "grow",
-				values = { "UP", "DOWN", "LEFT", "RIGHT", "HORIZONTAL", "VERTICAL" },
+				values = { "UP", "DOWN", "LEFT", "RIGHT", "HORIZONTAL", "VERTICAL", "GRID" },
 				get = function() return data.grow end,
-				set = function(v) data.grow = v; WA.Add(data) end,
+				set = function(v) data.grow = v; WA.Add(data); WA.RefreshOptions() end,
 			},
 			{
 				type = "select", name = "Sort", key = "sort",
@@ -851,18 +943,48 @@ WA.RegisterRegionType("dynamicgroup", {
 				get = function() return data.sort end,
 				set = function(v) data.sort = v; WA.Add(data); WA.RefreshOptions() end,
 			},
-			{
+		}
+		-- A grid spaces its two axes separately and reads neither `space` nor
+		-- `align`, so it offers its own pair and withholds both -- upstream hides
+		-- the same three fields, `stagger` included, for the same reason.
+		if data.grow == "GRID" then
+			table.insert(fields, {
+				type = "select", name = "Grid direction", key = "gridType",
+				values = GRID_TYPES, labels = GRID_TYPE_LABELS,
+				get = function() return data.gridType end,
+				set = function(v) data.gridType = v; WA.Add(data); WA.RefreshOptions() end,
+			})
+			table.insert(fields, {
+				type = "range", key = "gridWidth", min = 1, max = 20, step = 1,
+				name = string.find(data.gridType or "RD", "^[RLH]") and "Row width"
+					or "Column height",
+				get = function() return data.gridWidth end,
+				set = function(v) data.gridWidth = v; WA.Add(data) end,
+			})
+			table.insert(fields, {
+				type = "range", name = "Row spacing", key = "rowSpace", min = 0, max = 20, step = 1,
+				get = function() return data.rowSpace end,
+				set = function(v) data.rowSpace = v; WA.Add(data) end,
+			})
+			table.insert(fields, {
+				type = "range", name = "Column spacing", key = "columnSpace",
+				min = 0, max = 20, step = 1,
+				get = function() return data.columnSpace end,
+				set = function(v) data.columnSpace = v; WA.Add(data) end,
+			})
+		else
+			table.insert(fields, {
 				type = "range", name = "Spacing", key = "space", min = 0, max = 20, step = 1,
 				get = function() return data.space end,
 				set = function(v) data.space = v; WA.Add(data) end,
-			},
-			{
+			})
+			table.insert(fields, {
 				type = "select", name = "Align", key = "align",
 				values = { "LEFT", "CENTER", "RIGHT" },
 				get = function() return data.align end,
 				set = function(v) data.align = v; WA.Add(data) end,
-			},
-		}
+			})
+		end
 		if data.sort == "hybrid" then
 			table.insert(fields, {
 				type = "select", name = "Hybrid Position", key = "hybridPosition",
@@ -909,11 +1031,13 @@ WA.RegisterRegionType("dynamicgroup", {
 				end,
 			})
 		end
-		table.insert(fields, {
-			type = "range", name = "Stagger", key = "stagger", min = -50, max = 50, step = 1,
-			get = function() return data.stagger end,
-			set = function(v) data.stagger = v; WA.Add(data) end,
-		})
+		if data.grow ~= "GRID" then
+			table.insert(fields, {
+				type = "range", name = "Stagger", key = "stagger", min = -50, max = 50, step = 1,
+				get = function() return data.stagger end,
+				set = function(v) data.stagger = v; WA.Add(data) end,
+			})
+		end
 		table.insert(fields, {
 			type = "toggle", name = "Limit visible clones", key = "useLimit",
 			get = function() return data.useLimit end,
@@ -1165,7 +1289,6 @@ WA.RegisterRegionType("texture", {
 		region:SetMirror(data.mirror)
 		region:SetRotation(data.rotation)
 		WA.regionPrototype.ApplyPosition(region, data)
-		WA.regionPrototype.ApplyFrameStrata(region, data)
 		WA.regionPrototype.modifyFinish(region, data)
 	end,
 })
@@ -1401,7 +1524,6 @@ WA.RegisterRegionType("icon", {
 		region.displayIcon = data.displayIcon
 		region:UpdateIcon()
 		WA.regionPrototype.ApplyPosition(region, data)
-		WA.regionPrototype.ApplyFrameStrata(region, data)
 		WA.regionPrototype.ApplyProgressConfig(region, data)
 		WA.regionPrototype.modifyFinish(region, data)
 	end,
@@ -2528,7 +2650,6 @@ WA.RegisterRegionType("progressbar", {
 		-- ApplyPosition may SetParent, which resets child frame levels (and
 		-- strata, if inherited), so both are re-asserted right after it.
 		WA.regionPrototype.ApplyPosition(region, data)
-		WA.regionPrototype.ApplyFrameStrata(region, data)
 		local base = region:GetFrameLevel()
 		region.bar:SetFrameLevel(base + 1)
 		region.iconFrame:SetFrameLevel(base + 2)
@@ -2802,7 +2923,6 @@ local function textModify(region, data)
 	-- ApplyPosition may SetParent, which resets child frame levels, so the text
 	-- frame's is asserted after it -- below SUB_LEVEL, where region internals live.
 	WA.regionPrototype.ApplyPosition(region, data)
-	WA.regionPrototype.ApplyFrameStrata(region, data)
 	region.textFrame:SetFrameLevel(region:GetFrameLevel() + 1)
 
 	-- The region's own FrameTick subscription is installed *after* modifyFinish,
@@ -3100,7 +3220,7 @@ WA.RegisterRegionType("progresstexture", {
 		region.progress = region.progress or 1
 		progTexBackground(region)
 		progTexFill(region)
-		WA.regionPrototype.ApplyPosition(region, data); WA.regionPrototype.ApplyFrameStrata(region, data)
+		WA.regionPrototype.ApplyPosition(region, data)
 		WA.regionPrototype.ApplyProgressConfig(region, data); WA.regionPrototype.modifyFinish(region, data)
 	end,
 })
@@ -3310,7 +3430,6 @@ WA.RegisterRegionType("fallback", {
 
 		region:SetRegionAlpha(data.alpha or 1)
 		WA.regionPrototype.ApplyPosition(region, data)
-		WA.regionPrototype.ApplyFrameStrata(region, data)
 		region.textFrame:SetFrameLevel(region:GetFrameLevel() + 1)
 		WA.regionPrototype.modifyFinish(region, data)
 

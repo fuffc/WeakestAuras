@@ -994,17 +994,7 @@ local function appendChangeValue(fields, data, change, pentry)
 				get = function() return change.value end,
 				set = function(v) change.value = v; WA.Add(data) end })
 		elseif ptype == "glowexternal" then
-			table.insert(fields, { type = "select", name = "Glow Action", values = { "show", "hide" },
-				get = function() return change.value and change.value.glow_action or "show" end,
-				set = function(v) change.value = change.value or {}; change.value.glow_action = v; WA.Add(data) end })
-			table.insert(fields, { type = "select", name = "Frame Type", values = { "PARENTFRAME", "FRAMESELECTOR" },
-				get = function() return change.value and change.value.glow_frame_type or "PARENTFRAME" end,
-				set = function(v) change.value = change.value or {}; change.value.glow_frame_type = v; WA.Add(data) end })
-		if change.value and change.value.glow_frame_type == "FRAMESELECTOR" then
-			table.insert(fields, { type = "input", name = "Frame Name",
-				get = function() return change.value.glow_frame end,
-				set = function(v) change.value.glow_frame = v; WA.Add(data) end })
-		end
+			WA.ConditionGlowFields(fields, data, change)
 		end
 		return
 	end
@@ -1485,12 +1475,14 @@ function S.appendActionOptions(fields, data)
 	table.insert(fields, { type = "header", name = "On Show" })
 	if WA.ActionMessageFields then WA.ActionMessageFields(fields, data, data.actions.start, "start") end
 	if WA.ActionSoundFields then WA.ActionSoundFields(fields, data, data.actions.start) end
+	if WA.ActionGlowFields then WA.ActionGlowFields(fields, data, data.actions.start, "start") end
 	local startFields = codeField(data.actions.start, "do_custom", "custom", "Custom Code")
 	for i = 1, table.getn(startFields) do table.insert(fields, startFields[i]) end
 
 	table.insert(fields, { type = "header", name = "On Hide" })
 	if WA.ActionMessageFields then WA.ActionMessageFields(fields, data, data.actions.finish, "finish") end
 	if WA.ActionSoundFields then WA.ActionSoundFields(fields, data, data.actions.finish) end
+	if WA.ActionGlowFields then WA.ActionGlowFields(fields, data, data.actions.finish, "finish") end
 	local finishFields = codeField(data.actions.finish, "do_custom", "custom", "Custom Code")
 	for i = 1, table.getn(finishFields) do table.insert(fields, finishFields[i]) end
 end

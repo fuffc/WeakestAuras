@@ -1,5 +1,5 @@
 -- WeakestAuras -- action dispatch and compiled custom action functions.
--- Upstream section refs (§7, §13) point at design/architecture/weakauras2-reference.md
+-- Upstream section refs (§7, §13, §16) point at design/architecture/weakauras2-reference.md
 
 if WeakestAuras.disabled then return end
 
@@ -231,20 +231,9 @@ function WA.SendChat(region, options)
 		options.message_dest_isunit, options.r, options.g, options.b, region, nil, nil, nil)
 end
 
-function WA.GlowExternal(region, options)
-	if not region or not options or not options.glow_frame_type then return end
-	local frame = region
-	if options.glow_frame_type == "FRAMESELECTOR" and options.glow_frame then
-		frame = getglobal(options.glow_frame)
-	end
-	if not frame then return end
-	local glow = region.activeExternalGlows and region.activeExternalGlows[frame]
-	if options.glow_action == "hide" then
-		if glow and glow.StopGlow then glow:StopGlow() end
-		if region.activeExternalGlows then region.activeExternalGlows[frame] = nil end
-		return
-	end
+local function startGlowOn(region, frame, options)
 	region.activeExternalGlows = region.activeExternalGlows or {}
+	local glow = region.activeExternalGlows[frame]
 	if not glow then
 		glow = WA.CreateExternalGlow and WA.CreateExternalGlow(frame)
 		region.activeExternalGlows[frame] = glow
@@ -252,7 +241,91 @@ function WA.GlowExternal(region, options)
 	if glow and glow.StartGlow then glow:StartGlow(options) end
 end
 
+local function stopGlowOn(region, frame)
+	if not frame or not region.activeExternalGlows then return end
+	local glow = region.activeExternalGlows[frame]
+	if glow and glow.StopGlow then glow:StopGlow() end
+	region.activeExternalGlows[frame] = nil
+end
+
+-- A glow the user aimed at a unit rather than at a named frame (§16). Both
+-- targets are recycled -- a nameplate to whatever creature the engine next
+-- needs one for, a unit frame to whatever the token points at -- so a lit glow
+-- has to follow its unit or go out. Left alone it becomes a glow on a stranger,
+-- which is worse than no feature. Keyed by region because one region glows one
+-- unit at a time; the entry outlives a missing frame so the glow returns with
+-- the plate.
+local unitGlowMonitor = {}
+local unitGlowWatching
+
+local function glowUnitFrame(frameType, unit)
+	if not unit then return nil end
+	if frameType == "NAMEPLATE" then
+		return WA.GetUnitNameplate and WA.GetUnitNameplate(unit) or nil
+	end
+	return WA.GetUnitFrame and WA.GetUnitFrame(unit) or nil
+end
+
+-- Re-resolves every monitored glow, on every wake the unit watcher has: the
+-- token moved, a plate was recycled, or a frame that was missing turned up.
+local function refreshUnitGlows()
+	for region, entry in pairs(unitGlowMonitor) do
+		local frame = glowUnitFrame(entry.frameType, region.state and region.state.unit)
+		if frame ~= entry.frame then
+			stopGlowOn(region, entry.frame)
+			entry.frame = frame
+			if frame then startGlowOn(region, frame, entry.options) end
+		end
+	end
+end
+
+local function ensureUnitGlowWatch()
+	if unitGlowWatching or not WA.RegisterUnitWatchCallback then return end
+	unitGlowWatching = true
+	WA.RegisterUnitWatchCallback(refreshUnitGlows)
+end
+
+-- A named glow target, which is either a global frame or another display -- the
+-- same two spellings the SELECTFRAME anchor takes, because upstream's frame
+-- selector writes one field for both and an imported glow can carry either.
+local function namedGlowFrame(name)
+	if type(name) ~= "string" or name == "" then return nil end
+	local _, _, id = string.find(name, "^" .. WA.ANCHOR_AURA_PREFIX .. "(.+)$")
+	if id then return WA.PeekRegion(id, "") end
+	return getglobal(name)
+end
+
+function WA.GlowExternal(region, options)
+	if not region or not options or not options.glow_frame_type then return end
+	local frameType = options.glow_frame_type
+	local unitAimed = frameType == "UNITFRAME" or frameType == "NAMEPLATE"
+	local frame = region
+	if frameType == "FRAMESELECTOR" and options.glow_frame then
+		frame = namedGlowFrame(options.glow_frame)
+	elseif unitAimed then
+		frame = glowUnitFrame(frameType, region.state and region.state.unit)
+	end
+	if options.glow_action == "hide" then
+		local entry = unitAimed and unitGlowMonitor[region]
+		if entry then
+			-- The lit frame, not the one the token resolves to now: the unit may
+			-- have moved since, and the glow is on the frame it was started on.
+			frame = entry.frame
+			unitGlowMonitor[region] = nil
+		end
+		stopGlowOn(region, frame)
+		return
+	end
+	if unitAimed then
+		unitGlowMonitor[region] = { frameType = frameType, options = options, frame = frame }
+		ensureUnitGlowWatch()
+	end
+	if not frame then return end
+	startGlowOn(region, frame, options)
+end
+
 function WA.StopExternalGlows(region)
+	unitGlowMonitor[region] = nil
 	for frame, glow in pairs(region.activeExternalGlows or {}) do
 		if glow.StopGlow then glow:StopGlow() end
 		region.activeExternalGlows[frame] = nil
@@ -447,6 +520,14 @@ function WA.PerformActions(data, when, region)
 		local fn = cache and cache[when]
 		if fn then region:RunCode(fn) end
 	end
+	-- Deliberately outside the squelch above, as upstream's is: a glow is a state
+	-- the aura leaves behind rather than a notification, so suppressing it at
+	-- login would leave the display lit with nothing to put it out.
+	if actions.do_glow then WA.GlowExternal(region, actions) end
+	-- The escape hatch for a glow whose own "hide" never runs -- a show aimed at
+	-- a frame the aura no longer resolves, most often. Finish only: on show there
+	-- is nothing yet to clear.
+	if when == "finish" and actions.hide_all_glows then WA.StopExternalGlows(region) end
 end
 
 local function runInitIfNeeded(id, env)

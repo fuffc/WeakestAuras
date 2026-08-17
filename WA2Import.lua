@@ -103,14 +103,7 @@ local GROUP_KEYS = {
 
 local GROW_TYPES = {
 	UP = true, DOWN = true, LEFT = true, RIGHT = true,
-	HORIZONTAL = true, VERTICAL = true,
-}
-
--- A GRID grow's primary axis, from the first letter of its gridType: "RD" fills
--- rightward then wraps down, so RIGHT is the single direction closest to it.
-local GRID_PRIMARY_GROW = {
-	RD = "RIGHT", RU = "RIGHT", LD = "LEFT", LU = "LEFT",
-	DR = "DOWN", DL = "DOWN", UR = "UP", UL = "UP",
+	HORIZONTAL = true, VERTICAL = true, GRID = true,
 }
 
 -- Group fields with no local counterpart at all, each changing how the group
@@ -143,6 +136,12 @@ local ACTION_SPECS = {
 
 local ACTION_DROP_KEYS = {
 	"sound_channel", "stop_sound", "stop_sound_fade", "do_sound_fade", "message_channel",
+}
+
+-- The glow targets Actions.lua can resolve. Upstream reaches its unit frames
+-- through LibGetFrame; ours resolve the same two off the region's stored unit.
+local GLOW_FRAME_TYPES = {
+	PARENTFRAME = true, FRAMESELECTOR = true, UNITFRAME = true, NAMEPLATE = true,
 }
 
 local AURA_TRIGGER_KEYS = {
@@ -1556,6 +1555,59 @@ local function validateActionCode(data, report)
 	end
 end
 
+-- Upstream writes an aura reference as "WeakAuras:<id>"; ours is the same shape
+-- under our own name. The id inside is the *exporter's*, and every id in an
+-- import is reassigned -- remapChildIdKeys (ImportExport.lua) rewrites it once
+-- the whole pack is installed and the old-to-new map is complete.
+local WA2_ANCHOR_PREFIX = "WeakAuras:"
+
+local function translateAnchorReference(value)
+	if type(value) ~= "string" or value == "" then return nil end
+	local _, _, id = string.find(value, "^WeakAuras:(.+)$")
+	if id then return WA.ANCHOR_AURA_PREFIX .. id end
+	return value
+end
+
+-- Upstream's Proc glow carries two keys nothing else reads. Dropping the art
+-- (below) without them would leave an aura whose saved glow still claims a start
+-- animation the replacement art has no concept of.
+local GLOW_PROC_KEYS = { "glow_startAnim", "glow_duration" }
+
+-- One glow descriptor, wherever it came from: an action block's keys sit on the
+-- block, a condition change's on its `value`, and the shape is upstream's own
+-- either way. A frame we cannot resolve is dropped outright, because a glow
+-- aimed at nothing is a control the user will keep adjusting to no effect; an
+-- art we do not draw falls back rather than dropping, since a glow of the wrong
+-- shape still tells them what it was meant to tell them.
+local function sanitizeGlow(block, report, label)
+	if type(block) ~= "table" then return end
+	if block.glow_type and not (WA.glow_types and WA.glow_types[block.glow_type]) then
+		reportDrop(report, "unsupported glow art", label .. ": " .. tostring(block.glow_type))
+		block.glow_type = nil
+	end
+	if block.glow_frame_type and not GLOW_FRAME_TYPES[block.glow_frame_type] then
+		reportDrop(report, "unsupported glow frame", label .. ": " .. tostring(block.glow_frame_type))
+		block.glow_frame_type, block.glow_frame = nil, nil
+	end
+	-- A frame selector names a global frame or another display, and upstream
+	-- writes both into the one field. The aura reference carries the exporter's
+	-- id, which remapChildIdKeys rewrites once the pack is installed.
+	if block.glow_frame_type == "FRAMESELECTOR" then
+		block.glow_frame = translateAnchorReference(block.glow_frame)
+		if not block.glow_frame then
+			reportDrop(report, "unsupported glow frame", label .. ": no frame named")
+			block.glow_frame_type = nil
+		end
+	end
+	for i = 1, table.getn(GLOW_PROC_KEYS) do
+		local key = GLOW_PROC_KEYS[i]
+		if block[key] ~= nil then
+			reportDrop(report, "unsupported glow art", label .. ": " .. key)
+			block[key] = nil
+		end
+	end
+end
+
 local function sanitizeActions(data, report)
 	local actions = data.actions
 	if type(actions) ~= "table" then return end
@@ -1573,15 +1625,29 @@ local function sanitizeActions(data, report)
 				reportDrop(report, "unsupported action", phase .. ": INSTANCE_CHAT")
 				block.message_type, block.do_message = nil, nil
 			end
-			if block.glow_type and not (WA.glow_types and WA.glow_types[block.glow_type]) then
-				reportDrop(report, "unsupported glow art", phase .. ": " .. tostring(block.glow_type))
-				block.glow_type = nil
+			sanitizeGlow(block, report, phase)
+			-- A glow whose frame is gone would light this aura's own region
+			-- instead of the one the author picked, which is worse than silence.
+			if block.do_glow and not block.glow_frame_type then
+				reportDrop(report, "unsupported action", phase .. ": glow")
+				block.do_glow = nil
 			end
-			if block.glow_frame_type
-				and block.glow_frame_type ~= "PARENTFRAME"
-				and block.glow_frame_type ~= "FRAMESELECTOR" then
-				reportDrop(report, "unsupported glow frame", phase .. ": " .. tostring(block.glow_frame_type))
-				block.glow_frame_type, block.glow_frame = nil, nil
+		end
+	end
+end
+
+-- The condition half of the same descriptor. `translateConditionChanges` copies
+-- a change's value wholesale -- correct for every other property, but a glow
+-- carries frame and art names that have to survive the same check the action
+-- block's do.
+local function sanitizeConditionGlows(data, report)
+	local conditions = data.conditions
+	for n = 1, table.getn(conditions or {}) do
+		local changes = conditions[n] and conditions[n].changes or {}
+		for i = 1, table.getn(changes) do
+			local change = changes[i]
+			if change and change.property == "glowexternal" and type(change.value) == "table" then
+				sanitizeGlow(change.value, report, conditionLabel(data, n) .. " glow")
 			end
 		end
 	end
@@ -1691,19 +1757,6 @@ local ANCHOR_FRAME_TYPES = {
 	MOUSE = true, NAMEPLATE = true, UNITFRAME = true,
 }
 
--- Upstream writes an aura reference as "WeakAuras:<id>"; ours is the same shape
--- under our own name. The id inside is the *exporter's*, and every id in an
--- import is reassigned -- remapChildIdKeys (ImportExport.lua) rewrites it once
--- the whole pack is installed and the old-to-new map is complete.
-local WA2_ANCHOR_PREFIX = "WeakAuras:"
-
-local function translateAnchorReference(value)
-	if type(value) ~= "string" or value == "" then return nil end
-	local _, _, id = string.find(value, "^WeakAuras:(.+)$")
-	if id then return WA.ANCHOR_AURA_PREFIX .. id end
-	return value
-end
-
 local function translateAnchor(data, source, report)
 	local frameType = source.anchorFrameType
 	local label = tostring(source.id or "?")
@@ -1753,7 +1806,11 @@ local function translateGroup(data, source, report)
 	-- is `align` here. Our group frame is sized to its children's bounding box, so
 	-- pinning it by a corner instead of its centre shifts every child by half that
 	-- box -- hundreds of pixels for a real pack.
-	if data.selfPoint ~= nil and data.selfPoint ~= "CENTER" then
+	--
+	-- A grid is the one case where nothing is lost: upstream's options write
+	-- selfPoint from gridType (its gridSelfPoints table) whenever either is
+	-- touched, so the corner it names is one gridType already carries.
+	if data.selfPoint ~= nil and data.selfPoint ~= "CENTER" and data.grow ~= "GRID" then
 		reportDrop(report, "group anchor point", label .. ": " .. tostring(data.selfPoint)
 			.. " -> CENTER")
 	end
@@ -1763,19 +1820,12 @@ local function translateGroup(data, source, report)
 	if source.alpha ~= nil and source.alpha ~= 1 then
 		reportDrop(report, "group alpha", label .. ": " .. tostring(source.alpha))
 	end
+	-- CIRCLE/COUNTERCIRCLE and CUSTOM name no axis to keep, so they fall back to
+	-- the region default rather than to a direction. GRID is not among them: its
+	-- geometry fields are ours by the same names, so `take` carries them.
 	if data.grow ~= nil and not GROW_TYPES[data.grow] then
-		-- A grow we cannot draw falls back to a *direction*, not to the region
-		-- default: dropping the field leaves MergeDefaults to seed DOWN, and a
-		-- row of cooldowns arriving as a column reads as a broken import. GRID
-		-- names its primary axis in the first letter of gridType (RD is right
-		-- then down), which is the closest single direction to what its author
-		-- laid out. CIRCLE and CUSTOM name none, so those keep the default.
-		-- source, not data: gridType is upstream's own field and is not one of
-		-- ours, so `take` never copies it.
-		local fallback = GRID_PRIMARY_GROW[source.gridType or ""]
-		reportDrop(report, "unsupported grow direction", label .. ": " .. tostring(data.grow)
-			.. (fallback and (" -> " .. fallback) or ""))
-		data.grow = fallback
+		reportDrop(report, "unsupported grow direction", label .. ": " .. tostring(data.grow))
+		data.grow = nil
 	end
 	-- customGrow is refused rather than carried, so it is not this author's Lua
 	-- that runs: upstream's grow function writes control-point coordinates, and
@@ -1854,6 +1904,7 @@ local function translateDisplay(source, report)
 	if source.authorMode ~= nil then data.authorMode = WA.DeepCopy(source.authorMode) end
 	validateAnimation(data, localType, report)
 	sanitizeActions(data, report)
+	sanitizeConditionGlows(data, report)
 	validateActionCode(data, report)
 	reportMediaOptions(data.authorOptions, report)
 	WA.ValidateUserConfig(data)

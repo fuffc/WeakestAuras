@@ -139,6 +139,34 @@ local function applyPixelColor(overlay, color)
 	end
 end
 
+-- Colours every art an overlay's renderer might be drawing with. `bg`/`antTex`
+-- are buttonOverlay's and are the only two a caller reaches without this; the
+-- other four types draw through textures created per pool type, so tinting the
+-- pair alone leaves a Pixel or ACShine glow white whatever colour was asked for.
+-- nil colour means "the default gold", which is not the same as white: the ants
+-- texture is art rather than a tint surface and stays untinted there.
+local function tintOverlay(overlay, color)
+	if not overlay then return end
+	if color then
+		overlay.bg:SetVertexColor(color[1] or 1, color[2] or 1, color[3] or 1, color[4] or 1)
+		overlay.antTex:SetVertexColor(color[1] or 1, color[2] or 1, color[3] or 1, color[4] or 1)
+	else
+		overlay.bg:SetVertexColor(DEFAULT_GLOW_COLOR[1], DEFAULT_GLOW_COLOR[2],
+			DEFAULT_GLOW_COLOR[3], DEFAULT_GLOW_COLOR[4])
+		overlay.antTex:SetVertexColor(1, 1, 1, 1)
+	end
+	local c = color or DEFAULT_GLOW_COLOR
+	if overlay.poolType == "Pixel" then
+		applyPixelColor(overlay, c)
+	elseif overlay.poolType == "ACShine" then
+		for i = 1, table.getn(overlay.particles or {}) do
+			overlay.particles[i]:SetVertexColor(c[1] or 1, c[2] or 1, c[3] or 1, c[4] or 1)
+		end
+	elseif overlay.poolType == "Soft" or overlay.poolType == "Pulse" then
+		overlay.softTex:SetVertexColor(c[1] or 1, c[2] or 1, c[3] or 1, c[4] or 1)
+	end
+end
+
 local function applyACShine(overlay, now)
 	overlay.bgFrame:Hide()
 	overlay.antTex:Hide()
@@ -484,26 +512,7 @@ WA.RegisterSubRegionType("subglow", {
 		local region = { parent = parent, host = parent }
 
 		function region:ReapplyTint()
-			if not self.overlay then return end
-			if self.useGlowColor and self.glowColor then
-				local c = self.glowColor
-				self.overlay.bg:SetVertexColor(c[1] or 1, c[2] or 1, c[3] or 1, c[4] or 1)
-				self.overlay.antTex:SetVertexColor(c[1] or 1, c[2] or 1, c[3] or 1, c[4] or 1)
-			else
-				self.overlay.bg:SetVertexColor(DEFAULT_GLOW_COLOR[1], DEFAULT_GLOW_COLOR[2], DEFAULT_GLOW_COLOR[3], DEFAULT_GLOW_COLOR[4])
-				self.overlay.antTex:SetVertexColor(1, 1, 1, 1)
-			end
-			if self.overlay.poolType == "Pixel" then
-				applyPixelColor(self.overlay, self.useGlowColor and self.glowColor or DEFAULT_GLOW_COLOR)
-			elseif self.overlay.poolType == "ACShine" then
-				local c = self.useGlowColor and self.glowColor or DEFAULT_GLOW_COLOR
-				for i = 1, table.getn(self.overlay.particles or {}) do
-					self.overlay.particles[i]:SetVertexColor(c[1] or 1, c[2] or 1, c[3] or 1, c[4] or 1)
-				end
-			elseif self.overlay.poolType == "Soft" or self.overlay.poolType == "Pulse" then
-				local c = self.useGlowColor and self.glowColor or DEFAULT_GLOW_COLOR
-				self.overlay.softTex:SetVertexColor(c[1] or 1, c[2] or 1, c[3] or 1, c[4] or 1)
-			end
+			tintOverlay(self.overlay, self.useGlowColor and self.glowColor or nil)
 		end
 		function region:StartGlow()
 			local glowType = self.glowType or "buttonOverlay"
@@ -756,6 +765,13 @@ function WA.CreateExternalGlow(frame)
 		self.glowScale = options.glow_scale or 1
 		self.glowXOffset = options.glow_XOffset or 0
 		self.glowYOffset = options.glow_YOffset or 0
+		-- Per-axis size trim, the one lever a foreign frame really needs: a
+		-- nameplate's frame is its bar *and* its name text, so a glow matching it
+		-- stands well clear of the bar the user was aiming at, and by a different
+		-- amount on each axis than scale can express. applyGeometry grows the box
+		-- by twice each of these, so a negative pulls the glow in.
+		self.anchorData.anchorXOffset = options.glow_extraWidth or 0
+		self.anchorData.anchorYOffset = options.glow_extraHeight or 0
 		self.glowLines = options.glow_lines or 8
 		self.glowFrequency = options.glow_frequency or 0.25
 		self.glowLength = options.glow_length or 10
@@ -771,9 +787,7 @@ function WA.CreateExternalGlow(frame)
 		light(self.overlay)
 	end
 	function region:ReapplyTint()
-		local c = self.useGlowColor and self.glowColor or DEFAULT_GLOW_COLOR
-		self.overlay.bg:SetVertexColor(c[1], c[2], c[3], c[4] or 1)
-		self.overlay.antTex:SetVertexColor(1, 1, 1, 1)
+		tintOverlay(self.overlay, self.useGlowColor and self.glowColor or nil)
 	end
 	function region:StopGlow()
 		if not self.overlay then return end
@@ -787,4 +801,118 @@ function WA.CreateExternalGlow(frame)
 		self:StopGlow()
 	end
 	return region
+end
+
+-- The editor for one `glowexternal` condition change. It lives here rather than
+-- in OptionsFrame.lua because which fields a glow type offers is decided by what
+-- CreateExternalGlow's StartGlow above actually reads: `lines` means nothing to
+-- Soft, `length`/`thickness`/`border` mean nothing to anything but Pixel, and a
+-- field offered for a type that ignores it is a control that does nothing.
+local GLOW_TYPE_ORDER = { "buttonOverlay", "Pixel", "ACShine", "Soft", "Pulse" }
+local GLOW_FRAME_TYPES = { "PARENTFRAME", "FRAMESELECTOR", "UNITFRAME", "NAMEPLATE" }
+local GLOW_FRAME_LABELS = {
+	PARENTFRAME = "This Aura", FRAMESELECTOR = "Named Frame",
+	UNITFRAME = "Unit Frame", NAMEPLATE = "Nameplate",
+}
+
+-- The same editor over an action block, whose glow keys sit on the block itself
+-- rather than under a `value`. `finish` alone offers "Hide all glows": on show
+-- there is nothing lit yet to clear.
+function WA.ActionGlowFields(fields, data, block, when)
+	table.insert(fields, { type = "toggle", name = "Glow External Element",
+		get = function() return block.do_glow and true or false end,
+		set = function(v)
+			block.do_glow = v and true or false
+			WA.Add(data)
+			WA.RefreshOptions()
+		end })
+	if not block.do_glow then return end
+	WA.ConditionGlowFields(fields, data, { value = block })
+	if when == "finish" then
+		table.insert(fields, { type = "toggle", name = "Hide all glows",
+			get = function() return block.hide_all_glows and true or false end,
+			set = function(v) block.hide_all_glows = v and true or false; WA.Add(data) end })
+	end
+end
+
+function WA.ConditionGlowFields(fields, data, change)
+	local function get(key, default)
+		local v = change.value and change.value[key]
+		if v == nil then return default end
+		return v
+	end
+	local function set(key, refresh)
+		return function(v)
+			change.value = change.value or {}
+			change.value[key] = v
+			WA.Add(data)
+			if refresh then WA.RefreshOptions() end
+		end
+	end
+
+	table.insert(fields, { type = "select", name = "Glow Action", values = { "show", "hide" },
+		labels = { show = "Show", hide = "Hide" },
+		get = function() return get("glow_action", "show") end,
+		set = set("glow_action", true) })
+	table.insert(fields, { type = "select", name = "Frame Type",
+		values = GLOW_FRAME_TYPES, labels = GLOW_FRAME_LABELS,
+		get = function() return get("glow_frame_type", "PARENTFRAME") end,
+		set = set("glow_frame_type", true) })
+	if get("glow_frame_type", "PARENTFRAME") == "FRAMESELECTOR" then
+		table.insert(fields, { type = "input", name = "Frame Name",
+			get = function() return get("glow_frame", "") end,
+			set = set("glow_frame") })
+	end
+	-- A hide carries no art: it puts out whatever the matching show started.
+	if get("glow_action", "show") ~= "show" then return end
+
+	local glowType = get("glow_type", "buttonOverlay")
+	table.insert(fields, { type = "select", name = "Glow Type",
+		values = GLOW_TYPE_ORDER, labels = WA.glow_types,
+		get = function() return glowType end,
+		set = set("glow_type", true) })
+	table.insert(fields, { type = "toggle", name = "Use custom color", half = true,
+		get = function() return get("use_glow_color", false) and true or false end,
+		set = set("use_glow_color", true) })
+	if get("use_glow_color", false) then
+		table.insert(fields, { type = "color", name = "Color", half = true,
+			get = function() return get("glow_color", nil) end,
+			set = set("glow_color") })
+	end
+	if glowType == "Pixel" or glowType == "ACShine" then
+		table.insert(fields, { type = "range", name = "Lines", min = 1, max = 30, step = 1, half = true,
+			get = function() return get("glow_lines", 8) end,
+			set = set("glow_lines") })
+	end
+	if glowType == "Pixel" or glowType == "ACShine" or glowType == "Pulse" then
+		table.insert(fields, { type = "range", name = "Frequency", min = -2, max = 2, step = 0.05, half = true,
+			get = function() return get("glow_frequency", 0.25) end,
+			set = set("glow_frequency") })
+	end
+	if glowType == "Pixel" then
+		table.insert(fields, { type = "range", name = "Length", min = 1, max = 20, step = 1, half = true,
+			get = function() return get("glow_length", 10) end,
+			set = set("glow_length") })
+		table.insert(fields, { type = "range", name = "Thickness", min = 1, max = 20, step = 1, half = true,
+			get = function() return get("glow_thickness", 1) end,
+			set = set("glow_thickness") })
+		table.insert(fields, { type = "toggle", name = "Border", half = true,
+			get = function() return get("glow_border", false) and true or false end,
+			set = set("glow_border") })
+	end
+	table.insert(fields, { type = "range", name = "Scale", min = 0.05, max = 10, step = 0.05,
+		get = function() return get("glow_scale", 1) end,
+		set = set("glow_scale") })
+	table.insert(fields, { type = "range", name = "Extra width", min = -200, max = 200, step = 1, half = true,
+		get = function() return get("glow_extraWidth", 0) end,
+		set = set("glow_extraWidth") })
+	table.insert(fields, { type = "range", name = "Extra height", min = -200, max = 200, step = 1, half = true,
+		get = function() return get("glow_extraHeight", 0) end,
+		set = set("glow_extraHeight") })
+	table.insert(fields, { type = "range", name = "X Offset", min = -100, max = 100, step = 1, half = true,
+		get = function() return get("glow_XOffset", 0) end,
+		set = set("glow_XOffset") })
+	table.insert(fields, { type = "range", name = "Y Offset", min = -100, max = 100, step = 1, half = true,
+		get = function() return get("glow_YOffset", 0) end,
+		set = set("glow_YOffset") })
 end

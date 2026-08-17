@@ -858,6 +858,11 @@ local FRAME_STRATA_NAMES = {
 }
 local FRAME_STRATA_VALUES = { 1, 2, 3, 4, 5, 6, 7, 8, 9 }
 
+-- The names SetFrameStrata will take, for checking one that came back off a
+-- frame rather than out of the table above.
+local REAL_STRATA = {}
+for i = 2, table.getn(FRAME_STRATA_VALUES) do REAL_STRATA[FRAME_STRATA_NAMES[i]] = true end
+
 local ANCHOR_FRAME_TYPES = { "SCREEN", "UIPARENT", "SELECTFRAME", "MOUSE", "NAMEPLATE", "UNITFRAME", "CUSTOM" }
 local ANCHOR_FRAME_LABELS = {
 	SCREEN = "Screen / group",
@@ -1096,16 +1101,23 @@ local function FrameStrataField(data)
 end
 
 -- Applies a region's saved strata (1 = inherit from parent, 2..9 = a real
--- FRAME_STRATA_NAMES entry). Call after ApplyPosition, whose SetParent can
--- itself reset the frame's strata.
+-- FRAME_STRATA_NAMES entry). ApplyPosition calls this on every exit rather than
+-- leaving it to the caller: its own SetParent resets the frame's strata, so a
+-- re-anchor that forgot to follow up left the region on whatever the frame it
+-- just joined happens to use. Four of eleven call sites had forgotten.
 function proto.ApplyFrameStrata(region, data)
 	local strata = data.frameStrata
-	if not strata or strata == 1 then
-		local parent = region:GetParent() or UIParent
-		region:SetFrameStrata(parent:GetFrameStrata())
-	else
+	if strata and strata ~= 1 then
 		region:SetFrameStrata(FRAME_STRATA_NAMES[strata])
+		return
 	end
+	-- "Inherit" cannot inherit from a frame that has no strata to give. A vanilla
+	-- nameplate is a WorldFrame child and answers "UNKNOWN", which is not a name
+	-- SetFrameStrata takes -- a region anchored to one has to be put back into the
+	-- UI's strata system explicitly or it is outside the draw order entirely.
+	local parent = region:GetParent() or UIParent
+	local inherited = parent.GetFrameStrata and parent:GetFrameStrata()
+	region:SetFrameStrata(REAL_STRATA[inherited] and inherited or "MEDIUM")
 end
 
 -- Resolves a display's anchor frame and applies its saved anchor tuple. The one
@@ -1185,7 +1197,6 @@ function proto.ReanchorDynamic(frameType)
 			if data.anchorFrameType == "MOUSE" or data.anchorFrameType == "NAMEPLATE"
 				or data.anchorFrameType == "UNITFRAME" then
 				proto.ApplyPosition(region, data)
-				proto.ApplyFrameStrata(region, data)
 			end
 		end
 	end)
@@ -1263,6 +1274,27 @@ dynamicAnchorWatcher:SetScript("OnEvent", function()
 	if WA.RelayoutUnitAnchoredGroups then WA.RelayoutUnitAnchoredGroups() end
 end)
 
+-- SetParent does not redraw a region that was already shown when it moved: it
+-- keeps IsShown() true, IsVisible() false, and the engine never paints it
+-- (design/client/gotchas.md). That is why a plate-anchored aura stayed dark
+-- until the target was deselected and reselected, which does by hand exactly
+-- what this does -- Hide/Show forces the flag down the chain. A region still not
+-- drawn asks for another pass, so the retry runs until the aura is really on
+-- screen rather than stopping the moment the anchor resolved. Raw frame methods,
+-- not setShown -- no sub-region teardown, no FrameTick churn -- and bounded to
+-- the two anchor types whose frame can come and go under them.
+local function settleDynamicAnchor(region, data)
+	local frameType = data.anchorFrameType
+	if frameType ~= "NAMEPLATE" and frameType ~= "UNITFRAME" then return end
+	if not region.shown or not region.IsVisible or region:IsVisible() then return end
+	local parent = region:GetParent()
+	if parent and parent.IsVisible and parent:IsVisible() then
+		region:Hide()
+		region:Show()
+	end
+	if not region:IsVisible() then queueAnchorRetry(data) end
+end
+
 function proto.ApplyPosition(region, data)
 	local anchorFrame, anchorPoint, setParent = proto.ResolveAnchor(region, data)
 	local parentId = data.parent
@@ -1276,13 +1308,14 @@ function proto.ApplyPosition(region, data)
 			region:SetAnchor(data.selfPoint or "CENTER", anchorFrame, anchorPoint)
 			region:SetOffset(data.xOffset or 0, data.yOffset or 0)
 		end
-		return
+	else
+		if data.anchorFrameType == "MOUSE" then anchorPoint = "CENTER" end
+		region:SetAnchor(data.selfPoint or "CENTER", anchorFrame, anchorPoint)
+		region:SetOffset(data.xOffset or 0, data.yOffset or 0)
+		if WA.optionsOpen then proto.SyncOptionsAnchorMarkers() end
 	end
-	if data.anchorFrameType == "MOUSE" then anchorPoint = "CENTER" end
-	if pdata and WA.IsGroup(pdata) and data.anchorFrameType == "SCREEN" then anchorPoint = "CENTER" end
-	region:SetAnchor(data.selfPoint or "CENTER", anchorFrame, anchorPoint)
-	region:SetOffset(data.xOffset or 0, data.yOffset or 0)
-	if WA.optionsOpen then proto.SyncOptionsAnchorMarkers() end
+	proto.ApplyFrameStrata(region, data)
+	settleDynamicAnchor(region, data)
 end
 
 -- The Display-tab Position section, shared by every non-group region type so a

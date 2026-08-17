@@ -101,6 +101,22 @@ local INTERNAL_EVENTS = {
 	FRAME_UPDATE = true,
 }
 
+-- The unit watcher's occupancy events carry the token in their name
+-- (WA_UNIT_CHANGED_target), so they cannot be listed above: the set is whatever
+-- tokens loaded auras name, `specific`'s free text included.
+local UNIT_CHANGED_PREFIX = "WA_UNIT_CHANGED_"
+
+-- The token an occupancy event names, or nil if this is not one.
+local function unitChangeToken(event)
+	local _, _, token = string.find(event, "^" .. UNIT_CHANGED_PREFIX .. "(.+)$")
+	return token
+end
+
+local function isInternalEvent(name)
+	if INTERNAL_EVENTS[name] then return true end
+	return unitChangeToken(name) and true or false
+end
+
 -- ---------------------------------------------------------------------------
 -- Code-generation helpers (ConstructFunction, §4.2)
 -- ---------------------------------------------------------------------------
@@ -196,7 +212,7 @@ local function parseCustomEventList(str)
 end
 
 local function isClientEvent(name)
-	if INTERNAL_EVENTS[name] then return true end
+	if isInternalEvent(name) then return true end
 	if not (C_EventUtils and C_EventUtils.IsEventValid) then return true end
 	return C_EventUtils.IsEventValid(name) and true or false
 end
@@ -776,15 +792,152 @@ function WA.EnsureSlowTick()
 	end
 end
 
+-- ---------------------------------------------------------------------------
+-- The unit-token watcher (§4.4 WatchUnitChange)
+--
+-- A single-token trigger reads whatever `target`/`focus`/`mouseover`/... points
+-- at right now, and nothing in the game announces "that token moved" in a form
+-- a prototype can list: PLAYER_TARGET_CHANGED says the token, not the trigger.
+-- So the occupancy half lives here once, for every unit prototype, and reaches
+-- them as WA_UNIT_CHANGED_<token> through the ordinary dispatch. A multi-unit
+-- family gets its churn from appendMultiUnitEvents instead and never enters
+-- this set.
+-- ---------------------------------------------------------------------------
+
+-- Tokens whose occupancy the client announces. `player` is here because it
+-- never moves at all. Everything else -- the derived-target tokens, and
+-- whatever `specific` names -- is polled: UNIT_TARGET exists on no ClassicAPI
+-- surface and in no sibling addon, so there is nothing to listen to.
+local EVENTED_UNIT_TOKENS = {
+	player = true, target = true, focus = true, pet = true, mouseover = true,
+}
+
+-- Nameplate churn is a wake as much as the occupancy events are: a `nameplateN`
+-- token's creature changes with the plate, and a monitor re-resolving a frame
+-- has to hear about a recycled plate.
+local UNIT_WATCH_EVENTS = {
+	"PLAYER_TARGET_CHANGED", "PLAYER_FOCUS_CHANGED", "UNIT_PET",
+	"UPDATE_MOUSEOVER_UNIT", "PLAYER_ENTERING_WORLD",
+	"NAME_PLATE_UNIT_ADDED", "NAME_PLATE_UNIT_REMOVED",
+}
+
+-- "This token points at nothing" as a value rather than as an absent key, so
+-- tokenGuid's keys stay exactly the watch set and the diff below needs no nil
+-- case of its own. No GUID can equal it.
+local NO_UNIT = "\0"
+
+local watchedTokens = {}   -- token -> refcount, held while an aura naming it is loaded
+local polledTokens = {}    -- the watched tokens with no occupancy event
+local tokenGuid = {}       -- token -> last seen GUID, or NO_UNIT
+local watchCallbacks = {}
+local unitWatchFrame
+local diffScratch = {}
+
+local function diffUnitToken(token)
+	local guid = (UnitGUID and UnitGUID(token)) or NO_UNIT
+	if tokenGuid[token] == guid then return end
+	tokenGuid[token] = guid
+	-- The GUID, not the event, is what defines a change: a target-to-target
+	-- swap, an emptied token and a refilled one all come out here, and an event
+	-- that fires spuriously costs nothing.
+	WA.ScanEvents(UNIT_CHANGED_PREFIX .. token, token)
+end
+
+-- Dispatch can load, unload or delete a display, which rewrites the watch set
+-- mid-walk; the tokens are copied out first so `next` is never resumed from a
+-- key that has since gone. The scratch table is reused -- a tick that changes
+-- nothing must not allocate.
+local function diffUnitTokens(set)
+	local n = 0
+	for token in pairs(set) do n = n + 1; diffScratch[n] = token end
+	for i = 1, n do diffUnitToken(diffScratch[i]) end
+end
+
+local function runWatchCallbacks()
+	for i = 1, table.getn(watchCallbacks) do
+		WA.safecall("unit watch callback", watchCallbacks[i])
+	end
+end
+
+local function ensureUnitWatchFrame()
+	if unitWatchFrame then return end
+	unitWatchFrame = CreateFrame("Frame")
+	for i = 1, table.getn(UNIT_WATCH_EVENTS) do
+		-- Guarded on the same grounds as ensureEventRegistered's: an event name
+		-- this build does not know must not error out the load that asked for it.
+		pcall(unitWatchFrame.RegisterEvent, unitWatchFrame, UNIT_WATCH_EVENTS[i])
+	end
+	unitWatchFrame:SetScript("OnEvent", function()
+		diffUnitTokens(watchedTokens)
+		runWatchCallbacks()
+	end)
+end
+
+-- The polled half. The fast tick below is its only caller in game; it is public
+-- because a headless run has to drive it directly, a ticker created at load
+-- being unpaceable there.
+function WA.PollUnitTokens()
+	diffUnitTokens(polledTokens)
+	runWatchCallbacks()
+end
+
+-- Start watching `token`, refcounted. The count is what makes this safe across
+-- load transitions: loadFunc-style accumulation would poll every token an aura
+-- ever selected for the rest of the session, since nothing unloads it again.
+-- LoadDisplays and unregisterEvents own the pairing, off the same event list
+-- loaded_events is keyed by.
+function WA.WatchUnitToken(token)
+	if not token or token == "" then return end
+	local count = watchedTokens[token]
+	watchedTokens[token] = (count or 0) + 1
+	if count then return end
+	-- Seeded rather than dispatched: LoadDisplays' own force_events pass is what
+	-- gives the new trigger its first read.
+	tokenGuid[token] = (UnitGUID and UnitGUID(token)) or NO_UNIT
+	ensureUnitWatchFrame()
+	if not EVENTED_UNIT_TOKENS[token] then
+		polledTokens[token] = true
+		WA.EnsureFastTick()
+	end
+end
+
+function WA.UnwatchUnitToken(token)
+	local count = watchedTokens[token]
+	if not count then return end
+	if count > 1 then watchedTokens[token] = count - 1; return end
+	watchedTokens[token] = nil
+	polledTokens[token] = nil
+	tokenGuid[token] = nil
+end
+
+-- What the watcher holds for one token: how many loaded triggers name it, and
+-- whether it rides the poll rather than an event.
+function WA.UnitTokenWatch(token)
+	return watchedTokens[token] or 0, polledTokens[token] and true or false
+end
+
+-- Anything that resolves a live token to a frame and must re-resolve when the
+-- token moves -- an external glow on a unit frame or a plate. Called on every
+-- wake, event or tick, because the caller's token comes from a region's state
+-- rather than from the watch set.
+function WA.RegisterUnitWatchCallback(fn)
+	table.insert(watchCallbacks, fn)
+	ensureUnitWatchFrame()
+end
+
 -- Shared 0.1s heartbeat for status prototypes tracking a fast-moving value
--- (range to a unit). Started lazily by WA.EnsureFastTick when such a trigger
--- loads and never cancelled; a range readout wants smoother than the 1s slow
--- tick, and 0.1s is cheap because ScanEvents early-outs on an event no trigger
--- is registered for.
+-- (range to a unit), and the carrier for the polled tokens above. Started
+-- lazily by WA.EnsureFastTick when such a trigger loads and never cancelled; a
+-- range readout wants smoother than the 1s slow tick, and 0.1s is cheap because
+-- ScanEvents early-outs on an event no trigger is registered for and the poll
+-- walks an empty set until something enrols.
 local fastTicker
 function WA.EnsureFastTick()
 	if not fastTicker then
-		fastTicker = C_Timer.NewTicker(0.1, function() WA.ScanEvents("WA_FAST_TICK") end)
+		fastTicker = C_Timer.NewTicker(0.1, function()
+			WA.PollUnitTokens()
+			WA.ScanEvents("WA_FAST_TICK")
+		end)
 	end
 end
 
@@ -1364,6 +1517,24 @@ local function appendMultiUnitEvents(trigger, out)
 	return out
 end
 
+-- The single token this trigger reads, or nil for a multi-unit family.
+local function singleUnitToken(trigger, fallback)
+	if multiUnitFamily(trigger) then return nil end
+	return WA.TriggerUnit(trigger, fallback)
+end
+
+-- Occupancy for a single token, the pair to appendMultiUnitEvents: those say
+-- which members a family has, this says the one token now points somewhere
+-- else. A family trigger is already covered, so this leaves it alone and a
+-- prototype can call both unconditionally. The fallback must be the same one
+-- the prototype's `init` compiles in, or the trigger subscribes to a token it
+-- does not read.
+local function appendUnitChangeEvents(trigger, out, fallback)
+	local token = singleUnitToken(trigger, fallback)
+	if token then table.insert(out, UNIT_CHANGED_PREFIX .. token) end
+	return out
+end
+
 -- Multi-unit init: the runner hands the member's live token in as arg1, so the
 -- generated source reads it instead of a compile-time constant.
 local function multiUnitInit(trigger, fallback)
@@ -1387,7 +1558,8 @@ PROTOTYPES["health"] = {
 	progressValue = "health",
 	progressTotal = "maxhealth",
 	events = function(trigger)
-		return appendMultiUnitEvents(trigger, { "UNIT_HEALTH", "UNIT_MAXHEALTH" })
+		return appendUnitChangeEvents(trigger,
+			appendMultiUnitEvents(trigger, { "UNIT_HEALTH", "UNIT_MAXHEALTH" }), "player")
 	end,
 	force_events = true,
 	statesParameter = "unit",
@@ -1437,8 +1609,9 @@ PROTOTYPES["power"] = {
 	progressValue = "power",
 	progressTotal = "maxpower",
 	events = function(trigger)
-		return appendMultiUnitEvents(trigger, { "UNIT_MANA", "UNIT_RAGE", "UNIT_ENERGY", "UNIT_FOCUS",
-			"UNIT_MAXMANA", "UNIT_MAXRAGE", "UNIT_MAXENERGY", "UNIT_DISPLAYPOWER" })
+		return appendUnitChangeEvents(trigger,
+			appendMultiUnitEvents(trigger, { "UNIT_MANA", "UNIT_RAGE", "UNIT_ENERGY", "UNIT_FOCUS",
+				"UNIT_MAXMANA", "UNIT_MAXRAGE", "UNIT_MAXENERGY", "UNIT_DISPLAYPOWER" }), "player")
 	end,
 	force_events = true,
 	statesParameter = "unit",
@@ -1933,12 +2106,13 @@ PROTOTYPES["cast"] = {
 	-- family -- report a cast at all. Only the six all-unit events are listed:
 	-- DELAYED/FAILED/CHANNEL_UPDATE are player-only there and already covered.
 	events = function(trigger)
-		return appendMultiUnitEvents(trigger, { "SPELLCAST_START", "SPELLCAST_STOP",
-			"SPELLCAST_CHANNEL_START", "SPELLCAST_CHANNEL_STOP", "SPELLCAST_FAILED",
-			"SPELLCAST_INTERRUPTED", "PLAYER_TARGET_CHANGED",
-			"UNIT_SPELLCAST_START", "UNIT_SPELLCAST_STOP", "UNIT_SPELLCAST_SUCCEEDED",
-			"UNIT_SPELLCAST_INTERRUPTED", "UNIT_SPELLCAST_CHANNEL_START",
-			"UNIT_SPELLCAST_CHANNEL_STOP" })
+		return appendUnitChangeEvents(trigger,
+			appendMultiUnitEvents(trigger, { "SPELLCAST_START", "SPELLCAST_STOP",
+				"SPELLCAST_CHANNEL_START", "SPELLCAST_CHANNEL_STOP", "SPELLCAST_FAILED",
+				"SPELLCAST_INTERRUPTED",
+				"UNIT_SPELLCAST_START", "UNIT_SPELLCAST_STOP", "UNIT_SPELLCAST_SUCCEEDED",
+				"UNIT_SPELLCAST_INTERRUPTED", "UNIT_SPELLCAST_CHANNEL_START",
+				"UNIT_SPELLCAST_CHANNEL_STOP" }), "player")
 	end,
 	force_events = true,
 	statesParameter = "unit",
@@ -2387,7 +2561,10 @@ PROTOTYPES["unitcharacteristics"] = {
 	wa2Event = "Unit Characteristics",
 	category = "unit",
 	progressType = "none",
-	events = function() return { "UNIT_LEVEL", "PLAYER_TARGET_CHANGED", "PLAYER_ENTERING_WORLD" } end,
+	events = function(trigger)
+		return appendUnitChangeEvents(trigger,
+			{ "UNIT_LEVEL", "PLAYER_ENTERING_WORLD" }, "target")
+	end,
 	force_events = true,
 	icon = "Interface\\Icons\\INV_Misc_QuestionMark",
 	iconFunc = function() return "Interface\\Icons\\INV_Misc_QuestionMark" end,
@@ -2406,7 +2583,8 @@ PROTOTYPES["unitcharacteristics"] = {
 			.. "local isPlayer = UnitIsPlayer(unit) and true or false"
 	end,
 	args = {
-		{ name = "unit", type = "unit", display = "Unit", default = "target" },
+		{ name = "unit", type = "unit", display = "Unit", default = "target",
+			store = true, conditionType = "string" },
 		{ name = "exists", type = "hidden", required = true, test = "UnitExists(unit)" },
 		{ name = "unitName", type = "string", store = true, conditionType = "string", display = "Name" },
 		{ name = "level", type = "number", display = "Level", operator = ">=", store = true, conditionType = "number" },
@@ -2676,7 +2854,10 @@ PROTOTYPES["rangecheck"] = {
 	wa2Event = "Range Check",
 	category = "unit",
 	progressType = "none",
-	events = function() return { "PLAYER_TARGET_CHANGED", "WA_FAST_TICK", "PLAYER_ENTERING_WORLD" } end,
+	events = function(trigger)
+		return appendUnitChangeEvents(trigger,
+			{ "WA_FAST_TICK", "PLAYER_ENTERING_WORLD" }, "target")
+	end,
 	force_events = true,
 	loadFunc = function() WA.EnsureFastTick() end,
 	icon = "Interface\\Icons\\Ability_Hunter_SniperShot",
@@ -2715,7 +2896,8 @@ PROTOTYPES["rangecheck"] = {
 		return src
 	end,
 	args = {
-		{ name = "unit", type = "unit", display = "Unit", default = "target" },
+		{ name = "unit", type = "unit", display = "Unit", default = "target",
+			store = true, conditionType = "string" },
 		{ name = "rangeMode", type = "select", required = true, display = "Range Mode",
 			valueList = { "unit", "interact", "spell" },
 			valueLabels = { unit = "Unit (40yd)", interact = "Interact Band", spell = "Spell Range" },
@@ -3796,7 +3978,7 @@ local eventFrame = CreateFrame("Frame")
 local registered = {} -- event -> true, so we RegisterEvent each game event once
 
 local function ensureEventRegistered(event)
-	if registered[event] or INTERNAL_EVENTS[event] then return end
+	if registered[event] or isInternalEvent(event) then return end
 	registered[event] = true
 	-- Guarded: an invalid event name on this build would otherwise error out the
 	-- whole Add (risk (c)).
@@ -4265,6 +4447,8 @@ local function unregisterEvents(id)
 		end
 		local evs = ti.eventList or {}
 		for i = 1, table.getn(evs) do
+			local token = unitChangeToken(evs[i])
+			if token then WA.UnwatchUnitToken(token) end
 			local map = loaded_events[evs[i]]
 			if map and map[id] then map[id][triggernum] = nil end
 		end
@@ -4415,6 +4599,13 @@ function GenericTrigger.LoadDisplays(ids)
 				for i = 1, table.getn(ti.eventList) do
 					local ev = ti.eventList[i]
 					ensureEventRegistered(ev)
+					-- The occupancy watch is refcounted against the same list
+					-- loaded_events is keyed by, rather than started from a loadFunc:
+					-- unregisterEvents below walks this list too, so the release is
+					-- paired by construction instead of by a second lifecycle kept in
+					-- step with this one.
+					local token = unitChangeToken(ev)
+					if token then WA.WatchUnitToken(token) end
 					loaded_events[ev] = loaded_events[ev] or {}
 					loaded_events[ev][id] = loaded_events[ev][id] or {}
 					loaded_events[ev][id][triggernum] = ti

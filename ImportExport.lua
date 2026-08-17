@@ -252,6 +252,37 @@ end
 -- a display can be anchored to one installed *after* it -- the corpus's
 -- ComboFill1 anchors to a Cback1 that arrives twenty displays later -- so the
 -- map is only complete once the whole pack is in.
+-- A glow aimed at another display names it the same way an anchor does, so it
+-- needs the same repair -- in both places one can be written: the show/hide
+-- action blocks, and any `glowexternal` condition change.
+local function remapGlowFrame(block, byOldId)
+	if type(block) ~= "table" or block.glow_frame_type ~= "FRAMESELECTOR" then return end
+	if type(block.glow_frame) ~= "string" then return end
+	local prefix = WA.ANCHOR_AURA_PREFIX
+	local _, _, oldId = string.find(block.glow_frame, "^" .. prefix .. "(.+)$")
+	if oldId and byOldId[oldId] then
+		block.glow_frame = prefix .. byOldId[oldId]
+	end
+end
+
+local function remapGlowFrames(data, byOldId)
+	local actions = data.actions
+	if type(actions) == "table" then
+		for _, phase in ipairs({ "init", "start", "finish" }) do
+			remapGlowFrame(actions[phase], byOldId)
+		end
+	end
+	local conditions = data.conditions
+	for n = 1, table.getn(conditions or {}) do
+		local changes = conditions[n] and conditions[n].changes or {}
+		for c = 1, table.getn(changes) do
+			if changes[c] and changes[c].property == "glowexternal" then
+				remapGlowFrame(changes[c].value, byOldId)
+			end
+		end
+	end
+end
+
 local function remapChildIdKeys(installed, byOldId)
 	local prefix = WA.ANCHOR_AURA_PREFIX
 	for i = 1, table.getn(installed) do
@@ -273,6 +304,7 @@ local function remapChildIdKeys(installed, byOldId)
 				data.anchorFrameFrame = prefix .. byOldId[oldId]
 			end
 		end
+		remapGlowFrames(data, byOldId)
 	end
 end
 

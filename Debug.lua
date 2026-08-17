@@ -1,6 +1,7 @@
 -- WeakestAuras -- in-game probes and verification commands for the runtime
 -- engine. Registers /wa probe, soundprobe, states, libs, addons, gen, load,
--- conditions, codeprobe, textprobe, texprobe, wa2probe, wa2, and cdtest.
+-- conditions, codeprobe, textprobe, texprobe, plateprobe, wa2probe, wa2, and
+-- cdtest.
 
 if WeakestAuras.disabled then return end
 
@@ -1801,6 +1802,153 @@ function D.Wa2(text)
 end
 
 -- ---------------------------------------------------------------------------
+-- /wa plateprobe -- which link in the NAMEPLATE anchor chain is broken.
+--
+-- Three things have to happen for a plate-anchored aura to land, and a failure
+-- looks the same from outside whichever one gave way: the producer stores a
+-- unit, C_NamePlate resolves that unit to a frame, and something re-runs
+-- ApplyPosition once a frame exists where there was none. This logs all three
+-- on a change, so toggling nameplates says which one did not move.
+-- ---------------------------------------------------------------------------
+
+local plateProbe = { active = false, seen = {} }
+local plateProbeFrame
+
+-- A stable short name for a frame, since a plate rarely has one of its own.
+-- The type check is not defensive padding: NAME_PLATE_UNIT_ADDED carries a unit
+-- *token* in arg1, this client's strings have no metatable, and indexing one
+-- raises -- which a swallowed error then turned into "the event never fired".
+local function plateProbeName(frame)
+	if not frame then return "nil" end
+	if type(frame) ~= "table" then return tostring(frame) end
+	local name = frame.GetName and frame:GetName()
+	if name and name ~= "" then return name end
+	return string.gsub(tostring(frame), "table: 0*", "#")
+end
+
+local function plateProbeCount()
+	if not (C_NamePlate and C_NamePlate.GetNamePlates) then return "n/a" end
+	local ok, plates = pcall(C_NamePlate.GetNamePlates)
+	if not ok or type(plates) ~= "table" then return "?" end
+	return tostring(table.getn(plates))
+end
+
+-- What a frame reports about being drawable at all, which is a different
+-- question from being anchored: `shown` is the frame's own flag, `visible`
+-- accounts for the whole parent chain, and a zero alpha or an off-screen rect
+-- draws nothing while both flags read true.
+local function plateProbeVisibility(frame)
+	if not frame then return "absent" end
+	local function call(method)
+		local fn = frame[method]
+		if not fn then return "n/a" end
+		local ok, value = pcall(fn, frame)
+		if not ok then return "err" end
+		return value
+	end
+	local left, bottom = call("GetLeft"), call("GetBottom")
+	return "shown=" .. tostring(call("IsShown"))
+		.. " visible=" .. tostring(call("IsVisible"))
+		.. " alpha=" .. tostring(call("GetAlpha"))
+		.. " strata=" .. tostring(call("GetFrameStrata"))
+		.. " level=" .. tostring(call("GetFrameLevel"))
+		.. " scale=" .. tostring(call("GetScale"))
+		.. " rect=" .. tostring(left) .. "," .. tostring(bottom)
+		.. " " .. tostring(call("GetWidth")) .. "x" .. tostring(call("GetHeight"))
+end
+
+-- One line per NAMEPLATE-anchored region: what it read, what that resolves to,
+-- and where the region actually sits. A region parked on WeakestAurasHiddenFrames
+-- while the resolve column shows a frame means nothing re-applied the position.
+-- Anchored-but-invisible is the other half, so both the region and the plate it
+-- joined report their whole drawable state.
+local function plateProbeRegions(lines)
+	if not WA.ForEachRegion then return end
+	WA.ForEachRegion(function(region)
+		local data = WeakestAurasDB.displays[region.id]
+		if not data or data.anchorFrameType ~= "NAMEPLATE" then return end
+		local unit = region.state and (region.state.unit or region.state.unitId)
+		local frame = WA.GetUnitNameplate and WA.GetUnitNameplate(unit, region.state and region.state.guid)
+		local parent = region.GetParent and region:GetParent()
+		table.insert(lines, "  " .. tostring(region.id)
+			.. "  state.unit=" .. tostring(unit)
+			.. "  resolves=" .. plateProbeName(frame)
+			.. "  parent=" .. plateProbeName(parent)
+			.. "  toShow=" .. tostring(region.toShow))
+		table.insert(lines, "    region " .. plateProbeVisibility(region))
+		if parent then
+			local grand = parent.GetParent and parent:GetParent()
+			table.insert(lines, "    parent " .. plateProbeVisibility(parent)
+				.. "  of=" .. plateProbeName(grand)
+				.. (grand == WorldFrame and " (WorldFrame)" or ""))
+		end
+	end)
+end
+
+local function plateProbeSnapshot(reason)
+	local guid = UnitGUID and UnitGUID("target")
+	local byUnit = (C_NamePlate and C_NamePlate.GetNamePlateForUnit)
+		and C_NamePlate.GetNamePlateForUnit("target") or nil
+	local byGuid = (guid and C_NamePlate and C_NamePlate.GetNamePlateForGUID)
+		and C_NamePlate.GetNamePlateForGUID(guid) or nil
+	local lines = { "  plates=" .. plateProbeCount()
+		.. "  target=" .. tostring(UnitName and UnitName("target"))
+		.. "  ForUnit=" .. plateProbeName(byUnit)
+		.. "  ForGUID=" .. plateProbeName(byGuid) }
+	plateProbeRegions(lines)
+	local key = table.concat(lines, "|")
+	-- Only a changed picture is worth a line; the poll runs once a second and an
+	-- unchanged one would bury the transition it exists to show.
+	if key == plateProbe.last then return end
+	plateProbe.last = key
+	D.Log("[plate] " .. reason)
+	for i = 1, table.getn(lines) do D.Log(lines[i]) end
+end
+
+local function plateProbeStop()
+	plateProbe.active = false
+	plateProbe.last = nil
+	if plateProbeFrame then plateProbeFrame:UnregisterAllEvents() end
+	if plateProbe.ticker then plateProbe.ticker:Cancel(); plateProbe.ticker = nil end
+	D.Log("--- end plateprobe ---")
+end
+
+function D.PlateProbe()
+	if plateProbe.active then plateProbeStop(); return end
+
+	D.Log("--- plateprobe ---")
+	if not C_NamePlate then
+		D.Log("  C_NamePlate absent -- this client has no nameplate API at all")
+		return
+	end
+	D.Log("  GetNamePlates=" .. tostring(C_NamePlate.GetNamePlates ~= nil)
+		.. "  ForUnit=" .. tostring(C_NamePlate.GetNamePlateForUnit ~= nil)
+		.. "  ForGUID=" .. tostring(C_NamePlate.GetNamePlateForGUID ~= nil))
+	D.Log("  toggle nameplates on and off with a target selected; /wa plateprobe again to stop")
+
+	if not plateProbeFrame then plateProbeFrame = CreateFrame("Frame") end
+	plateProbeFrame:SetScript("OnEvent", function()
+		D.Log("[plate] " .. tostring(event) .. "  arg1=" .. plateProbeName(arg1)
+			.. "  unit=" .. tostring(UnitName and type(arg1) == "string" and UnitName(arg1)))
+		plateProbe.last = nil
+		plateProbeSnapshot(tostring(event))
+	end)
+	pcall(plateProbeFrame.RegisterEvent, plateProbeFrame, "NAME_PLATE_CREATED")
+	pcall(plateProbeFrame.RegisterEvent, plateProbeFrame, "NAME_PLATE_UNIT_ADDED")
+	pcall(plateProbeFrame.RegisterEvent, plateProbeFrame, "NAME_PLATE_UNIT_REMOVED")
+
+	plateProbe.active = true
+	plateProbe.last = nil
+	plateProbeSnapshot("start")
+	-- Polled as well as evented: if the toggle produces no churn event at all,
+	-- the poll still shows the resolve column changing, which is the answer.
+	plateProbe.ticker = C_Timer.NewTicker(1, function()
+		if not plateProbe.active then return end
+		plateProbeSnapshot("poll")
+	end)
+end
+
+-- ---------------------------------------------------------------------------
 -- /wa texprobe -- the Texture questions no headless harness can answer.
 --
 -- The log records capability read-backs and the frame puts the visual tests
@@ -2846,6 +2994,8 @@ function D.HandleSlash(msg)
 		D.CodeProbe()
 	elseif cmd == "textprobe" then
 		D.TextProbe()
+	elseif cmd == "plateprobe" then
+		D.PlateProbe()
 	elseif cmd == "texprobe" then
 		D.TexProbe()
 	elseif cmd == "wa2probe" then
@@ -2878,6 +3028,6 @@ function D.HandleSlash(msg)
 		ensureFrame()
 		frame:Hide()
 	else
-		D.Log("[debug] unknown command \"" .. cmd .. "\". Available: dump [unit] [filter], watch [unit], events [EVENT ...], auraprobe [unit|all], overflow [unit], timers, linkprobe, commprobe [charname|throttle [channel] [rate] [secs]], cdtest, swipetest [sizes/WxH...], swipenudge <k> [yflat], track <spellName>, states <id>, conditions <id>, gen <id>, load <id>, probe, soundprobe, gcd, cdprobe <spell>, ver [version], codeprobe, textprobe, texprobe, wa2probe, wa2 <string>, codelive, codetab <1-8|tabs>, codefont <6-16>, rows, configtest, libs, addons, export <id>, import, clear, show, hide")
+		D.Log("[debug] unknown command \"" .. cmd .. "\". Available: dump [unit] [filter], watch [unit], events [EVENT ...], auraprobe [unit|all], overflow [unit], timers, linkprobe, commprobe [charname|throttle [channel] [rate] [secs]], cdtest, swipetest [sizes/WxH...], swipenudge <k> [yflat], track <spellName>, states <id>, conditions <id>, gen <id>, load <id>, probe, soundprobe, gcd, cdprobe <spell>, ver [version], codeprobe, textprobe, texprobe, plateprobe, wa2probe, wa2 <string>, codelive, codetab <1-8|tabs>, codefont <6-16>, rows, configtest, libs, addons, export <id>, import, clear, show, hide")
 	end
 end
