@@ -1693,6 +1693,12 @@ local function onCooldownExpr(showgcd)
 	return "(duration ~= nil and duration > 0 and " .. notGcd .. "expirationTime > GetTime())"
 end
 
+-- An excluded GCD is ready to timed progress regions as well as to the show test.
+local function cooldownGcdProgressFilter(trigger)
+	if trigger.showgcd then return "" end
+	return "if duration ~= nil and duration > 0 and WeakestAuras.IsGcdCooldown(duration) then startTime = 0 duration = 0 end\n"
+end
+
 -- Spell cooldown, timed progress. Fed by the central cooldown watcher (below):
 -- its init reads the watcher's cache rather than polling GetSpellCooldown
 -- itself, so GCD filtering and ready-time scheduling stay in one place (ref
@@ -1750,6 +1756,7 @@ PROTOTYPES["spellcooldown"] = {
 	init = function(trigger)
 		return "local spellId = " .. fmt(WA.ResolveSpellID(trigger.spellName) or 0) .. "\n"
 			.. "local startTime, duration = WeakestAuras.SpellCdInfo(spellId)\n"
+			.. cooldownGcdProgressFilter(trigger)
 			.. "local expirationTime = (startTime and duration and (startTime + duration)) or 0\n"
 			.. "local remaining = (expirationTime > 0 and (expirationTime - GetTime())) or 0\n"
 			.. "local onCooldown = " .. onCooldownExpr(trigger.showgcd) .. " and true or false\n"
@@ -1815,6 +1822,7 @@ PROTOTYPES["itemcooldown"] = {
 	init = function(trigger)
 		return "local itemId = " .. fmt(WA.ResolveItemID(trigger.itemName) or 0) .. "\n"
 			.. "local startTime, duration = WeakestAuras.ItemCdInfo(itemId)\n"
+			.. cooldownGcdProgressFilter(trigger)
 			.. "local expirationTime = (startTime and duration and (startTime + duration)) or 0\n"
 			.. "local remaining = (expirationTime > 0 and (expirationTime - GetTime())) or 0\n"
 			.. "local onCooldown = " .. onCooldownExpr() .. " and true or false"
@@ -1886,6 +1894,7 @@ PROTOTYPES["equipslotcooldown"] = {
 	init = function(trigger)
 		return "local itemSlot = " .. fmt(trigger.itemSlot or 0) .. "\n"
 			.. "local startTime, duration = WeakestAuras.EquipSlotCdInfo(itemSlot)\n"
+			.. cooldownGcdProgressFilter(trigger)
 			.. "local expirationTime = (startTime and duration and (startTime + duration)) or 0\n"
 			.. "local remaining = (expirationTime > 0 and (expirationTime - GetTime())) or 0\n"
 			.. "local onCooldown = " .. onCooldownExpr() .. " and true or false"
@@ -3861,6 +3870,7 @@ end
 -- been measured, which is why it is not the literal 1.5 it replaced.
 function WA.IsGcdCooldown(duration)
 	if not duration or duration <= 0 then return false end
+	local isGcd = duration <= (gcd.measured or GCD_DEFAULT) + 0.1
 	return duration <= (gcd.measured or GCD_DEFAULT) + 0.1
 end
 
