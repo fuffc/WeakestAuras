@@ -72,14 +72,10 @@ end
 
 -- Aura-cast events arrive with Nampower 2.20. Below that, or with no Nampower at
 -- all, nothing here registers and every query answers nil, which leaves the
--- descriptor the only aura source exactly as it was.
+-- descriptor the only aura source exactly as it was. Asked through the shared
+-- gate so the refusal shows up in the options footer's mod list.
 local function nampowerReady()
-	if not WA.hasNampower then return false end
-	local ok, major, minor, patch = pcall(GetNampowerVersion)
-	if not ok or not major then return false end
-	local have = WA.ParseVersion(major .. "." .. (minor or 0) .. "." .. (patch or 0))
-	local need = WA.ParseVersion(AURA_CAST_MIN)
-	return have ~= nil and have >= need
+	return WA.RequireNampower(AURA_CAST_MIN, "debuff overflow recovery (aura-cast events)")
 end
 
 -- Nampower sends no aura-cast event at all while this reads 0, so the cache has

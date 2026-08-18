@@ -20,7 +20,7 @@ WA.RegisterSubRegionType("subborder", {
 	displayName = "Border",
 	supports = function(regionType)
 		return regionType == "icon" or regionType == "progressbar" or regionType == "text"
-			or regionType == "texture"
+			or regionType == "texture" or regionType == "progresstexture"
 	end,
 	default = {
 		type = "subborder",
@@ -49,6 +49,7 @@ WA.RegisterSubRegionType("subborder", {
 		function region:SetBorderColor(r, g, b, a)
 			self.frame:SetBackdropBorderColor(r, g, b, a or 1)
 		end
+		function region:SetFrameLevel(level) self.frame:SetFrameLevel(level) end
 		function region:Show() if self.visible ~= false then self.frame:Show() end end
 		function region:Hide() self.frame:Hide() end
 		return region
@@ -57,9 +58,6 @@ WA.RegisterSubRegionType("subborder", {
 		region.visible = subData.border_visible ~= false
 
 		local frame = region.frame
-		-- One above the text so a border always frames the whole region cleanly
-		-- (and above whatever the region type builds as a child -- see SUB_LEVEL).
-		frame:SetFrameLevel(parent:GetFrameLevel() + proto.SUB_LEVEL + 1)
 		proto.AnchorSubRegion(frame, parent, subData, {
 			areaOnly = true, areaTarget = "region", x = subData.border_offset or 0,
 			y = subData.border_offset or 0,

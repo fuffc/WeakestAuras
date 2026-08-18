@@ -206,9 +206,19 @@ local function clear(anim)
 	if r.SetAnimRotation then r:SetAnimRotation(nil) end
 	if r.ColorAnim then r:ColorAnim(nil) end
 end
+-- Whether an animation block's `<slot>Func` is Lua that can run, asked of the
+-- block alone so the import review can put the same question to a payload it
+-- never animates. A preset block never reaches its own functions -- WA.Animate
+-- swaps in the preset's table before it reads a slot -- and a slot set to a
+-- named curve reaches that curve instead, so the stored source is dead however
+-- the slot is enabled.
+function WA.AnimationCodeIsLive(anim, slot)
+	if type(anim) ~= "table" or anim.type ~= "custom" then return false end
+	return (anim["use_" .. slot] and anim[slot .. "Type"] == "custom") and true or false
+end
 local function compileSlot(anim, slot, fallback)
-	local key, source = anim[slot .. "Type"] or fallback, anim[slot .. "Func"]
-	if key ~= "custom" then source = WA.anim_function_strings[key] end
+	local source = WA.AnimationCodeIsLive(anim, slot) and anim[slot .. "Func"]
+	if not source then source = WA.anim_function_strings[anim[slot .. "Type"] or fallback] end
 	return source and WA.LoadFunction(source, nil) or nil
 end
 local function run(key, anim, elapsed, time)

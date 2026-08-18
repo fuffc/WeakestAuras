@@ -1,7 +1,7 @@
 -- WeakestAuras -- in-game probes and verification commands for the runtime
 -- engine. Registers /wa probe, soundprobe, states, libs, addons, gen, load,
--- conditions, codeprobe, textprobe, texprobe, plateprobe, wa2probe, wa2, and
--- cdtest.
+-- conditions, codeprobe, textprobe, texprobe, levelprobe, plateprobe, wa2probe,
+-- wa2, and cdtest.
 
 if WeakestAuras.disabled then return end
 
@@ -1166,6 +1166,28 @@ local probeFrame
 -- height, is answered here rather than by reading anchors.
 -- ---------------------------------------------------------------------------
 
+-- Live and pooled region frames per type. The number to watch is the total:
+-- flipping a display's region type back and forth must not grow it, since a
+-- frame this client cannot destroy is stranded for the session if it is not
+-- recycled.
+function D.Regions()
+	local live, pooled, liveTotal, pooledTotal = WA.RegionCensus()
+	D.Log(string.format("--- regions: %d live, %d pooled, %d total ---",
+		liveTotal, pooledTotal, liveTotal + pooledTotal))
+	local names = {}
+	for regionType in pairs(live) do table.insert(names, regionType) end
+	for regionType in pairs(pooled) do
+		if not live[regionType] then table.insert(names, regionType) end
+	end
+	table.sort(names)
+	for i = 1, table.getn(names) do
+		local regionType = names[i]
+		D.Log(string.format("  %-15s live=%d pooled=%d", regionType,
+			live[regionType] or 0, pooled[regionType] or 0))
+	end
+	if table.getn(names) == 0 then D.Log("  (no regions built yet)") end
+end
+
 function D.Rows()
 	local S = WA.OptionsState
 	if not S or not S.listBg then
@@ -1949,6 +1971,68 @@ function D.PlateProbe()
 end
 
 -- ---------------------------------------------------------------------------
+-- ---------------------------------------------------------------------------
+-- /wa levelprobe -- how high SetFrameLevel goes here, and how much of that a
+-- sub-region stack spends.
+--
+-- Sub-region draw order is base + SUB_LEVEL + SUB_STEP * (index - 1), on a
+-- region that may itself be nested in a group, so the ceiling is a real bound
+-- and not a theoretical one. Nothing headless can answer it: the mock stores
+-- whatever it is handed and reads it straight back.
+-- ---------------------------------------------------------------------------
+
+local levelProbeHost
+
+function D.LevelProbe()
+	local proto = WA.regionPrototype
+	D.Log("--- levelprobe ---")
+
+	-- Frames cannot be destroyed here, so the probe keeps its two rather than
+	-- making a fresh pair on every run.
+	if not levelProbeHost then
+		levelProbeHost = CreateFrame("Frame", nil, UIParent)
+		levelProbeHost.child = CreateFrame("Frame", nil, levelProbeHost)
+	end
+	local host = levelProbeHost
+	D.Log(string.format("UIParent %s -> child %s -> grandchild %s",
+		tostring(UIParent:GetFrameLevel()), tostring(host:GetFrameLevel()),
+		tostring(host.child:GetFrameLevel())))
+
+	local probes = { 0, 1, 10, 63, 64, 100, 127, 128, 200, 255, 256, 500, 1000, 10000, 65535 }
+	local ceiling
+	for i = 1, table.getn(probes) do
+		local want = probes[i]
+		local ok = pcall(function() host:SetFrameLevel(want) end)
+		local got = host:GetFrameLevel()
+		local verdict
+		if not ok then
+			verdict = "ERROR"
+		elseif got == want then
+			verdict = "ok"
+			ceiling = want
+		else
+			verdict = "CLAMPED"
+		end
+		D.Log(string.format("  SetFrameLevel(%d) -> %s  [%s]", want, tostring(got), verdict))
+	end
+	D.Log("highest value read back unchanged: " .. tostring(ceiling))
+
+	-- Measured against live regions rather than assumed: what matters is the
+	-- deepest base actually in play, since a nested region starts higher.
+	local deepest, deepestId = 0, nil
+	for id in pairs(WeakestAurasDB.displays or {}) do
+		local region = WA.PeekRegion(id, "")
+		if region and region.GetFrameLevel then
+			local base = region:GetFrameLevel()
+			if base > deepest then deepest, deepestId = base, id end
+		end
+	end
+	D.Log(string.format("deepest live region base: %d (%s)", deepest, tostring(deepestId)))
+	D.Log(string.format("  ten effects on it reach %d (SUB_LEVEL %d, SUB_STEP %d)",
+		deepest + proto.SUB_LEVEL + proto.SUB_STEP * 9, proto.SUB_LEVEL, proto.SUB_STEP))
+	D.Log("--- end levelprobe ---")
+end
+
 -- /wa texprobe -- the Texture questions no headless harness can answer.
 --
 -- The log records capability read-backs and the frame puts the visual tests
@@ -3277,6 +3361,8 @@ function D.HandleSlash(msg)
 		D.PlateProbe()
 	elseif cmd == "texprobe" then
 		D.TexProbe()
+	elseif cmd == "levelprobe" then
+		D.LevelProbe()
 	elseif cmd == "wa2probe" then
 		D.Wa2Probe()
 	elseif cmd == "wa2" then
@@ -3289,6 +3375,8 @@ function D.HandleSlash(msg)
 		D.CodeFont(rest)
 	elseif cmd == "rows" then
 		D.Rows()
+	elseif cmd == "regions" then
+		D.Regions()
 	elseif cmd == "configtest" then
 		D.ConfigTest()
 	elseif cmd == "libs" then
@@ -3307,6 +3395,6 @@ function D.HandleSlash(msg)
 		ensureFrame()
 		frame:Hide()
 	else
-		D.Log("[debug] unknown command \"" .. cmd .. "\". Available: dump [unit] [filter], watch [unit], events [EVENT ...], auraprobe [unit|all], overflow [unit], timers, linkprobe, commprobe [charname|throttle [channel] [rate] [secs]], threat [send|query|tm|report|off], cdtest, swipetest [sizes/WxH...], swipenudge <k> [yflat], track <spellName>, states <id>, conditions <id>, gen <id>, load <id>, probe, soundprobe, gcd, cdprobe <spell>, ver [version], codeprobe, textprobe, texprobe, plateprobe, wa2probe, wa2 <string>, codelive, codetab <1-8|tabs>, codefont <6-16>, rows, configtest, libs, addons, export <id>, import, clear, show, hide")
+		D.Log("[debug] unknown command \"" .. cmd .. "\". Available: dump [unit] [filter], watch [unit], events [EVENT ...], auraprobe [unit|all], overflow [unit], timers, linkprobe, commprobe [charname|throttle [channel] [rate] [secs]], threat [send|query|tm|report|off], cdtest, swipetest [sizes/WxH...], swipenudge <k> [yflat], track <spellName>, states <id>, conditions <id>, gen <id>, load <id>, probe, soundprobe, gcd, cdprobe <spell>, ver [version], codeprobe, textprobe, texprobe, levelprobe, plateprobe, wa2probe, wa2 <string>, codelive, codetab <1-8|tabs>, codefont <6-16>, rows, regions, configtest, libs, addons, export <id>, import, clear, show, hide")
 	end
 end

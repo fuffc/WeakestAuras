@@ -155,8 +155,13 @@ local function collapseFrame(frame, data)
 	if frame.Collapse then frame:Collapse() end
 end
 
-local function releaseClone(entry, cloneId, frame, data)
-	if cloneId == "" or entry.byClone[cloneId] ~= frame then return end
+-- `allowBase` retires a *base* frame (the "" cloneId) as well, which only a
+-- regionType switch asks for: the frame is the wrong type from that moment, and
+-- **frames cannot be destroyed on this client**, so it has to reach the pool or
+-- it is stranded for the session along with every sub-region instance under it.
+-- Every other caller leaves the base alone -- it is the aura's permanent frame.
+local function releaseClone(entry, cloneId, frame, data, allowBase)
+	if (cloneId == "" and not allowBase) or entry.byClone[cloneId] ~= frame then return end
 	if frame.pendingRelease then return end
 	frame.pendingRelease = true
 	if data and data.uid then WA.ReleaseConditionsForClone(data.uid, cloneId) end
@@ -180,7 +185,11 @@ local function releaseClone(entry, cloneId, frame, data)
 		end
 		table.insert(pool, frame)
 	end
-	if frame.Collapse then frame:Collapse(recycle) else recycle() end
+	-- `Collapse` runs its callback only for a region that was actually shown
+	-- (it returns early on `toShow` false), so a frame retired while already
+	-- hidden has to be recycled directly -- otherwise it lands in neither
+	-- `byClone` nor the pool and is stranded for the session.
+	if frame.Collapse and frame.toShow then frame:Collapse(recycle) else recycle() end
 end
 
 local function releaseNonBaseClones(entry, data)
@@ -212,8 +221,11 @@ local function EnsureRegion(id, cloneId)
 	if not entry or entry.regionType ~= data.regionType or entry.spec ~= rt then
 		if entry then
 			releaseNonBaseClones(entry, data)
+			-- Pooled under the *old* type, not merely hidden: the pool is keyed by
+			-- regionType and matched on the spec, so switching away and back hands
+			-- the original frame straight back instead of building a second one.
 			local base = entry.byClone[""]
-			if base then collapseFrame(base, data); base:Hide() end
+			if base then releaseClone(entry, "", base, data, true) end
 		end
 		entry = { regionType = data.regionType, spec = rt, byClone = {} }
 		regions[id] = entry
@@ -221,18 +233,10 @@ local function EnsureRegion(id, cloneId)
 
 	local frame = entry.byClone[cloneId]
 	if not frame then
-		if cloneId == "" then
-			frame = rt.create(UIParent, data)
-			frame.id = id
-			frame.cloneId = cloneId
-			cloneSeq = cloneSeq + 1
-			frame.cloneSeq = cloneSeq
-			frame._waRegionType = data.regionType
-			frame._waRegionSpec = rt
-			if rt.modify then rt.modify(frame, data) end
-		else
-			frame = acquireClone(rt, data, cloneId)
-		end
+		-- Base and clone take the same path: both want a pooled frame of this type
+		-- if one is going spare, and the base is only ever absent here on the
+		-- display's first build or straight after a regionType switch retired it.
+		frame = acquireClone(rt, data, cloneId)
 		entry.byClone[cloneId] = frame
 	end
 	return frame
@@ -316,6 +320,30 @@ end
 function WA.PeekRegion(id, cloneId)
 	local entry = regions[id]
 	return entry and entry.byClone[cloneId or ""]
+end
+
+-- Read-only census of every region frame the engine holds, live or pooled
+-- (Debug.lua's `/wa regions`). Frames cannot be destroyed on this client, so
+-- "how many exist" is the only way to see a leak from inside the game: a count
+-- that climbs as a display is switched between region types means frames are
+-- being abandoned rather than recycled.
+function WA.RegionCensus()
+	local live, pooled = {}, {}
+	local liveTotal, pooledTotal = 0, 0
+	for _, entry in pairs(regions) do
+		for _ in pairs(entry.byClone) do
+			live[entry.regionType] = (live[entry.regionType] or 0) + 1
+			liveTotal = liveTotal + 1
+		end
+	end
+	for regionType, pool in pairs(clonePools) do
+		local n = table.getn(pool)
+		if n > 0 then
+			pooled[regionType] = n
+			pooledTotal = pooledTotal + n
+		end
+	end
+	return live, pooled, liveTotal, pooledTotal
 end
 
 -- ---------------------------------------------------------------------------

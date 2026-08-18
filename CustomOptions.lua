@@ -850,14 +850,16 @@ end
 local function authorOptionActions(data, options, index, option)
 	return WA.Widgets.ListActions(options, index, function()
 		authorOptionChanged(data)
-	end, function(list, itemIndex)
-		local copy = WA.DeepCopy(option)
-		if copy.key then
-			copy.key = ensureUniqueAuthorKey(copy.key .. "copy", "", options, 1)
-		end
-		if copy.name then copy.name = copy.name .. " - Copy" end
-		table.insert(list, itemIndex + 1, copy)
-	end)
+	end, {
+		duplicate = function(list, itemIndex)
+			local copy = WA.DeepCopy(option)
+			if copy.key then
+				copy.key = ensureUniqueAuthorKey(copy.key .. "copy", "", options, 1)
+			end
+			if copy.name then copy.name = copy.name .. " - Copy" end
+			table.insert(list, itemIndex + 1, copy)
+		end,
+	})
 end
 
 local function optionPathString(path)

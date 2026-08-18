@@ -489,6 +489,7 @@ WA.RegisterSubRegionType("subglow", {
 			or regionType == "progressbar"
 			or regionType == "text"
 			or regionType == "texture"
+			or regionType == "progresstexture"
 	end,
 	default = glowDefault("icon"),
 	defaultFor = glowDefault,
@@ -514,6 +515,23 @@ WA.RegisterSubRegionType("subglow", {
 		function region:ReapplyTint()
 			tintOverlay(self.overlay, self.useGlowColor and self.glowColor or nil)
 		end
+		-- The overlay comes from a shared pool and is acquired on demand, so the
+		-- level has to be *stored* and re-applied to whatever the pool hands
+		-- back -- being told it once, at modify time, would only reach an
+		-- overlay that happened to already exist. The pair takes two levels
+		-- (backdrop under art), which is what proto.SUB_STEP reserves.
+		function region:ApplyFrameLevel(overlay)
+			overlay = overlay or self.overlay
+			if not overlay then return end
+			local level = self.frameLevel
+				or (self.parent:GetFrameLevel() + proto.SUB_LEVEL)
+			overlay.bgFrame:SetFrameLevel(level)
+			overlay:SetFrameLevel(level + 1)
+		end
+		function region:SetFrameLevel(level)
+			self.frameLevel = level
+			self:ApplyFrameLevel()
+		end
 		function region:StartGlow()
 			local glowType = self.glowType or "buttonOverlay"
 			local renderer = getRenderer(glowType)
@@ -526,8 +544,7 @@ WA.RegisterSubRegionType("subglow", {
 			local target = glowTarget(self.parent, glowAnchorArea(self.parentData, self.anchorData))
 			overlay:SetParent(target or self.host)
 			overlay.bgFrame:SetParent(target or self.host)
-			overlay.bgFrame:SetFrameLevel(self.parent:GetFrameLevel() + proto.SUB_LEVEL + 1)
-			overlay:SetFrameLevel(self.parent:GetFrameLevel() + proto.SUB_LEVEL + 2)
+			self:ApplyFrameLevel(overlay)
 			overlay.renderer = renderer
 			self.overlay = overlay
 			overlay.params = {

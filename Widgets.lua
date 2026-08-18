@@ -90,11 +90,25 @@ function W.DeleteAction(onClick)
 	return { icon = LibWidgets.ICON_DELETE, tooltip = "Delete", onClick = onClick }
 end
 
-function W.ListActions(list, index, onChanged, onDuplicate)
+-- Duplicate/up/down/delete for a positional list, as a header `actions` array.
+-- `mutators` replaces any of the four with a handler taking (list, index); the
+-- ones it omits get the plain list mutation, and `onChanged` runs after either.
+--
+-- A list whose *index* is addressed from outside the list must override every
+-- key it can reach: the plain mutations renumber nothing, so anything holding an
+-- index (data.subRegions' `sub.<n>.<key>` condition properties) silently
+-- retargets at whatever moves into the slot. The bounds checks stay here so a
+-- mutator never has to repeat them.
+--
+-- `mutators.delete = false` drops the delete action entirely, for a header that
+-- already carries its own `onDelete`: that one is the arming two-click button,
+-- which a plain action icon is not.
+function W.ListActions(list, index, onChanged, mutators)
+	mutators = mutators or {}
 	local actions = {}
 	table.insert(actions, { icon = W.DUPLICATE_TEXTURE, tooltip = "Duplicate", onClick = function()
-		if onDuplicate then
-			onDuplicate(list, index)
+		if mutators.duplicate then
+			mutators.duplicate(list, index)
 		else
 			table.insert(list, index + 1, WA.DeepCopy(list[index]))
 		end
@@ -102,20 +116,34 @@ function W.ListActions(list, index, onChanged, onDuplicate)
 	end })
 	table.insert(actions, { icon = W.LIBWIDGETS_TEXTURES .. "up", tooltip = "Move Up", onClick = function()
 		if index > 1 then
-			list[index - 1], list[index] = list[index], list[index - 1]
+			if mutators.moveUp then
+				mutators.moveUp(list, index)
+			else
+				list[index - 1], list[index] = list[index], list[index - 1]
+			end
 			onChanged()
 		end
 	end })
 	table.insert(actions, { icon = W.LIBWIDGETS_TEXTURES .. "down", tooltip = "Move Down", onClick = function()
 		if index < table.getn(list) then
-			list[index + 1], list[index] = list[index], list[index + 1]
+			if mutators.moveDown then
+				mutators.moveDown(list, index)
+			else
+				list[index + 1], list[index] = list[index], list[index + 1]
+			end
 			onChanged()
 		end
 	end })
-	table.insert(actions, W.DeleteAction(function()
-		table.remove(list, index)
-		onChanged()
-	end))
+	if mutators.delete ~= false then
+		table.insert(actions, W.DeleteAction(function()
+			if mutators.delete then
+				mutators.delete(list, index)
+			else
+				table.remove(list, index)
+			end
+			onChanged()
+		end))
+	end
 	return actions
 end
 

@@ -48,6 +48,98 @@ WeakestAuras.hasNampower = type(GetNampowerVersion) == "function"
 -- (../pfUI/pfUI.lua), so it is present here.
 WeakestAuras.version = GetAddOnMetadata and GetAddOnMetadata("WeakestAuras", "Version") or nil
 
+-- The companion website. Shown in the options footer; there is no way to open
+-- a browser from this client, so every reference offers the URL as copyable
+-- text instead of a link.
+WeakestAuras.WEBSITE = "https://weako.xyz"
+
+-- ClassicAPI packs its version as X*10000 + Y*100 + Z; untagged local builds
+-- carry a sentinel meaning "newer than every release".
+local CLASSICAPI_DEV = 99999999
+
+-- The oldest ClassicAPI whose feature set version gates can reason about.
+-- Everything this addon calls unconditionally is assumed present from here on;
+-- an API added in a later release must go through WeakestAuras.RequireClassicAPI
+-- instead of a bare call. A client below this baseline predates that convention
+-- entirely, so the options footer flags it as "update" rather than pretending
+-- to know what it has.
+WeakestAuras.CLASSICAPI_BASELINE = 10911 -- 1.9.11
+
+-- "X.Y.Z" from a packed ClassicAPI version, "dev" for the sentinel. With no
+-- argument, the running client's own; nil when it cannot answer.
+function WeakestAuras.ClassicAPIVersionString(packed)
+	if packed == nil then packed = CLASSIC_API_VERSION end
+	if type(packed) ~= "number" then return nil end
+	if packed == CLASSICAPI_DEV then return "dev" end
+	return math.floor(packed / 10000) .. "."
+		.. math.floor(math.mod(packed, 10000) / 100) .. "."
+		.. math.mod(packed, 100)
+end
+
+-- SuperWoW's version as a display string, nil when the mod is absent. Neither
+-- global is confirmed on a live client (see the capability-probe note above),
+-- so a present-but-versionless SuperWoW answers "" and callers show the bare
+-- mod name.
+function WeakestAuras.SuperWoWVersionString()
+	if SUPERWOW_VERSION ~= nil then return tostring(SUPERWOW_VERSION) end
+	if type(SUPERWOW_STRING) == "string" then
+		local _, _, v = string.find(SUPERWOW_STRING, "(%d[%d%.]*)")
+		return v or ""
+	end
+	return nil
+end
+
+-- Nampower's version as "X.Y.Z", nil when absent or not answering.
+function WeakestAuras.NampowerVersionString()
+	if not WeakestAuras.hasNampower then return nil end
+	local ok, major, minor, patch = pcall(GetNampowerVersion)
+	if not ok or type(major) ~= "number" then return nil end
+	return major .. "." .. (minor or 0) .. "." .. (patch or 0)
+end
+
+-- Feature gates against the client mods' versions. Each Require* answers
+-- whether the running client has at least `minVersion` of its mod; false means
+-- the caller must fall back gracefully. A false with a `label` is also
+-- recorded, once per label, so the options footer can list what this client is
+-- missing out on. ClassicAPI takes its own packed integer; SuperWoW and
+-- Nampower take an "X.Y" / "X.Y.Z" string through ParseVersion.
+WeakestAuras.degradedFeatures = {}
+local function recordDegraded(mod, needs, label)
+	if not label then return end
+	local list = WeakestAuras.degradedFeatures
+	for i = 1, table.getn(list) do
+		if list[i].label == label then return end
+	end
+	table.insert(list, { mod = mod, needs = needs, label = label })
+end
+
+function WeakestAuras.RequireClassicAPI(minVersion, label)
+	if type(CLASSIC_API_VERSION) == "number" and CLASSIC_API_VERSION >= minVersion then
+		return true
+	end
+	recordDegraded("ClassicAPI", WeakestAuras.ClassicAPIVersionString(minVersion) or "?", label)
+	return false
+end
+
+-- A present mod whose version cannot be read still fails a version gate: the
+-- feature stays off rather than running against an unprovable surface, and the
+-- footer says which version would turn it on.
+function WeakestAuras.RequireSuperWoW(minVersion, label)
+	local have = WeakestAuras.ParseVersion(WeakestAuras.SuperWoWVersionString() or "")
+	local need = WeakestAuras.ParseVersion(minVersion)
+	if have and need and have >= need then return true end
+	recordDegraded("SuperWoW", tostring(minVersion), label)
+	return false
+end
+
+function WeakestAuras.RequireNampower(minVersion, label)
+	local have = WeakestAuras.ParseVersion(WeakestAuras.NampowerVersionString() or "")
+	local need = WeakestAuras.ParseVersion(minVersion)
+	if have and need and have >= need then return true end
+	recordDegraded("Nampower", tostring(minVersion), label)
+	return false
+end
+
 -- `x.y` or `x.y.z`, each part at most 999, packed into one comparable number.
 -- Anything else is nil: a version string reaching this also arrives from
 -- strangers over the addon channel, where "99.0.0" and "9.9.9.9" are both things

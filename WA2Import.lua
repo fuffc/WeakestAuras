@@ -63,7 +63,7 @@ local TEXT_KEYS = {
 }
 
 local TOP_LEVEL_DROPS = {
-	"information", "url", "semver", "skipWagoUpdate", "ignoreWagoUpdate",
+	"information", "semver", "skipWagoUpdate", "ignoreWagoUpdate",
 	"preferToUpdate", "wagoID", "tocversion",
 }
 
@@ -1469,14 +1469,22 @@ function WA.CollectImportCode(data, report, prefix)
 			local block = entry and entry[slot]
 			for i = 1, table.getn(TRIGGER_CODE_KEYS) do
 				local item = TRIGGER_CODE_KEYS[i]
-				local label = item.label
-				if slot == "untrigger" then label = "un" .. label end
+				local label, liveKey = item.label, item.key
+				-- The untrigger block holds one field the compiler reads, under the
+				-- name the predicate knows it by; anything else stored there is
+				-- carried and never run.
+				if slot == "untrigger" then
+					label = "un" .. label
+					liveKey = item.key == "custom" and "untrigger" or nil
+				end
 				addCode(report, prefix .. "trigger " .. n .. " " .. label,
-					block and block[item.key], true)
+					block and block[item.key],
+					liveKey and WA.TriggerCodeIsLive(entry and entry.trigger, liveKey))
 			end
 		end
 	end
-	addCode(report, prefix .. "trigger logic", triggers and triggers.customTriggerLogic, true)
+	addCode(report, prefix .. "trigger logic", triggers and triggers.customTriggerLogic,
+		triggers and triggers.disjunctive == "custom")
 
 	local conditions = data.conditions
 	for n = 1, table.getn(conditions or {}) do
@@ -1500,9 +1508,9 @@ function WA.CollectImportCode(data, report, prefix)
 		local block = animation and animation[phase]
 		for i = 1, table.getn(ANIMATION_CODE_KEYS) do
 			local key = ANIMATION_CODE_KEYS[i]
-			local useKey = "use_" .. string.sub(key, 1, string.len(key) - 4)
+			local slot = string.sub(key, 1, string.len(key) - 4)
 			addCode(report, prefix .. "animation " .. phase .. " " .. key,
-				block and block[key], not block or block[useKey] ~= false)
+				block and block[key], WA.AnimationCodeIsLive(block, slot))
 		end
 	end
 
@@ -1894,6 +1902,10 @@ local function translateDisplay(source, report)
 	local data = {}
 	if source.id ~= nil then data.id = WA.DeepCopy(source.id) end
 	if source.uid ~= nil then data.uid = WA.DeepCopy(source.uid) end
+	-- Author metadata, outside keysFor's per-type whitelist because every type
+	-- carries it: the Info tab shows and edits both.
+	if type(source.desc) == "string" then data.desc = source.desc end
+	if type(source.url) == "string" then data.url = source.url end
 	take(data, source, keysFor(localType))
 	data.regionType = sourceType == "aurabar" and "progressbar" or sourceType
 	if sourceType == "model" or sourceType == "stopmotion" then
@@ -1956,6 +1968,12 @@ local function translateDisplay(source, report)
 	codeSource.customSort = data.customSort
 	codeSource.customAnchorPerUnit = data.customAnchorPerUnit
 	WA.CollectImportCode(codeSource, report, tostring(source.id or "?") .. " - ")
+
+	-- Current-schema by construction -- fresh tables, current field names,
+	-- upstream's own draw order -- so the importer's migrations must not touch
+	-- it. The source's internalVersion counts upstream Modernize passes, not
+	-- our schema, and is never carried.
+	data.internalVersion = WA.SCHEMA_VERSION
 	return data
 end
 
@@ -2202,6 +2220,25 @@ function WA.ImportSummary(pending, report)
 				.. table.concat(shown, ", ")
 			if hidden > 0 then line = line .. ", and " .. hidden .. " more" end
 			table.insert(lines, line)
+		end
+	end
+	if report and report.sourceVersion then
+		table.insert(lines, "")
+		table.insert(lines, "Exported from " .. (report.sourceAddon or "WeakestAuras")
+			.. " " .. tostring(report.sourceVersion))
+		local mods = report.sourceMods
+		if type(mods) == "table" then
+			local parts = {}
+			if mods.classicapi then table.insert(parts, "ClassicAPI " .. tostring(mods.classicapi)) end
+			if mods.superwow then table.insert(parts, "SuperWoW " .. tostring(mods.superwow)) end
+			if mods.nampower then table.insert(parts, "Nampower " .. tostring(mods.nampower)) end
+			if table.getn(parts) > 0 then
+				table.insert(lines, "  built with " .. table.concat(parts, ", "))
+			end
+		end
+		if report.sourceAddon == "WeakestAuras"
+			and WA.VersionNewer(report.sourceVersion, WA.version) then
+			table.insert(lines, "  That WeakestAuras is newer than this one -- settings it added may not survive.")
 		end
 	end
 	return table.concat(lines, "\n")

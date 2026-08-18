@@ -91,7 +91,14 @@ function WA.ExportRaw(id)
 	local data = WeakestAurasDB.displays[id]
 	if not data then return nil, "no such display: " .. tostring(id) end
 
+	-- v and mods say what built the string -- the importer's preview names them,
+	-- and a bug report over a pasted string gets its environment for free.
 	local payload = { m = "WeakestAuras", v = WA.version, d = cleanForExport(data) }
+	payload.mods = {
+		classicapi = WA.ClassicAPIVersionString(),
+		superwow = WA.SuperWoWVersionString(),
+		nampower = WA.NampowerVersionString(),
+	}
 	if WA.IsGroup(data) and data.controlledChildren then
 		payload.c = {}
 		for i = 1, table.getn(data.controlledChildren) do
@@ -180,6 +187,20 @@ function WA.ImportPreview(str)
 		if not payload then return nil, importReport("not a WeakestAuras export string") end
 		local pending, why = localPending(payload)
 		if not pending then return nil, importReport(why) end
+		-- A payload whose schema outruns this install is refused outright, as
+		-- WA2 refuses (its Update frame hides the import button behind a red
+		-- warning): the migrations here have never seen that shape, so what
+		-- installs would be data no code path understands. A newer *release*
+		-- at the same schema still imports, with the summary's soft warning.
+		local schema = pending.root.internalVersion or 0
+		for i = 1, table.getn(pending.children) do
+			local v = pending.children[i].internalVersion or 0
+			if v > schema then schema = v end
+		end
+		if schema > WA.SCHEMA_VERSION then
+			return nil, importReport(
+				"this aura was made with a newer WeakestAuras -- update the addon to import it")
+		end
 		local report = importReport(nil)
 		WA.CollectImportCode(pending.root, report, tostring(pending.root.id or "?") .. " - ")
 		for i = 1, table.getn(pending.children) do
@@ -187,6 +208,9 @@ function WA.ImportPreview(str)
 			WA.CollectImportCode(child, report, tostring(child.id or "?") .. " - ")
 		end
 		report.format = class
+		report.sourceAddon = "WeakestAuras"
+		if type(payload.v) == "string" then report.sourceVersion = payload.v end
+		if type(payload.mods) == "table" then report.sourceMods = payload.mods end
 		return pending, report
 	end
 	if class == "wa2" then
@@ -196,6 +220,8 @@ function WA.ImportPreview(str)
 		end
 		local pending, report = WA.WA2Translate(payload)
 		report.format = class
+		report.sourceAddon = "WeakAuras"
+		if type(payload.s) == "string" then report.sourceVersion = payload.s end
 		return pending, report
 	end
 	return nil, importReport("not a WeakestAuras export string")
@@ -219,7 +245,6 @@ local function installOne(data, parentId)
 	data.id = newId
 	if not data.uid or WA.FindByUID(data.uid) then data.uid = WA.NewUID() end
 	data.parent = parentId
-	data.internalVersion = 4
 	WeakestAurasDB.displays[newId] = data
 	local ok, err = pcall(WA.MergeDefaults, data)
 	if not ok then
@@ -371,7 +396,6 @@ function WA.UpdatePendingImport(pending, targetId)
 		if not UPDATE_PRESERVED[key] then target[key] = WA.DeepCopy(value) end
 	end
 	target.id, target.uid, target.parent = targetId, original.uid, original.parent
-	target.internalVersion = 4
 	local ok, err = pcall(WA.MergeDefaults, target)
 	if not ok then
 		for key in pairs(target) do target[key] = nil end

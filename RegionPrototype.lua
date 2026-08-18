@@ -390,12 +390,39 @@ function proto.CustomTextOptionFields(data)
 	return fields
 end
 
+-- Idle sub-region instances, per owning region and keyed by type. **Frames
+-- cannot be destroyed on this client**, so an instance displaced from its slot
+-- has to stay reachable: deleting one effect shifts every later one up a slot,
+-- and each shift past a differently-typed neighbour would otherwise strand an
+-- instance nothing can ever reach again.
+--
+-- The pool is per-region, not global, and must stay that way: a sub-region's
+-- create closes over its parent (subtick goes further and builds its texture on
+-- the parent's bar frame), so an instance is only ever reusable under the region
+-- it was made for.
+local function parkSubRegion(region, inst)
+	if inst.Hide then inst:Hide() end
+	local free = region.subRegionPool[inst.subType]
+	if not free then
+		free = {}
+		region.subRegionPool[inst.subType] = free
+	end
+	table.insert(free, inst)
+end
+
+local function takeSubRegion(region, subType)
+	local free = region.subRegionPool[subType]
+	if free and table.getn(free) > 0 then return table.remove(free) end
+	return nil
+end
+
 -- Rebuilds a region's sub-region instances from data.subRegions and re-wires
 -- their event subscriptions (§8). Called at the end of each region type's
 -- modify, so config edits, a new state, and a regionType switch all funnel
 -- through one place. Instances are reused in place by index+type across edits
--- so a slider drag doesn't leak a FontString per tick. Clone pooling reuses the
--- whole owning region frame; it does not detach individual sub-regions.
+-- so a slider drag doesn't leak a FontString per tick, and displaced ones go to
+-- the pool above rather than being dropped. Clone pooling reuses the whole
+-- owning region frame; it does not detach individual sub-regions.
 function proto.modifyFinish(region, data)
 	local setWidth, setHeight = region.SetRegionWidth, region.SetRegionHeight
 	if setWidth and setHeight and not WA.IsGroup(data) then
@@ -459,6 +486,7 @@ function proto.modifyFinish(region, data)
 		region.subRegionEvents:AddSubscriber("FrameTick", region.customTextTick)
 	end
 	region.subRegions = region.subRegions or {}
+	region.subRegionPool = region.subRegionPool or {}
 	local list = data.subRegions or {}
 	local n = table.getn(list)
 	for i = 1, n do
@@ -470,23 +498,42 @@ function proto.modifyFinish(region, data)
 		if spec and (not spec.supports or spec.supports(data.regionType)) then
 			local inst = region.subRegions[i]
 			if not inst or inst.subType ~= subData.type then
-				if inst and inst.Hide then inst:Hide() end
-				inst = spec.create(region)
-				inst.subType = subData.type
+				if inst then parkSubRegion(region, inst) end
+				inst = takeSubRegion(region, subData.type)
+				if not inst then
+					inst = spec.create(region)
+					inst.subType = subData.type
+				end
 				region.subRegions[i] = inst
 			end
 			if inst.Show then inst:Show() end
 			spec.modify(region, inst, data, subData)
+			-- After modify, not before: a type that rebuilds or re-parents its
+			-- frames there would otherwise be told a level and then discard it.
+			-- Optional because not every type has a frame to put on one --
+			-- subtick draws on the parent's bar and rides with the spark.
+			if inst.SetFrameLevel then
+				inst:SetFrameLevel(proto.SubRegionLevel(region, i))
+			end
 		else
 			local inst = region.subRegions[i]
 			if inst and inst.Hide then inst:Hide() end
 		end
 	end
-	-- Hide instances left over from a shorter config (kept for later reuse).
-	for i = n + 1, table.getn(region.subRegions) do
+	-- Park instances left over from a shorter config. Bounded by the high-water
+	-- mark rather than table.getn: an unsupported type at index 1 never gets an
+	-- instance, and getn over the resulting hole reports 0, which would skip the
+	-- sweep entirely and leave a stale instance drawn.
+	local high = region.subRegionHigh or 0
+	if n > high then high = n end
+	for i = n + 1, high do
 		local inst = region.subRegions[i]
-		if inst and inst.Hide then inst:Hide() end
+		if inst then
+			parkSubRegion(region, inst)
+			region.subRegions[i] = nil
+		end
 	end
+	region.subRegionHigh = n
 
 	proto.RefreshFrameTick(region)
 end
@@ -659,6 +706,20 @@ end
 -- or a border created on the region. Region types keep their internals below
 -- SUB_LEVEL; subregions sit at or above it, ordered among themselves.
 proto.SUB_LEVEL = 5
+
+-- Levels reserved per subregion, so a type needing two frames of its own has one
+-- to spare without landing on its neighbour's. subglow is the reason: its
+-- backdrop and its art must be ordered against each other, and at a step of 1
+-- the art would tie with whatever sits one slot higher in the list, leaving the
+-- winner to creation order rather than to what the user arranged.
+proto.SUB_STEP = 2
+
+-- The draw level of the i-th entry of data.subRegions, in list order: the first
+-- effect sits lowest, the last on top. Type no longer decides -- moving a row in
+-- the Display Effects list is what restacks it.
+function proto.SubRegionLevel(region, index)
+	return region:GetFrameLevel() + proto.SUB_LEVEL + (index - 1) * proto.SUB_STEP
+end
 
 -- Area-anchors a subregion frame over the whole parent region (border/glow
 -- cover the region rather than self-anchoring to one point the way subtext

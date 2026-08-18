@@ -396,6 +396,12 @@ end
 -- mirrors constructFunction's return contract (fn, source, err).
 local function constructCustomFunction(trigger, errTag)
 	local body = trigger.custom or ""
+	-- No source, no function, no complaint -- the same bargain compileCustomField
+	-- makes. Picking the Custom category compiles before the editor has painted
+	-- anything, and WA.LoadFunction refuses an empty body in the user's chat, so
+	-- an untouched trigger would report an error against code it has not been
+	-- given yet. It stays inert until there is something to run.
+	if not string.find(body, "%S") then return nil, body end
 	local fn, err = WA.LoadFunction(body, errTag)
 	return fn, body, err
 end
@@ -403,6 +409,33 @@ end
 local function compileCustomField(source, errTag)
 	if not source or not string.find(source, "%S") then return nil end
 	return WA.LoadFunction(source, errTag)
+end
+
+-- Whether one of a custom trigger's code fields is code the compile below
+-- actually reaches. Asked of the trigger table alone, so the import review can
+-- put the same question to a payload it has never compiled and get the
+-- compiler's own answer. `key` is the field name, except that "untrigger"
+-- stands for the untrigger block's `custom` -- which is the trigger's setting to
+-- decide, not the block's. `customTexture`, `customStacks` and `customOverlay*`
+-- arrive from WeakAuras and are read by nothing here, so they are never live.
+--
+-- A Trigger State Updater carries its own progress, name, icon and hiding, so
+-- its auxiliary fields are not compiled at all rather than compiled and left
+-- unread -- two sources for one value is what the editor hides in that mode.
+function WA.TriggerCodeIsLive(trigger, key)
+	if type(trigger) ~= "table" or trigger.type ~= "custom" then return false end
+	local tsu = trigger.custom_type == "stateupdate"
+	if key == "custom" then return true end
+	if key == "customVariables" then return tsu end
+	if tsu then return false end
+	if key == "untrigger" then
+		return trigger.custom_type == "status"
+			or (trigger.custom_type == "event" and trigger.custom_hide == "custom")
+	end
+	if key == "customDuration" then
+		return trigger.custom_type ~= "event" or trigger.custom_hide == "custom"
+	end
+	return key == "customName" or key == "customIcon"
 end
 
 -- A Trigger State Updater's `customVariables` text is a table *expression*, not a
@@ -2631,11 +2664,14 @@ PROTOTYPES["custom"] = {
 			trigger.customEvents = nil
 		end
 	end,
+	-- No `custom` here: the boilerplate is the editor's opening text, not a
+	-- setting, and stamping it at MergeDefaults writes Lua into every aura whose
+	-- author only ever glanced at this category. The code field seeds the same
+	-- signature the first time it paints.
 	defaults = {
 		custom_type = "status",
 		check = "event",
 		events = "",
-		custom = "function(event, ...)\n    return true\nend",
 		custom_hide = "timed",
 		duration = 1,
 		customDuration = "",
@@ -4824,26 +4860,26 @@ function GenericTrigger.Add(data)
 				fn, source = constructCustomFunction(trigger, errTag)
 				local entry = data.triggers[triggernum]
 				local untriggerSource = entry.untrigger and entry.untrigger.custom or ""
-				if isTsu then
-					-- TSU state carries its own progress, name, icon and hiding, so the
-					-- auxiliary functions are not compiled at all rather than compiled
-					-- and left unread -- two sources for one value is what the editor
-					-- hides in this mode.
-					untriggerSource = ""
+				-- A TSU never reads the untrigger, so its text must not reach
+				-- sourceKey either -- editing code nothing runs is not an edit.
+				if isTsu then untriggerSource = "" end
+				if WA.TriggerCodeIsLive(trigger, "customVariables") then
 					tsuVariablesFunc = compileTsuVariables(trigger.customVariables,
 						data.id .. ": custom variables " .. triggernum)
-				else
-					if trigger.custom_type == "status"
-						or (trigger.custom_type == "event" and trigger.custom_hide == "custom") then
-						untriggerFunc = compileCustomField(untriggerSource,
-							data.id .. ": untrigger " .. triggernum) or trueFunction
-					end
-					if trigger.custom_type ~= "event" or trigger.custom_hide == "custom" then
-						customDurationFunc = compileCustomField(trigger.customDuration,
-							data.id .. ": duration function " .. triggernum)
-					end
+				end
+				if WA.TriggerCodeIsLive(trigger, "untrigger") then
+					untriggerFunc = compileCustomField(untriggerSource,
+						data.id .. ": untrigger " .. triggernum) or trueFunction
+				end
+				if WA.TriggerCodeIsLive(trigger, "customDuration") then
+					customDurationFunc = compileCustomField(trigger.customDuration,
+						data.id .. ": duration function " .. triggernum)
+				end
+				if WA.TriggerCodeIsLive(trigger, "customName") then
 					customNameFunc = compileCustomField(trigger.customName,
 						data.id .. ": name function " .. triggernum)
+				end
+				if WA.TriggerCodeIsLive(trigger, "customIcon") then
 					customIconFunc = compileCustomField(trigger.customIcon,
 						data.id .. ": icon function " .. triggernum)
 				end
@@ -5259,7 +5295,7 @@ local function buildOptions(data, triggernum)
 				default = (isTsu and "function(allstates, event, ...)\n    return true\nend")
 					or (t.weakestAurasLegacyStateArgs
 						and "function(state, event, ...)\n    return true\nend")
-					or (proto.defaults and proto.defaults.custom),
+					or "function(event, ...)\n    return true\nend",
 				validate = function(txt) return validate(txt, "custom trigger") end })
 		if isTsu then
 			table.insert(more, { type = "code", name = "Custom Variables", key = "customVariables", height = 140,

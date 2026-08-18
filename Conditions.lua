@@ -66,11 +66,18 @@ function WA.GetProperties(data)
 		end
 	end
 	local subs = data.subRegions or {}
+	local perType = {}
 	for i = 1, table.getn(subs) do
 		local sspec = WA.subRegionTypes[subs[i].type]
+		perType[subs[i].type] = (perType[subs[i].type] or 0) + 1
 		if sspec and sspec.properties then
+			-- Same label the Display Effects list gives the block this targets, so
+			-- the two pages name one element the same way -- which means counting
+			-- per type here too, not by list position. The position is still what
+			-- the key `sub.<i>.<key>` addresses it by.
+			local label = (sspec.displayName or subs[i].type) .. " " .. perType[subs[i].type] .. " "
 			for key, pspec in pairs(sspec.properties) do
-				out["sub." .. i .. "." .. key] = { display = "Text " .. i .. " " .. (pspec.display or key),
+				out["sub." .. i .. "." .. key] = { display = label .. (pspec.display or key),
 					setter = pspec.setter, action = pspec.action, type = pspec.type, min = pspec.min, max = pspec.max,
 					step = pspec.step, values = pspec.values, base = pspec.base, baseIndex = pspec.baseIndex,
 					isSub = true, subIndex = i, subKey = pspec.dataKey or key }

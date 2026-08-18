@@ -61,7 +61,8 @@ local S = {
 	TAB_ROW_H = 22, -- one row of the tab strip
 	TAB_ROW_GAP = 4, -- between two rows of a wrapped strip
 	TAB_TO_CONTENT = 6, -- gap below the strip's last row
-	BOTTOM_RESERVED = 12, -- bottom margin only; the list runs to the panel's edge
+	BOTTOM_RESERVED = 12, -- bottom margin only; the list runs to the footer
+	FOOTER_H = 22, -- version/website footer line (16 tall + 6 gap above)
 	-- MIN_W = left inset + LIST_W + gap + CONTENT_W + right inset, i.e. the
 	-- narrowest window that still gives the list its minimum beside a
 	-- full-width options pane.
@@ -100,7 +101,11 @@ local S = {
 	COPY_IGNORE = {
 		triggers = true, conditions = true, animation = true, actions = true, load = true,
 		id = true, parent = true, controlledChildren = true,
-		uid = true, internalVersion = true,
+		uid = true, internalVersion = true, desc = true, url = true,
+		-- Provenance belongs to the string it arrived in. Pasting settings out of
+		-- a downloaded aura must not stamp the target with a source it was never
+		-- served from.
+		sourceUrl = true, sourceVersion = true,
 	},
 	searchTerms = {},
 	-- Per-group expand/collapse state, keyed by aura id. Absence means
@@ -643,6 +648,55 @@ function S.convertRegionType(data, regionType)
 	S.refreshTabContent()
 end
 
+-- The version stamp as a display string, or nil. The format calls it an
+-- unsigned integer and "%d" holds it to that whatever the decoder hands back;
+-- a site that wrote a text label instead is shown verbatim rather than dropped.
+local function sourceVersionText(v)
+	if type(v) == "number" then return string.format("%d", v) end
+	if type(v) == "string" and v ~= "" then return v end
+	return nil
+end
+
+-- The Info tab's provenance block: where a string came from, stamped by the
+-- distributing site at download time (see design/architecture/export-format.md).
+-- Read-only by contract -- the addon never writes the pair, and the only edit
+-- offered here is dropping it -- so this is a description plus two buttons and
+-- not an input; typing a sourceUrl by hand would be a claim the site never made.
+function S.addSourceFields(fields, data)
+	local url = data.sourceUrl
+	if type(url) ~= "string" or url == "" then return end
+	local line = "Imported from |cff82c5ff" .. url .. "|r"
+	local ver = sourceVersionText(data.sourceVersion)
+	if ver then line = line .. "  (version " .. ver .. ")" end
+	-- "Imported from", never "this is that aura": the pair survives editing and
+	-- re-export, so it names an origin with exactly the strength of uid.
+	line = line .. "\nCheck that page for a newer version of this aura."
+	table.insert(fields, { type = "header", name = "Source" })
+	table.insert(fields, { type = "description", name = line })
+	table.insert(fields, {
+		type = "button", name = "Copy Source Link",
+		onClick = function() S.openURLDialog("Aura Source", url) end,
+	})
+	-- Two-click confirm, the Delete button's affordance: erasing the stamp is
+	-- unrecoverable from inside the game -- nothing re-derives it but importing
+	-- the site's string again.
+	table.insert(fields, {
+		type = "button", name = "Clear Source Link",
+		onClick = function()
+			if this.confirming then
+				this.confirming = nil
+				data.sourceUrl = nil
+				data.sourceVersion = nil
+				S.refreshTabContent()
+			else
+				this.confirming = true
+				this.label:SetText("Confirm?")
+				S.scheduleUnconfirm(this, "Clear Source Link")
+			end
+		end,
+	})
+end
+
 function S.getInfoOptions(data)
 	local fields = {
 		{ type = "header", name = data.id },
@@ -663,11 +717,31 @@ function S.getInfoOptions(data)
 			get = function() return data.regionType end,
 			set = function(v) S.convertRegionType(data, v) end,
 		},
+		-- Author metadata, travelling with every export and surviving a WA2
+		-- import (upstream's Information tab holds the same pair).
+		{
+			type = "input", name = "Description",
+			get = function() return data.desc or "" end,
+			set = function(v)
+				v = S.trim(v)
+				data.desc = v ~= "" and v or nil
+			end,
+		},
+		{
+			type = "input", name = "URL",
+			get = function() return data.url or "" end,
+			set = function(v)
+				v = S.trim(v)
+				data.url = v ~= "" and v or nil
+			end,
+		},
 		-- data.uid is deliberately not shown: it's an internal identity for
 		-- import/export and cross-references, not something the user acts on
 		-- (upstream never surfaces it in the Information tab either).
-		{ type = "button", name = "Export", onClick = function() S.openExport(data.id) end },
 	}
+	S.addSourceFields(fields, data)
+	table.insert(fields, { type = "button", name = "Export",
+		onClick = function() S.openExport(data.id) end })
 	-- Every warning this aura has, titled by the worst severity -- the block the
 	-- row's status icon click arrives at. Upstream puts it midway down its own
 	-- Information tab; here it sits above everything else, because landing on it
@@ -750,6 +824,23 @@ function S.clearCollapsed(data, prefix)
 	end
 end
 
+-- Carries a numeric collapse-state namespace through the same old -> new index
+-- map a structural list edit hands WA.RemapSubRegionRefs: an entry the map sends
+-- to false is dropped, one it does not mention stays put. Lifted out of the
+-- namespace first and written back second, so a swap doesn't overwrite the state
+-- it is about to move.
+function S.remapCollapsed(data, prefix, map)
+	local base = data.id .. "::" .. prefix
+	local lifted = {}
+	for old in pairs(map) do
+		lifted[old] = S.collapsed[base .. old]
+		S.collapsed[base .. old] = nil
+	end
+	for old, new in pairs(map) do
+		if new then S.collapsed[base .. new] = lifted[old] end
+	end
+end
+
 -- Makes every plain header in `fields` collapsible, returning a new array with
 -- folded sections' bodies dropped. For generated sections whose generator has
 -- no fold state of its own (Regions.lua's Icon/Size/Position, which are the
@@ -802,7 +893,9 @@ end
 -- Appends the sub-region editor ("Display Effects") onto the Display tab's field
 -- list (matching upstream, where subtext/border/glow live under Display, not a
 -- separate tab): one block per instance in data.subRegions rendered from its own
--- spec.options field array, plus per-type add and per-instance remove. Walks
+-- spec.options field array, plus per-type add and per-instance
+-- duplicate/up/down/delete. List order is draw order (index-derived frame
+-- levels, see RegionPrototype's SUB_LEVEL), so the arrows restack. Walks
 -- WA.subRegionTypes so a newly-registered subregion type shows up here for free;
 -- the "+ Add" list is filtered to types that support this region type. Each
 -- block's closures capture their own `sub`/`idx` locals (fresh per loop
@@ -812,12 +905,20 @@ end
 function S.appendDisplayEffectsOptions(fields, data)
 	table.insert(fields, { type = "header", name = "Display Effects" })
 	local subs = data.subRegions or {}
+	-- Counted per type, so [text, border, text] reads Text 1 / Border 1 / Text 2
+	-- rather than numbering a lone border "2" (upstream's `subIndex`,
+	-- DisplayOptions.lua). The list position stays the *address* -- `sub.<n>`,
+	-- the fold key, the index each action renumbers against -- and only the
+	-- label counts per type. Advanced for every entry, not just the ones with an
+	-- options block, so it cannot drift from WA.GetProperties' identical count.
+	local perType = {}
 	for i = 1, table.getn(subs) do
 		local sub = subs[i]
 		local idx = i
 		local spec = WA.subRegionTypes[sub.type]
+		perType[sub.type] = (perType[sub.type] or 0) + 1
 		if spec and spec.options then
-			local label = (spec.displayName or sub.type) .. " " .. idx
+			local label = (spec.displayName or sub.type) .. " " .. perType[sub.type]
 			local key = "sub:" .. idx
 			-- Unfolded by default. Upstream folds subregions instead
 			-- (DisplayOptions.lua's __collapsed = true), but it can afford to:
@@ -831,12 +932,58 @@ function S.appendDisplayEffectsOptions(fields, data)
 					S.setCollapsed(data, key, not collapsed)
 					S.refreshTabContent()
 				end,
+				-- Delete stays the header's own arming two-click button rather
+				-- than joining the actions row, where it would be a plain icon
+				-- that removes a configured effect on one click.
 				onDelete = function()
+					local map = { [idx] = false }
+					for i = idx + 1, table.getn(data.subRegions) do map[i] = i - 1 end
 					table.remove(data.subRegions, idx)
-					S.clearCollapsed(data, "sub:")
+					WA.RemapSubRegionRefs(data, map)
+					S.remapCollapsed(data, "sub:", map)
 					WA.Add(data)
 					S.refreshTabContent()
 				end,
+				-- Every structural edit renumbers, so every one of them maps.
+				-- data.subRegions is positional, a condition addresses an effect
+				-- as `sub.<n>.<key>`, and the index is the only thing tying the
+				-- two together -- a shift no map describes leaves that condition
+				-- pointing at whatever moved into the slot, silently. Each map is
+				-- built against the pre-edit indices, which is why duplicate
+				-- walks its range backwards and delete builds the map before the
+				-- removal.
+				actions = W.ListActions(subs, idx, function()
+					WA.Add(data)
+					S.refreshTabContent()
+				end, {
+					delete = false,
+					duplicate = function(list, i)
+						local map = {}
+						for j = table.getn(list), i + 1, -1 do map[j] = j + 1 end
+						table.insert(list, i + 1, WA.DeepCopy(list[i]))
+						WA.RemapSubRegionRefs(data, map)
+						S.remapCollapsed(data, "sub:", map)
+						-- The copy takes the original's fold state: it lands
+						-- directly under the section the user was looking at.
+						-- Conditions are deliberately not cloned onto it -- the
+						-- original keeps them, and duplicating every change that
+						-- targets an effect is a separate judgement call.
+						S.setCollapsed(data, "sub:" .. (i + 1),
+							S.isCollapsed(data, "sub:" .. i, false))
+					end,
+					moveUp = function(list, i)
+						list[i - 1], list[i] = list[i], list[i - 1]
+						local map = { [i] = i - 1, [i - 1] = i }
+						WA.RemapSubRegionRefs(data, map)
+						S.remapCollapsed(data, "sub:", map)
+					end,
+					moveDown = function(list, i)
+						list[i + 1], list[i] = list[i], list[i + 1]
+						local map = { [i] = i + 1, [i + 1] = i }
+						WA.RemapSubRegionRefs(data, map)
+						S.remapCollapsed(data, "sub:", map)
+					end,
+				}),
 			})
 			if not collapsed then
 				local typeFields = spec.options(data, sub, idx)
@@ -1764,7 +1911,7 @@ function S.paintNewPane()
 	importRow:SetPoint("TOPLEFT", content, "TOPLEFT", 4, -y)
 	importRow:SetPoint("TOPRIGHT", content, "TOPRIGHT", -4, -y)
 	importRow.name:SetText("Import from string")
-	importRow.desc:SetText("Paste an aura exported from WeakAuras or WeakestAuras.")
+	importRow.desc:SetText("Paste an aura from WeakAuras, WeakestAuras, or weako.xyz.")
 	importRow.onClick = function() S.openImport() end
 	if importRow.thumb then
 		WA.ReleaseThumbnail(importRow.thumb)
@@ -2636,6 +2783,214 @@ end
 
 WA.Comm.OnPayload = S.openReceived
 
+-- ---------------------------------------------------------------------------
+-- Footer: the build's own version, the companion website, and the detected
+-- client-mod versions. WA2 parks its link row (Discord/docs/bug tracker) in a
+-- bottom tipFrame the same way; version-in-the-title is the one thing it does
+-- differently, and the footer keeps our title row free for the toolbar.
+-- ---------------------------------------------------------------------------
+
+-- Colour runs for the footer's mod list: green = present, amber = present but
+-- limited, red = absent.
+local MOD_OK, MOD_WARN, MOD_BAD = "|cff33ff99", "|cffffcc00", "|cffff5555"
+
+local function classicApiBelowBaseline()
+	return type(CLASSIC_API_VERSION) == "number"
+		and CLASSIC_API_VERSION < WA.CLASSICAPI_BASELINE
+end
+
+-- The Require* gate refusals recorded against one mod.
+local function degradedFor(mod)
+	local out = {}
+	local list = WA.degradedFeatures
+	for i = 1, table.getn(list) do
+		if list[i].mod == mod then table.insert(out, list[i]) end
+	end
+	return out
+end
+
+function S.footerModsText()
+	local parts = {}
+	local caColor = MOD_OK
+	if classicApiBelowBaseline() or table.getn(degradedFor("ClassicAPI")) > 0 then
+		caColor = MOD_WARN
+	end
+	table.insert(parts, caColor .. "ClassicAPI " .. (WA.ClassicAPIVersionString() or "?") .. "|r")
+
+	local sw = WA.SuperWoWVersionString()
+	if sw then
+		local color = table.getn(degradedFor("SuperWoW")) > 0 and MOD_WARN or MOD_OK
+		table.insert(parts, color .. "SuperWoW" .. (sw ~= "" and (" " .. sw) or "") .. "|r")
+	else
+		table.insert(parts, MOD_BAD .. "SuperWoW missing|r")
+	end
+
+	local np = WA.NampowerVersionString()
+	if np or WA.hasNampower then
+		local color = table.getn(degradedFor("Nampower")) > 0 and MOD_WARN or MOD_OK
+		table.insert(parts, color .. "Nampower" .. (np and (" " .. np) or "") .. "|r")
+	else
+		table.insert(parts, MOD_BAD .. "Nampower missing|r")
+	end
+	return table.concat(parts, "   ")
+end
+
+local function tooltipDegraded(mod)
+	local list = degradedFor(mod)
+	for i = 1, table.getn(list) do
+		GameTooltip:AddLine("  needs " .. tostring(list[i].needs) .. ": "
+			.. tostring(list[i].label), 1, 0.8, 0, true)
+	end
+end
+
+-- Fills an already-owned GameTooltip; the caller anchors and shows it.
+function S.footerModsTooltip()
+	GameTooltip:SetText("Client mods", 1, 1, 1)
+	local ca = WA.ClassicAPIVersionString() or "?"
+	if classicApiBelowBaseline() then
+		GameTooltip:AddLine("ClassicAPI " .. ca .. " -- older than the "
+			.. WA.ClassicAPIVersionString(WA.CLASSICAPI_BASELINE)
+			.. " baseline, so newer features cannot tell what it supports. Update it.",
+			1, 0.8, 0, true)
+	else
+		GameTooltip:AddLine("ClassicAPI " .. ca, 0.2, 1, 0.6)
+	end
+	tooltipDegraded("ClassicAPI")
+
+	local sw = WA.SuperWoWVersionString()
+	if sw then
+		GameTooltip:AddLine("SuperWoW" .. (sw ~= "" and (" " .. sw) or ""), 0.2, 1, 0.6)
+	else
+		GameTooltip:AddLine("SuperWoW not detected -- triggers needing GUID units or cast events stay off.",
+			1, 0.35, 0.35, true)
+	end
+	tooltipDegraded("SuperWoW")
+
+	local np = WA.NampowerVersionString()
+	if np or WA.hasNampower then
+		GameTooltip:AddLine("Nampower" .. (np and (" " .. np) or ""), 0.2, 1, 0.6)
+	else
+		GameTooltip:AddLine("Nampower not detected -- real aura durations and cast events stay off.",
+			1, 0.35, 0.35, true)
+	end
+	tooltipDegraded("Nampower")
+end
+
+-- The client cannot open a browser, so every "link" in the addon -- the footer's
+-- site button and an aura's imported-from stamp alike -- is this copyable box.
+function S.openURLDialog(title, url)
+	if not S.urlDialog then
+		local f = CreateFrame("Frame", "WeakestAurasURLDialog", UIParent)
+		f:SetWidth(360); f:SetHeight(96)
+		f:SetPoint("CENTER", UIParent, "CENTER", 0, 60)
+		f:SetBackdrop(W.PANEL_BACKDROP)
+		f:SetBackdropColor(0, 0, 0, 1)
+		f:SetFrameStrata("FULLSCREEN_DIALOG")
+		f:SetToplevel(true)
+		f:EnableMouse(true)
+		f:Hide()
+
+		local heading = f:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+		heading:SetPoint("TOP", 0, -14)
+		heading:SetTextColor(1, 0.82, 0)
+		f.heading = heading
+
+		local close = CreateFrame("Button", nil, f, "UIPanelCloseButton")
+		close:SetPoint("TOPRIGHT", -4, -4)
+		close:SetScript("OnClick", function() f:Hide() end)
+
+		local box = LibWidgets.NewTextBox(f, { width = 332, text = "" })
+		box:SetPoint("TOP", 0, -40)
+		box:SetScript("OnEscapePressed", function()
+			this:ClearFocus()
+			f:Hide()
+		end)
+		f.box = box
+
+		local hint = f:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+		hint:SetPoint("TOP", box, "BOTTOM", 0, -6)
+		hint:SetText("Ctrl-C to copy, Escape to close.")
+
+		S.urlDialog = f
+	end
+	local f = S.urlDialog
+	f:Show()
+	f.heading:SetText(title)
+	f.box:SetText(url)
+	f.box:SetFocus()
+	f.box:HighlightText()
+end
+
+function S.openWebsite()
+	S.openURLDialog("Companion Website", WA.WEBSITE)
+end
+
+function S.buildFooter(panel)
+	local footer = CreateFrame("Frame", nil, panel)
+	footer:SetHeight(16)
+	footer:SetPoint("BOTTOMLEFT", panel, "BOTTOMLEFT", 14, 10)
+	-- Right inset clears the resize grip.
+	footer:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", -26, 10)
+
+	local logo = footer:CreateTexture(nil, "ARTWORK")
+	logo:SetWidth(16); logo:SetHeight(16)
+	logo:SetPoint("LEFT", footer, "LEFT", 0, 0)
+	logo:SetTexture("Interface\\AddOns\\WeakestAuras\\textures\\weako.tga")
+
+	local version = footer:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+	version:SetPoint("LEFT", logo, "RIGHT", 5, 0)
+
+	-- Labelled by task, not by domain -- upstream's wago button says "Find
+	-- Auras", and the domain rides behind it. The lead-in is an escaped grey
+	-- run, so the hover recolour (SetTextColor sets only the base) brightens
+	-- just the site name.
+	local site = CreateFrame("Button", nil, footer)
+	site:SetHeight(16)
+	local siteText = site:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+	siteText:SetPoint("LEFT", 0, 0)
+	siteText:SetText("|cff9d9d9dFind or upload auras at|r weako.xyz")
+	site.text = siteText
+	site:SetWidth((siteText:GetStringWidth() or 160) + 2)
+	site:SetPoint("LEFT", version, "RIGHT", 10, 0)
+	site:SetScript("OnClick", function() S.openWebsite() end)
+	site:SetScript("OnEnter", function()
+		this.text:SetTextColor(1, 1, 0.5)
+		GameTooltip:SetOwner(this, "ANCHOR_NONE")
+		GameTooltip:SetPoint("BOTTOMLEFT", this, "TOPLEFT", 0, 6)
+		GameTooltip:SetText("The WeakestAuras companion website", 1, 1, 1)
+		GameTooltip:AddLine("Click for a copyable link.", 0.8, 0.8, 0.8)
+		GameTooltip:Show()
+	end)
+	site:SetScript("OnLeave", function()
+		this.text:SetTextColor(1, 0.82, 0)
+		GameTooltip:Hide()
+	end)
+
+	local mods = CreateFrame("Frame", nil, footer)
+	mods:SetHeight(16)
+	mods:SetPoint("RIGHT", footer, "RIGHT", 0, 0)
+	mods:EnableMouse(true)
+	local modsText = mods:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+	modsText:SetPoint("RIGHT", 0, 0)
+	mods:SetScript("OnEnter", function()
+		GameTooltip:SetOwner(this, "ANCHOR_NONE")
+		GameTooltip:SetPoint("BOTTOMRIGHT", this, "TOPRIGHT", 0, 6)
+		S.footerModsTooltip()
+		GameTooltip:Show()
+	end)
+	mods:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+	-- Refreshed on every open, not just at build: the degraded list grows as
+	-- gated features first run.
+	local function updateFooter()
+		version:SetText(WA.version and ("WeakestAuras " .. WA.version) or "WeakestAuras")
+		modsText:SetText(S.footerModsText())
+		mods:SetWidth((modsText:GetStringWidth() or 0) + 4)
+	end
+	footer:SetScript("OnShow", updateFooter)
+	updateFooter()
+end
+
 local function buildPanel()
 	local panel = CreateFrame("Frame", "WeakestAurasOptions", UIParent)
 	S.panel = panel
@@ -2717,6 +3072,8 @@ local function buildPanel()
 	grip:SetScript("OnMouseDown", function() panel:StartSizing("BOTTOMRIGHT") end)
 	grip:SetScript("OnMouseUp", function() panel:StopMovingOrSizing() end)
 
+	S.buildFooter(panel)
+
 	-- The content pane is the *fixed*-width column and the list absorbs a resize,
 	-- not the other way round -- WA2 anchors its options container a constant
 	-- distance in from the window's right edge for the same reason. BuildOptions
@@ -2733,7 +3090,7 @@ local function buildPanel()
 	-- The tab strip wraps, so where the content pane starts is decided by the
 	-- strip's row count rather than by a constant -- S.anchorContent, driven from
 	-- the strip's onReflow. One row reproduces the offset this used to hardcode.
-	contentScroll:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", -14, 12)
+	contentScroll:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", -14, 12 + S.FOOTER_H)
 	S.anchorContent(1)
 
 	-- The options pane reads as its own surface rather than as fields floating on
@@ -3412,7 +3769,8 @@ local function buildPanel()
 		-- Measured from the panel, not from listBg: the box is sized to a whole
 		-- number of rows below, so reading its own height back would feed each
 		-- snap into the next one.
-		local avail = (panel:GetHeight() or 0) - (36 + S.SEARCH_H + S.TOOLBAR_H) - S.BOTTOM_RESERVED
+		local avail = (panel:GetHeight() or 0) - (36 + S.SEARCH_H + S.TOOLBAR_H)
+			- S.BOTTOM_RESERVED - S.FOOTER_H
 		-- The room the list may use. The box itself is sized by refreshList to
 		-- the rows it actually laid out -- with two row heights in play, the only
 		-- way the border ends flush under the last one is to measure the paint
@@ -3423,11 +3781,13 @@ local function buildPanel()
 		S.visibleRows = n
 	end
 
-	-- Toolbar strip above the search box, mirroring WA2's own: icon plus caption,
-	-- in two groups as upstream splits them -- what *creates* an aura on the left,
-	-- the mode toggles pushed to the right edge, reading their lit state back from
-	-- WA.Mover, which owns the flags and persists them. Each button sizes itself
-	-- to its caption, so the two groups re-flow from their own anchors.
+	-- Toolbar strip above the search box, in two groups: what *creates* an aura
+	-- on the left (icon plus caption, as upstream's own toolbar buttons), the
+	-- mode toggles pushed to the right edge as icon-only squares whose tooltips
+	-- carry their names -- upstream captions those too, but its window is 830px
+	-- wide against our 680 default, and four captioned toggles were crowding the
+	-- title out of this one. The toggles read their lit state back from
+	-- WA.Mover, which owns the flags and persists them.
 	--
 	-- Undo/Redo are deliberately absent: upstream backs them with a TimeMachine
 	-- edit-history subsystem that has no counterpart here.
@@ -3448,8 +3808,7 @@ local function buildPanel()
 		"Import from string", function() S.openImport() end, "Import")
 	importBtn:SetPoint("LEFT", newBtn, "RIGHT", 4, 0)
 
-	local lockBtn = W.toolbarButton(toolbar, "Interface\\Icons\\INV_Misc_Key_03", "Lock positions",
-		nil, "Lock Positions")
+	local lockBtn = W.toolbarButton(toolbar, "Interface\\Icons\\INV_Misc_Key_03", "Lock Positions")
 	lockBtn.tipDesc = "Stops the in-world mover from dragging or resizing an aura."
 	lockBtn.setToggled(WA.Mover.locked)
 	lockBtn:SetScript("OnClick", function()
@@ -3458,7 +3817,7 @@ local function buildPanel()
 	end)
 
 	local magnetBtn = W.toolbarButton(toolbar, "Interface\\Icons\\Spell_Frost_FrostArmor",
-		"Magnetically align", nil, "Magnetically Align")
+		"Magnetically Align")
 	magnetBtn:SetPoint("RIGHT", toolbar, "RIGHT", 0, 0)
 	lockBtn:SetPoint("RIGHT", magnetBtn, "LEFT", -4, 0)
 	magnetBtn.tipDesc = "Snaps a dragged aura's edges to nearby auras. Hold Shift during a drag to suppress it."
@@ -3472,7 +3831,7 @@ local function buildPanel()
 	-- gets the notice. It silences only the chat line: the version we broadcast is
 	-- what tells everyone else, and withholding it helps nobody.
 	local notifyBtn = W.toolbarButton(toolbar, "Interface\\Icons\\INV_Misc_Note_01",
-		"Update notices", nil, "Update Notices")
+		"Update Notices")
 	notifyBtn:SetPoint("RIGHT", lockBtn, "LEFT", -4, 0)
 	notifyBtn.tipDesc = "Says once per session when someone in your guild or group is running a newer release."
 	notifyBtn.setToggled(WA.Options().updateNotify ~= false)
@@ -3487,7 +3846,7 @@ local function buildPanel()
 	-- returns every aura trigger to reading the descriptor alone, which is the
 	-- escape hatch if a recovered debuff ever turns out to be a phantom.
 	local overflowBtn = W.toolbarButton(toolbar, "Interface\\Icons\\Spell_Shadow_CurseOfSargeras",
-		"Debuff overflow", nil, "Debuff Overflow")
+		"Debuff Overflow")
 	overflowBtn:SetPoint("RIGHT", notifyBtn, "LEFT", -4, 0)
 	overflowBtn.tipDesc = "A unit shows at most 16 debuffs. Recovers the ones past that from cast events, so a trigger for one still fires."
 	overflowBtn.setToggled(WA.Options().auraOverflow ~= false)

@@ -33,10 +33,35 @@ local function formatGetter(subData)
 	end
 end
 
+-- Every string this text can end up showing: its own, plus any a condition can
+-- swap in through text_text. Formatters are built once over the whole set, the
+-- way the standalone text region does it (`displayTexts`), so a condition
+-- supplying a %p hands over an already-formatted symbol rather than rendering
+-- raw until the next modify. The scan is not narrowed to this instance's own
+-- index -- modify is not told which index it is -- so a sibling's strings are
+-- swept in too; a formatter for a symbol this text never shows is one unused
+-- table entry.
+local function subTexts(parentData, subData)
+	local texts = { subData.text_text or "" }
+	local conditions = parentData.conditions or {}
+	for i = 1, table.getn(conditions) do
+		local changes = conditions[i].changes or {}
+		for c = 1, table.getn(changes) do
+			local change = changes[c]
+			local _, _, suffix = string.find(change.property or "", "^sub%.[0-9]+%.(.*)$")
+			if suffix == "text_text" and type(change.value) == "string" then
+				table.insert(texts, change.value)
+			end
+		end
+	end
+	return texts
+end
+
 WA.RegisterSubRegionType("subtext", {
 	displayName = "Text",
 	supports = function(regionType)
 		return regionType == "icon" or regionType == "progressbar" or regionType == "texture"
+			or regionType == "progresstexture"
 	end,
 	default = {
 		type = "subtext",
@@ -74,18 +99,28 @@ WA.RegisterSubRegionType("subtext", {
 	end,
 	-- Condition-overridable properties, namespaced sub.<n>.* (§8). Each setter
 	-- is a method defined in create below.
+	-- The offset keys keep upstream's `text_anchorXOffset` naming while pointing
+	-- `dataKey` at our own saved field (`anchorXOffset`, renamed from `text_x` at
+	-- internalVersion 3): WA2Import carries condition property names through
+	-- verbatim, so an imported condition only lands if the property is spelled
+	-- the way upstream spells it.
 	properties = {
 		text_visible = { display = "Visible", setter = "SetVisible", type = "bool" },
+		text_text = { display = "Text", setter = "ChangeText", type = "string" },
 		text_color = { display = "Color", setter = "SetTextColor", type = "color" },
 		text_fontSize = { display = "Font Size", setter = "SetTextHeight", type = "number", min = 6, max = 48, step = 1 },
+		text_anchorXOffset = { display = "X-Offset", setter = "SetXOffset", type = "number",
+			min = -500, max = 500, step = 1, dataKey = "anchorXOffset" },
+		text_anchorYOffset = { display = "Y-Offset", setter = "SetYOffset", type = "number",
+			min = -500, max = 500, step = 1, dataKey = "anchorYOffset" },
 	},
 	create = function(parent)
 		local region = { parent = parent }
 		-- The FontString lives in a frame of its own, not on the region: a child
 		-- frame's draw layers all sit above its parent's, so text created directly
 		-- on the region renders *under* anything the region type builds as a child
-		-- frame -- the progress bar, the icon's cooldown swipe. The level is
-		-- (re)asserted in modify, since SetParent resets it.
+		-- frame -- the progress bar, the icon's cooldown swipe. modifyFinish
+		-- (re)asserts the level after every modify, since SetParent resets it.
 		local frame = CreateFrame("Frame", nil, parent)
 		frame:SetAllPoints(parent)
 		region.frame = frame
@@ -96,6 +131,7 @@ WA.RegisterSubRegionType("subtext", {
 			WA.textCore.SetText(self.fontString,
 				WA.ReplacePlaceHolders(self.text or "", self.parent, self.formatters))
 		end
+		function region:SetFrameLevel(level) self.frame:SetFrameLevel(level) end
 		function region:Show() if self.visible ~= false then self.fontString:Show() end end
 		function region:Hide() self.fontString:Hide() end
 		function region:SetVisible(b)
@@ -109,26 +145,75 @@ WA.RegisterSubRegionType("subtext", {
 			WA.textCore.Apply(self.fontString, self.subData, "text_", size, WA.textCore.SUBTEXT_KEYS)
 			self.fontString:SetTextHeight(size)
 		end
+
+		-- One stable reference per instance rather than a fresh closure per
+		-- modify: RemoveSubscriber matches by identity, so a tick subscribed as an
+		-- anonymous function can be added but never taken off again -- which is
+		-- what ChangeText below needs to do when a %p string is swapped out.
+		region.frameTick = function() region:Update() end
+
+		-- Two independent reasons to repaint per frame: the string's own (%p, or
+		-- an every-frame formatter), and a %c whose function runs per frame. The
+		-- second is the parent's setting, asked one level up. Re-derived rather
+		-- than decided once at modify, because a condition can swap the whole
+		-- string afterwards: one that gains a %p has to start ticking, one that
+		-- loses it has to stop.
+		function region:ConfigureTick()
+			local host = self.parent
+			host.subRegionEvents:RemoveSubscriber("FrameTick", self.frameTick)
+			local needsTick = WA.TextNeedsFrameTick(self.text, self.everyFrameFormatters)
+				or (host.customTextFunc ~= nil and host.customTextMode == "update"
+					and WA.ContainsCustomPlaceHolder(self.text))
+			if needsTick then
+				host.subRegionEvents:AddSubscriber("FrameTick", self.frameTick)
+			end
+			proto.RefreshFrameTick(host)
+		end
+
+		function region:ChangeText(msg)
+			self.text = msg or ""
+			self:ConfigureTick()
+			self:Update()
+		end
+
+		-- Offsets are re-applied through the shared anchor resolver rather than a
+		-- bare SetPoint: it owns which target and which points this sub-region is
+		-- anchored against, and only the two numbers are being overridden.
+		function region:ApplyAnchor()
+			local effective = self.subData
+			if self.xOffset ~= nil or self.yOffset ~= nil then
+				effective = {}
+				for k, v in pairs(self.subData) do effective[k] = v end
+				if self.xOffset ~= nil then effective.anchorXOffset = self.xOffset end
+				if self.yOffset ~= nil then effective.anchorYOffset = self.yOffset end
+			end
+			proto.AnchorSubRegion(self.fontString, self.parent, effective, self.anchorDefaults)
+		end
+		function region:SetXOffset(v) self.xOffset = v; self:ApplyAnchor() end
+		function region:SetYOffset(v) self.yOffset = v; self:ApplyAnchor() end
+
 		return region
 	end,
 	modify = function(parent, region, parentData, subData)
 		region.subData = subData
 		region.text = subData.text_text or ""
 		region.visible = subData.text_visible ~= false
+		-- Config is the source of truth again on every modify; a condition that
+		-- is still active re-applies its override immediately afterwards.
+		region.xOffset, region.yOffset = nil, nil
 		region.formatters, region.everyFrameFormatters =
-			WA.CreateFormatters(region.text, formatGetter(subData), parentData)
+			WA.CreateFormatters(subTexts(parentData, subData), formatGetter(subData), parentData)
 
 		local fs = region.fontString
 		WA.textCore.Apply(fs, subData, "text_", nil, WA.textCore.SUBTEXT_KEYS)
 
-		region.frame:SetFrameLevel(parent:GetFrameLevel() + WA.regionPrototype.SUB_LEVEL)
-
-		proto.AnchorSubRegion(fs, parent, subData, {
+		region.anchorDefaults = {
 			mode = subData.anchor_mode or "point", target = parent.subRegionAnchor and "bar" or "region",
 			anchorPoint = subData.anchor_point or "CENTER",
 			selfPoint = subData.anchor_point or "CENTER",
 			x = subData.anchorXOffset or 0, y = subData.anchorYOffset or 0,
-		})
+		}
+		region:ApplyAnchor()
 
 		if region.visible then fs:Show() else fs:Hide() end
 
@@ -136,17 +221,10 @@ WA.RegisterSubRegionType("subtext", {
 		parent.subRegionEvents:AddSubscriber("PreShow", function()
 			if region.visible then fs:Show() end
 		end)
-		-- Two independent reasons to repaint per frame: the string's own (%p, an
-		-- every-frame formatter), and a %c whose function is set to run per frame.
-		-- The second is the parent's setting, asked one level up -- the parent has
-		-- already subscribed its refresh ahead of this, so what is left here is
-		-- re-resolving the string against the values it just recomputed.
-		local needsTick = WA.TextNeedsFrameTick(region.text, region.everyFrameFormatters)
-			or (parent.customTextFunc ~= nil and parent.customTextMode == "update"
-				and WA.ContainsCustomPlaceHolder(region.text))
-		if needsTick then
-			parent.subRegionEvents:AddSubscriber("FrameTick", function() region:Update() end)
-		end
+		-- The parent has already subscribed its own %c refresh ahead of this, so
+		-- what a tick leaves to do here is re-resolve the string against the
+		-- values it just recomputed.
+		region:ConfigureTick()
 
 		region:Update()
 	end,

@@ -320,6 +320,73 @@ local function migrateConditionProperties(data)
 	end
 end
 
+-- Rewrites the index inside every `sub.<n>.<key>` condition property against a
+-- map of old index -> new index, or -> false where the sub-region is gone (the
+-- change's property is cleared, which the editor renders as an unset row rather
+-- than erroring).
+--
+-- Every structural edit to data.subRegions must call this. The index is the only
+-- thing tying a condition to the element it targets, so a shift that skips it
+-- does not error -- it silently retargets the condition at whatever moved into
+-- the slot. Conditions are the sole holder of these references; anchor targets
+-- are region-provided keys ("region", "bar", "icon"), never `sub.<n>`.
+function WA.RemapSubRegionRefs(data, replacements)
+	local conditions = data.conditions or {}
+	for i = 1, table.getn(conditions) do
+		local changes = conditions[i].changes or {}
+		for j = 1, table.getn(changes) do
+			local _, _, index, suffix = string.find(changes[j].property or "", "^sub%.([0-9]+)%.(.*)$")
+			if index then
+				-- Present-but-false is "deleted" and nil is "not in the map, leave
+				-- alone", so this cannot collapse into a truthiness test.
+				local mapped = replacements[tonumber(index)]
+				if mapped == false then
+					changes[j].property = nil
+				elseif mapped then
+					changes[j].property = "sub." .. mapped .. "." .. suffix
+				end
+			end
+		end
+	end
+end
+
+-- What each sub-region type's draw level used to be a fixed constant of, before
+-- the level came off the entry's position in data.subRegions. A type owning no
+-- frame at all -- subtick, which draws on the parent's bar and takes no level --
+-- takes the floor, since where it sits in the list cannot change what it looks
+-- like either way.
+local LEGACY_SUB_LEVELS = { subtext = 1, subborder = 2, subglow = 3 }
+local LEGACY_SUB_FLOOR = 1
+
+-- Draw order was per-type and list order meant nothing, so a saved aura can
+-- carry a border ahead of a text in the list while drawing behind it. Sorting by
+-- the old constants makes list order agree with what is already on screen;
+-- skipping it would restack every such aura the first time it loads, silently.
+local function migrateSchemaV5(data)
+	local subs = data.subRegions
+	local n = table.getn(subs or {})
+	if n < 2 then return end
+	local order = {}
+	for i = 1, n do
+		order[i] = { index = i, rank = LEGACY_SUB_LEVELS[subs[i].type] or LEGACY_SUB_FLOOR }
+	end
+	-- table.sort is not stable, so equal ranks fall through to the original
+	-- index: two texts must keep the order the user put them in.
+	table.sort(order, function(a, b)
+		if a.rank ~= b.rank then return a.rank < b.rank end
+		return a.index < b.index
+	end)
+	local sorted, map, moved = {}, {}, false
+	for i = 1, n do
+		sorted[i] = subs[order[i].index]
+		map[order[i].index] = i
+		if order[i].index ~= i then moved = true end
+	end
+	if not moved then return end
+	for i = 1, n do subs[i] = sorted[i] end
+	WA.RemapSubRegionRefs(data, map)
+end
+
 -- A sub-region imported from upstream before the combined anchor was split
 -- carries the anchored part where a bare point belongs ("OUTER_TOPLEFT"), which
 -- SetPoint rejects outright.
@@ -365,6 +432,12 @@ local function migrateSchemaV3(data)
 	end
 	migrateConditionProperties(data)
 end
+
+-- The version the migration gates in MergeDefaults end on. The two must move
+-- together: a new migration adds a gate and bumps this in the same change.
+-- Data that is current-schema by construction rather than by migration
+-- (WA2Translate's output) is stamped with it directly.
+WA.SCHEMA_VERSION = 5
 
 -- Fills in missing fields from the aura's regionType/trigger.type defaults, and
 -- migrates saved data through the local schema versions (upstream's `triggers`
@@ -470,6 +543,11 @@ function WA.MergeDefaults(data)
 	if data.internalVersion < 4 then
 		migrateSchemaV4(data)
 		data.internalVersion = 4
+	end
+
+	if data.internalVersion < 5 then
+		migrateSchemaV5(data)
+		data.internalVersion = 5
 	end
 end
 
