@@ -2935,6 +2935,283 @@ function D.ToggleTsuTrace()
 end
 
 -- ---------------------------------------------------------------------------
+-- /wa threat -- Turtle's server-side threat query, watched and driven by hand.
+--
+-- The query is an addon-message RPC: SendAddonMessage("TWT_UDTSv4"[.."_TM"],
+-- "limit=N", "RAID"/"PARTY"), which the server answers with a CHAT_MSG_ADDON
+-- carrying "TWTv4=name:tank:threat:perc:melee;...". A reply reaches only the
+-- client that asked, but every addon in that client's process sees it, so a
+-- reply nothing of ours asked for is proof that something else here is querying
+-- -- the attribution below is what turns that into a usable signal.
+--
+-- Nothing here sends unless a subcommand says to. The dump, the attribution and
+-- the target log are passive, which is what makes it safe to leave running.
+-- ---------------------------------------------------------------------------
+
+local THREAT_QUERY_PREFIX = "TWT_UDTSv4"
+local THREAT_REPLY_MARKER = "TWTv4="
+-- A reply arriving later than this is not attributable to a request of ours.
+-- Requests are claimed oldest-first and expire out of the window rather than
+-- being tracked by a single "awaiting ours" flag: a request the server never
+-- answers would otherwise consume every later reply forever, and the probe
+-- would report "nobody else is asking" exactly when somebody is.
+local THREAT_REPLY_WINDOW = 3.0
+
+local threatProbe = { on = false, sent = {},
+	requests = 0, replies = 0, ours = 0, foreign = 0, queries = 0, started = 0 }
+
+local function threatChannel(want)
+	if want and want ~= "" then return string.upper(want) end
+	if GetNumRaidMembers and GetNumRaidMembers() > 0 then return "RAID" end
+	if GetNumPartyMembers and GetNumPartyMembers() > 0 then return "PARTY" end
+	return nil
+end
+
+local function threatTargetLabel()
+	if not UnitExists("target") then return "none" end
+	-- The GUID's tail, because "Blackrock Sentry" is four mobs in a pack and the
+	-- question a run of unanswered queries raises first is whether they were even
+	-- about the same creature.
+	local guid = UnitGUID and UnitGUID("target")
+	return "\"" .. tostring(UnitName("target")) .. "\""
+		.. " " .. tostring(UnitClassification("target"))
+		.. (guid and ("#" .. string.sub(guid, -8)) or "")
+		.. (UnitIsPlayer("target") and " PLAYER" or "")
+		.. (UnitIsDead("target") and " DEAD" or "")
+		.. (UnitAffectingCombat("target") and " incombat" or "")
+end
+
+local function threatStamp()
+	return string.format("%7.2f", GetTime() - threatProbe.started)
+end
+
+-- A request that is never answered is otherwise only an absence in the log, and
+-- an absence is the one thing a reader skips.
+local function threatTrack()
+	threatProbe.requests = threatProbe.requests + 1
+	local req = { at = GetTime(), n = threatProbe.requests }
+	table.insert(threatProbe.sent, req)
+	C_Timer.After(THREAT_REPLY_WINDOW + 0.1, function()
+		if req.claimed then return end
+		D.Log("  [twt] " .. threatStamp() .. " NO REPLY to #" .. req.n
+			.. " after " .. THREAT_REPLY_WINDOW .. "s")
+	end)
+	return req.n
+end
+
+local function threatSend(limit, channel, tankMode)
+	local chan = threatChannel(channel)
+	if not chan then
+		D.Log("  [twt] " .. threatStamp() .. " NOT SENT -- no party or raid, and SendAddonMessage"
+			.. " needs a channel. \"/wa threat send 5 GUILD\" forces one.")
+		return false
+	end
+	local prefix = THREAT_QUERY_PREFIX .. (tankMode and "_TM" or "")
+	local msg = "limit=" .. limit
+	D.Log("  [twt] " .. threatStamp() .. " SEND #" .. threatTrack() .. " " .. prefix
+		.. " \"" .. msg .. "\" -> " .. chan .. "  target " .. threatTargetLabel())
+	-- The global rather than Comm.lua's route: ChatThrottleLib would pace the
+	-- send, and a request whose timestamp is not the moment it left the client
+	-- measures the wrong latency. Its v13/v14 hook takes exactly these three
+	-- parameters, so nothing is dropped here the way a whisper's target would be.
+	local ok, err = pcall(SendAddonMessage, prefix, msg, chan)
+	if not ok then D.Log("  [twt] send ERRORED -- " .. tostring(err)) end
+	return ok
+end
+
+-- Every query the engine makes, typed or automatic, lands here through
+-- WA.OnThreatQuery -- so a request counts against the same attribution the
+-- probe's own sends do, and its reply reads OURS rather than as somebody else's.
+-- Refusals repeat once per target change, so an unchanged reason is logged at
+-- most every few seconds; walking around out of combat would otherwise bury the
+-- log in "nothing is in combat".
+local function threatOnQuery(info, why)
+	if why then
+		local now = GetTime()
+		if why == threatProbe.lastRefusal and now - (threatProbe.lastRefusalAt or 0) < 5 then
+			return
+		end
+		threatProbe.lastRefusal, threatProbe.lastRefusalAt = why, now
+		D.Log("  [twt] " .. threatStamp() .. " gate REFUSED -- " .. why)
+		return
+	end
+	threatProbe.lastRefusal = nil
+	D.Log("  [twt] " .. threatStamp() .. " ENGINE SEND #" .. threatTrack()
+		.. " " .. tostring(info.prefix) .. " \"" .. tostring(info.msg) .. "\" -> "
+		.. tostring(info.channel) .. "  target " .. threatTargetLabel())
+end
+
+-- Oldest-first, expiring. Returns the request this reply answers, or nil for a
+-- reply nothing of ours asked for.
+local function threatClaim(now)
+	while true do
+		local req = threatProbe.sent[1]
+		if not req then return nil end
+		table.remove(threatProbe.sent, 1)
+		if now - req.at <= THREAT_REPLY_WINDOW then
+			req.claimed = true
+			return req
+		end
+	end
+end
+
+-- The reply's own `perc` beside the aggro race the watcher computes from raw
+-- threat, which is the only way to read what `perc` is a percentage of. Reads
+-- WA.ThreatInfo() rather than re-parsing: WA.WatchThreat registers its frame
+-- before this one does, and 1.12 dispatches an event in registration order, so
+-- the digest is already the one this packet produced.
+local function threatDigestLine()
+	local ts = WA.ThreatInfo and WA.ThreatInfo()
+	if not (ts and ts.exists) then return "         digest: none (no row for the player)" end
+	return "         digest: rows=" .. tostring(ts.threatcount)
+		.. " me threat=" .. tostring(ts.threat) .. " twt-perc=" .. tostring(ts.threatpct)
+		.. " | computed pullPct=" .. tostring(ts.pullPct) .. " pullGap=" .. tostring(ts.pullGap)
+		.. " rival=" .. tostring(ts.rivalName) .. " tanking=" .. tostring(ts.isTanking)
+end
+
+local function threatOnEvent()
+	if event == "PLAYER_TARGET_CHANGED" then
+		D.Log("  [twt] " .. threatStamp() .. " target -> " .. threatTargetLabel())
+		return
+	end
+	if event ~= "CHAT_MSG_ADDON" then return end
+	local prefix, body, chan, sender = arg1, arg2, arg3, arg4
+	-- The reply carries the *server's* prefix, which is not known to differ from
+	-- the one the request goes out on, so the body is the only honest
+	-- discriminator: a reply carries the TWTv4 marker, a request "limit=N".
+	local isReply = body and string.find(body, THREAT_REPLY_MARKER, 1, true)
+	local isQuery = not isReply and prefix and string.find(prefix, THREAT_QUERY_PREFIX, 1, true)
+	-- Everything TWThreat-shaped, not only the replies: a request seen here is a
+	-- request the server relayed to the channel rather than swallowing (Q4).
+	if not isReply and not isQuery and not (prefix and string.find(prefix, "TWT", 1, true)) then
+		return
+	end
+
+	local head = "  [twt] " .. threatStamp() .. " RECV arg1=\"" .. tostring(prefix)
+		.. "\" arg3=\"" .. tostring(chan) .. "\" arg4=\"" .. tostring(sender)
+		.. "\" " .. string.len(body or "") .. "B"
+
+	if isQuery then
+		threatProbe.queries = threatProbe.queries + 1
+		D.Log(head .. "  <- A QUERY, not a reply: the server relays requests to the channel.")
+		D.Log("         body: " .. tostring(body))
+		return
+	end
+	if not isReply then
+		D.Log(head .. "  <- TWThreat's own addon traffic, not the server's reply.")
+		return
+	end
+
+	threatProbe.replies = threatProbe.replies + 1
+	local now = GetTime()
+	local req = threatClaim(now)
+	if req then
+		threatProbe.ours = threatProbe.ours + 1
+		D.Log(head .. string.format("  <- OURS, %.2fs after #%d", now - req.at, req.n))
+	else
+		threatProbe.foreign = threatProbe.foreign + 1
+		D.Log(head .. "  <- UNSOLICITED: nothing of ours asked inside "
+			.. THREAT_REPLY_WINDOW .. "s")
+	end
+	D.Log("         body: " .. tostring(body))
+	D.Log(threatDigestLine())
+end
+
+local function threatEnv()
+	D.Log("  [env] SendAddonMessage = " .. type(SendAddonMessage)
+		.. ", ChatThrottleLib = " .. type(ChatThrottleLib)
+		.. (ChatThrottleLib and (" v" .. tostring(ChatThrottleLib.version)) or ""))
+	D.Log("  [env] raid " .. tostring(GetNumRaidMembers and GetNumRaidMembers())
+		.. ", party " .. tostring(GetNumPartyMembers and GetNumPartyMembers())
+		.. " -> channel " .. tostring(threatChannel()))
+	local loaded = function(name) return (IsAddOnLoaded and IsAddOnLoaded(name)) and true or false end
+	D.Log("  [env] TWThreat loaded = " .. tostring(loaded("TWThreat")) .. ", TWT = " .. type(TWT)
+		.. (TWT_CONFIG and (", tankMode = " .. tostring(TWT_CONFIG.tankMode)
+			.. ", anyMob = " .. tostring(TWT_CONFIG.anyMob)) or ", no TWT_CONFIG"))
+	D.Log("  [env] other readers: BigWigs = " .. tostring(loaded("BigWigs"))
+		.. ", SuperCleveRoidMacros = " .. tostring(loaded("SuperCleveRoidMacros")))
+	D.Log("  [env] target " .. threatTargetLabel()
+		.. ", creatureType " .. tostring(UnitCreatureType("target"))
+		.. ", guid " .. tostring(UnitGUID and UnitGUID("target")))
+	D.Log("  [env] player in combat = " .. tostring(UnitAffectingCombat("player") and true or false))
+end
+
+local function threatStart()
+	if threatProbe.on then return end
+	threatProbe.on = true
+	threatProbe.started = GetTime()
+	-- Stood up first so its CHAT_MSG_ADDON handler runs ahead of the probe's and
+	-- the digest line describes the packet just logged.
+	if WA.WatchThreat then WA.WatchThreat() end
+	WA.OnThreatQuery = function(info, why)
+		WA.safecall("Debug.threatQuery", threatOnQuery, info, why)
+	end
+	if not threatProbe.frame then
+		threatProbe.frame = CreateFrame("Frame")
+		threatProbe.frame:SetScript("OnEvent", function()
+			WA.safecall("Debug.threat", threatOnEvent)
+		end)
+	end
+	-- Outside the create guard: stopping unregisters, and the frame it
+	-- unregistered is the one a restart gets handed back.
+	threatProbe.frame:RegisterEvent("CHAT_MSG_ADDON")
+	threatProbe.frame:RegisterEvent("PLAYER_TARGET_CHANGED")
+	D.Log("--- threat probe on (passive; nothing is sent until you say so) ---")
+end
+
+local function threatReport()
+	D.Log("  [twt] tally: " .. threatProbe.requests .. " request(s) of ours, "
+		.. threatProbe.replies .. " reply packet(s) -- " .. threatProbe.ours
+		.. " answering ours, " .. threatProbe.foreign .. " UNSOLICITED, "
+		.. threatProbe.queries .. " request(s) of somebody's seen on the wire")
+	D.Log("  [twt] Q1  UNSOLICITED > 0 while TWThreat is off HERE = the server answers the")
+	D.Log("            whole channel, and a reply cannot prove who asked.")
+	D.Log("  [twt] Q4  \"request(s) seen on the wire\" > 0 = the server relays requests too.")
+end
+
+local function threatHelp()
+	D.Log("  [twt] /wa threat send [limit] [channel] -- one query (default limit 5, channel auto)")
+	D.Log("  [twt] /wa threat query [limit]          -- one query through the engine's own gate")
+	D.Log("  [twt] /wa threat tm [limit]             -- the same with TWThreat's _TM tank-mode prefix")
+	D.Log("  [twt] /wa threat report                 -- the tally so far")
+	D.Log("  [twt] /wa threat off                    -- stop listening")
+end
+
+function D.Threat(rest)
+	local _, _, sub, tail = string.find(rest or "", "^(%S*)%s*(.-)$")
+	sub = string.lower(sub or "")
+
+	if sub == "off" then
+		threatProbe.on = false
+		WA.OnThreatQuery = nil
+		if threatProbe.frame then threatProbe.frame:UnregisterAllEvents() end
+		threatReport()
+		D.Log("--- threat probe off ---")
+		return
+	end
+
+	threatStart()
+	local _, _, limitArg, chanArg = string.find(tail or "", "^(%S*)%s*(%S*)$")
+	local limit = tonumber(limitArg) or 5
+
+	if sub == "" then
+		threatEnv()
+		threatHelp()
+	elseif sub == "send" then
+		threatSend(limit, chanArg)
+	elseif sub == "tm" then
+		threatSend(limit, chanArg, true)
+	elseif sub == "query" then
+		WA.SendThreatQuery(tonumber(limitArg))
+	elseif sub == "report" then
+		threatReport()
+	else
+		D.Log("  [twt] unknown \"" .. sub .. "\".")
+		threatHelp()
+	end
+end
+
+-- ---------------------------------------------------------------------------
 -- Slash dispatch. Called from OptionsFrame.lua's /wa handler whenever the
 -- command has an argument; a bare /wa still opens the options window.
 -- ---------------------------------------------------------------------------
@@ -2960,6 +3237,8 @@ function D.HandleSlash(msg)
 		D.LinkProbe()
 	elseif cmd == "commprobe" then
 		D.CommProbe(rest)
+	elseif cmd == "threat" then
+		D.Threat(rest)
 	elseif cmd == "cdtest" then
 		D.CooldownTest()
 	elseif cmd == "swipetest" then
@@ -3028,6 +3307,6 @@ function D.HandleSlash(msg)
 		ensureFrame()
 		frame:Hide()
 	else
-		D.Log("[debug] unknown command \"" .. cmd .. "\". Available: dump [unit] [filter], watch [unit], events [EVENT ...], auraprobe [unit|all], overflow [unit], timers, linkprobe, commprobe [charname|throttle [channel] [rate] [secs]], cdtest, swipetest [sizes/WxH...], swipenudge <k> [yflat], track <spellName>, states <id>, conditions <id>, gen <id>, load <id>, probe, soundprobe, gcd, cdprobe <spell>, ver [version], codeprobe, textprobe, texprobe, plateprobe, wa2probe, wa2 <string>, codelive, codetab <1-8|tabs>, codefont <6-16>, rows, configtest, libs, addons, export <id>, import, clear, show, hide")
+		D.Log("[debug] unknown command \"" .. cmd .. "\". Available: dump [unit] [filter], watch [unit], events [EVENT ...], auraprobe [unit|all], overflow [unit], timers, linkprobe, commprobe [charname|throttle [channel] [rate] [secs]], threat [send|query|tm|report|off], cdtest, swipetest [sizes/WxH...], swipenudge <k> [yflat], track <spellName>, states <id>, conditions <id>, gen <id>, load <id>, probe, soundprobe, gcd, cdprobe <spell>, ver [version], codeprobe, textprobe, texprobe, plateprobe, wa2probe, wa2 <string>, codelive, codetab <1-8|tabs>, codefont <6-16>, rows, configtest, libs, addons, export <id>, import, clear, show, hide")
 	end
 end

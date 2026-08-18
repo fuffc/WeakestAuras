@@ -50,8 +50,16 @@ local lastCompiled = {}
 local compilingId
 local unresolvedIds = {}
 
-local function noteUnresolved()
-	if compilingId then unresolvedIds[compilingId] = true end
+-- Keyed by the name that failed, so a display waiting on two of them says both.
+-- Never printed: an item cache is cold at every login, so the common case is a
+-- name that resolves a moment later and the recompile sweep clears it -- a chat
+-- line would fire on every login and mean nothing.
+local function noteUnresolved(input)
+	if not compilingId then return end
+	unresolvedIds[compilingId] = true
+	WA.ReportForAura(compilingId, "unresolved:" .. tostring(input), "warning",
+		"[" .. tostring(compilingId) .. "] \"" .. tostring(input)
+			.. "\" is not a spell or item this client can name yet, so the trigger using it stays dark.")
 end
 
 -- Whether any compiled display is still waiting on a name the client cannot
@@ -426,7 +434,7 @@ function WA.ResolveSpellID(input)
 		local info = C_Spell.GetSpellInfo(input)
 		if info and info.spellID then return info.spellID end
 	end
-	noteUnresolved()
+	noteUnresolved(input)
 	return nil
 end
 
@@ -601,7 +609,7 @@ function WA.ResolveItemID(input)
 		if id2 then return id2 end
 	end
 	local byName = WA.ItemIDByName(input)
-	if byName == nil then noteUnresolved() end
+	if byName == nil then noteUnresolved(input) end
 	return byName
 end
 
@@ -2935,19 +2943,28 @@ PROTOTYPES["rangecheck"] = {
 	},
 }
 
--- Threat, static progress. No Lua threat API on 1.12; TWThreat drives Turtle's
--- server-side threat query and broadcasts it. We consume its CHAT_MSG_ADDON
--- packets via WA.WatchThreat (below) and never send, so there's no protocol
--- risk -- it just needs someone in the group running TWThreat and an elite/boss
--- target for packets to arrive. `exists` stays false (trigger hidden) until the
--- first packet naming the player lands. threatpct is 0..100 (the player's threat
--- as a percentage of the tank's / aggro threshold).
+-- Threat, static progress (value/total = pullPct/100, so a bar fills as the mob
+-- is about to change hands). No Lua threat API on 1.12: Turtle answers a
+-- server-side threat query sent as an addon message, with a table of the top N
+-- players on the requester's own target. WA.WatchThreat (below) consumes the
+-- reply and sends the query, standing down for anything else on this client
+-- that is already asking -- so this needs a party or raid and an elite target,
+-- but not TWThreat. `exists` stays false (trigger hidden) until a packet naming
+-- the player lands, and goes false again on a target change or when combat ends.
+--
+-- The two halves of a threat display come off the same rival calculation: not
+-- holding the mob, the rival is whoever does and pullGap is the threat left
+-- before the player rips it; holding it, the rival is the closest challenger and
+-- pullGap is the lead over them. pullPct is the same race as 0..100, threatDiff
+-- the plain signed difference. threatpct is the server's own number -- each row's
+-- share of its own pull threshold, so it describes whichever row it sits on
+-- rather than the player -- so prefer the computed fields.
 PROTOTYPES["threat"] = {
-	displayName = "Threat (TWThreat)",
+	displayName = "Threat",
 	wa2Event = "Threat Situation",
 	category = "unit",
 	progressType = "static",
-	progressValue = "threatpct",
+	progressValue = "pullPct",
 	progressTotal = "threatmax",
 	events = function() return { "WA_THREAT_CHANGED", "PLAYER_TARGET_CHANGED" } end,
 	force_events = true,
@@ -2955,16 +2972,50 @@ PROTOTYPES["threat"] = {
 	icon = "Interface\\Icons\\Ability_Threaten",
 	iconFunc = function() return "Interface\\Icons\\Ability_Threaten" end,
 	nameFunc = function() return "Threat" end,
-	init = function()
-		return "local threatpct, isTanking, exists = WeakestAuras.ThreatInfo()\n"
-			.. "local threatmax = 100"
-	end,
+	init = function() return "local ts = WeakestAuras.ThreatInfo()" end,
 	args = {
-		{ name = "exists", type = "hidden", required = true, test = "exists" },
-		{ name = "threatpct", type = "number", display = "Threat (%)", operator = ">=",
-			store = true, conditionType = "number" },
-		{ name = "threatmax", type = "hidden", store = true, conditionType = "number", display = "Threat Max" },
-		{ name = "isTanking", type = "hidden", store = true, conditionType = "bool", display = "Tanking" },
+		{ name = "exists", type = "hidden", required = true, init = "ts.exists", test = "exists" },
+		{ name = "pullPct", type = "number", display = "Aggro Race (%)", operator = ">=",
+			init = "ts.pullPct or 0", multiEntry = true, store = true, conditionType = "number" },
+		{ name = "pullGap", type = "number", display = "Threat Until Swap",
+			init = "ts.pullGap or 0", multiEntry = true, store = true, conditionType = "number" },
+		{ name = "threatDiff", type = "number", display = "Threat Difference",
+			init = "ts.threatDiff or 0", multiEntry = true, store = true, conditionType = "number" },
+		{ name = "threat", type = "number", display = "Own Threat",
+			init = "ts.threat or 0", store = true, conditionType = "number" },
+		{ name = "threatpct", type = "number", display = "Threat (%, server's)", operator = ">=",
+			init = "ts.threatpct or 0", store = true, conditionType = "number" },
+		{ name = "threatcount", type = "number", display = "Players Listed",
+			init = "ts.threatcount or 0", store = true, conditionType = "number" },
+		{ name = "aggro", type = "select", display = "Aggro",
+			valueList = { "any", "tanking", "notTanking" },
+			valueLabels = { any = "Ignore", tanking = "Holding Aggro", notTanking = "Not Holding Aggro" },
+			default = "any", test = function(trigger)
+				if not trigger.use_aggro or trigger.aggro == "any" then return nil end
+				return trigger.aggro == "tanking" and "isTanking" or "(not isTanking)"
+			end },
+		{ name = "threatmax", type = "hidden", init = "ts.threatmax or 100",
+			store = true, conditionType = "number", display = "Threat Max" },
+		{ name = "isTanking", type = "hidden", init = "ts.isTanking and true or false",
+			store = true, conditionType = "bool", display = "Tanking" },
+		{ name = "melee", type = "hidden", init = "ts.melee and true or false",
+			store = true, conditionType = "bool", display = "In Melee Range" },
+		{ name = "tankName", type = "hidden", init = "ts.tankName",
+			store = true, conditionType = "string", display = "Aggro Holder" },
+		{ name = "tankThreat", type = "hidden", init = "ts.tankThreat or 0",
+			store = true, conditionType = "number", display = "Aggro Holder Threat" },
+		{ name = "rivalName", type = "hidden", init = "ts.rivalName",
+			store = true, conditionType = "string", display = "Rival" },
+		{ name = "rivalThreat", type = "hidden", init = "ts.rivalThreat or 0",
+			store = true, conditionType = "number", display = "Rival Threat" },
+		-- Stored so a display can anchor itself to the mob's own nameplate: the
+		-- NAMEPLATE anchor resolves state.unit, falling back to state.guid.
+		{ name = "unit", type = "hidden", init = "ts.unit", store = true,
+			conditionType = "string", display = "Unit" },
+		{ name = "guid", type = "hidden", init = "ts.guid", store = true,
+			conditionType = "string", display = "GUID" },
+		{ name = "targetName", type = "hidden", init = "ts.targetName",
+			store = true, conditionType = "string", display = "Target Name" },
 	},
 }
 
@@ -3307,14 +3358,29 @@ local equipCdWatch = newCooldownWatcher({
 function WA.WatchEquipSlotCooldown(slot, wantTick) equipCdWatch.Watch(slot, wantTick) end
 function WA.EquipSlotCdInfo(slot) return equipCdWatch.Info(slot) end
 
--- Threat watcher: parses TWThreat's CHAT_MSG_ADDON broadcasts into a cached
-	-- threat percentage for the player, re-emitting WA_THREAT_CHANGED so the threat
--- prototype re-reads it (the incoming addon message is just another event
--- feeding a status update -- fits the existing model with no engine change).
--- Packet body: "...TWTv4=name:tank:threat:perc:melee:extra;name2:...;" (ref
--- TWThreat.lua handleThreatPacket). Plain string.find/sub splitting -- this
--- client's Lua 5.0 has no gmatch, and the fields are magic-char-free anyway.
-local threatCache = { pct = 0, isTanking = false, exists = false }
+-- Threat watcher: parses the packet Turtle's server-side threat query answers
+-- into a cached table describing every player in it, re-emitting
+-- WA_THREAT_CHANGED so the threat prototype re-reads it (the incoming addon
+-- message is just another event feeding a status update -- fits the existing
+-- model with no engine change).
+--
+-- Packet body: "TWTv4=name:tank:threat:perc:melee;name2:...", five fields to a
+-- row and no trailing separator, optionally followed by "#TMTv1=..." when the
+-- meter runs in tank mode (ref TWThreat.lua handleThreatPacket). The
+-- addon-message prefix is deliberately not checked: the reply is the server's,
+-- and it arrives on "TWT " -- with the trailing space -- where TWThreat's own
+-- traffic is "TWT", so an exact prefix test drops every packet. TWThreat itself
+-- matches the "TWTv4=" marker alone. Plain string.find/sub splitting; this
+-- client's Lua 5.0 has no gmatch and the fields are magic-char-free anyway.
+--
+-- `tank` marks whoever currently holds the mob, which is not the same as top
+-- threat: a challenger only takes it at 110% of the holder's threat in melee
+-- range and 130% out of it, and each row carries its own melee flag. `perc` is
+-- the row's own share of that threshold, so the holder always reads 100 and a
+-- challenger reads what pullPct derives below. It is kept as-is and derived
+-- from rather than trusted: it is a percentage of *that row's* race, which is
+-- the player's only while the player is the one being raced.
+local threatCache = { exists = false }
 local threatFrame
 local function splitStr(s, sep)
 	local out, pos = {}, 1
@@ -3328,30 +3394,287 @@ local function splitStr(s, sep)
 end
 function WA.WatchThreat()
 	if threatFrame then return end
+
+	-- One packet's rows reduced to what the prototype stores. `rival` is whoever
+	-- the player is racing for the mob -- the closest challenger when holding it,
+	-- the holder otherwise -- and `limit` the threat that flips it, always taken
+	-- against the challenger's own melee flag.
+	local function digest(rows, count, meRow, tankRow)
+		local d = {
+			exists = true, threatcount = count,
+			threat = meRow.threat, threatpct = meRow.perc, threatmax = 100,
+			melee = meRow.melee, isTanking = meRow.tank,
+			tankName = tankRow and tankRow.name, tankThreat = tankRow and tankRow.threat or 0,
+			unit = "target", guid = UnitGUID and UnitGUID("target") or nil,
+			targetName = UnitName("target"),
+			rivalThreat = 0, threatDiff = 0, pullGap = 0, pullPct = 0,
+		}
+		local rival, limit
+		if meRow.tank then
+			for i = 1, count do
+				local r = rows[i]
+				if r ~= meRow then
+					local l = meRow.threat * (r.melee and 1.1 or 1.3)
+					if not rival or (l - r.threat) < (limit - rival.threat) then rival, limit = r, l end
+				end
+			end
+		elseif tankRow then
+			rival, limit = tankRow, tankRow.threat * (meRow.melee and 1.1 or 1.3)
+		end
+		if rival then
+			-- Rounded at the source: the threshold multiplier makes both a float, and
+			-- a raw one reaches a %pullGap text as fifteen digits of noise.
+			local challenger = meRow.tank and rival.threat or meRow.threat
+			d.rivalName = rival.name
+			d.rivalThreat = rival.threat
+			d.threatDiff = meRow.threat - rival.threat
+			d.pullGap = math.floor(limit - challenger + 0.5)
+			d.pullPct = limit > 0 and (math.floor(challenger / limit * 1000 + 0.5) / 10) or 0
+		end
+		return d
+	end
+
 	threatFrame = CreateFrame("Frame")
-	-- Guarded like every other event registration here (risk (c)); CHAT_MSG_ADDON
-	-- is a native 1.12 event so it should always take.
+	-- Guarded like every other event registration here (risk (c)); all three are
+	-- native 1.12 events so they should always take.
 	pcall(threatFrame.RegisterEvent, threatFrame, "CHAT_MSG_ADDON")
+	pcall(threatFrame.RegisterEvent, threatFrame, "PLAYER_TARGET_CHANGED")
+	pcall(threatFrame.RegisterEvent, threatFrame, "PLAYER_REGEN_ENABLED")
+	pcall(threatFrame.RegisterEvent, threatFrame, "PLAYER_REGEN_DISABLED")
 	threatFrame:SetScript("OnEvent", function()
-		if arg1 ~= "TWT" or not arg2 then return end
+		-- A packet describes the mob the meter last asked about, so a new target,
+		-- the start of a fight or the end of one invalidates it wholesale --
+		-- otherwise the display keeps counting threat on something that is no
+		-- longer being fought.
+		if event ~= "CHAT_MSG_ADDON" then
+			if threatCache.exists then
+				threatCache = { exists = false }
+				WA.ScanEvents("WA_THREAT_CHANGED")
+			end
+			WA.ThreatPollOnEvent(event)
+			-- The two moments a threat list is new and nobody has asked about it
+			-- yet. Combat start is here because at the pull the target has not
+			-- changed, but the list it describes has only just come into being.
+			if event == "PLAYER_TARGET_CHANGED" or event == "PLAYER_REGEN_DISABLED" then
+				WA.ThreatQueryOnSwitch()
+			end
+			return
+		end
+		if not arg2 then return end
 		local s, e = string.find(arg2, "TWTv4=", 1, true)
 		if not s then return end
-		local players = splitStr(string.sub(arg2, e + 1), ";")
+		-- Counted before the body is read, and before the player's own row is
+		-- required: a packet that left the player out still proves somebody asked.
+		WA.ThreatQueryOnReply()
+		local body = string.sub(arg2, e + 1)
+		local tm = string.find(body, "#", 1, true)
+		if tm then body = string.sub(body, 1, tm - 1) end
+		local players = splitStr(body, ";")
 		local me = UnitName("player")
-		local found = false
+		local rows, count, meRow, tankRow = {}, 0, nil, nil
 		for i = 1, table.getn(players) do
 			local f = splitStr(players[i], ":")
-			if f[1] == me and f[4] then
-				threatCache.pct = tonumber(f[4]) or 0
-				threatCache.isTanking = f[2] == "1"
-				threatCache.exists = true
-				found = true
+			if f[1] and f[2] and f[3] and f[4] and f[5] then
+				count = count + 1
+				rows[count] = { name = f[1], tank = f[2] == "1", threat = tonumber(f[3]) or 0,
+					perc = tonumber(f[4]) or 0, melee = f[5] == "1" }
+				if f[1] == me then meRow = rows[count] end
+				if rows[count].tank then tankRow = rows[count] end
 			end
 		end
-		if found then WA.ScanEvents("WA_THREAT_CHANGED") end
+		-- The query carries a row limit, so a packet can leave the player out; there
+		-- is nothing to report against until one includes them.
+		if not meRow then return end
+		threatCache = digest(rows, count, meRow, tankRow)
+		WA.ScanEvents("WA_THREAT_CHANGED")
 	end)
 end
-function WA.ThreatInfo() return threatCache.pct, threatCache.isTanking, threatCache.exists end
+function WA.ThreatInfo() return threatCache end
+
+-- The other half of the protocol: the query the reply above answers. The server
+-- reads the requester's own selection, so this asks about `target` and nothing
+-- else, and it answers whoever asked -- a reply is not broadcast to the channel.
+--
+-- Wrapped in a block because this file's main chunk sits against Lua's ceiling
+-- of 200 simultaneously-active locals. Three more at file scope tip it over,
+-- and the failure is not symmetric: Lua 5.0.3 still compiles the file, so
+-- `luac50 -p` passes it and only the harness refuses to load it. Anything added
+-- here scopes its locals the same way.
+--
+-- The gate is most of the work here. One request feeds every consumer on the
+-- client through CHAT_MSG_ADDON, so a second sender buys nothing and costs the
+-- realm, and a request the server will refuse costs the same as one it answers.
+-- Hence the classification test: Turtle's handler declines a `normal` mob
+-- outright, which is measured rather than a guess at its `CanHaveThreatList`.
+-- `UnitClassification` returns untranslated tokens, so unlike `UnitCreatureType`
+-- it is safe to compare against; only `normal` is excluded, because `rare` and
+-- `rareelite` have not been shown to fail.
+do
+
+local THREAT_QUERY_PREFIX = "TWT_UDTSv4"
+-- What a display can use, not the maximum: the packet costs bytes and the rows
+-- past the aggro holder and the player's own are only there to find the closest
+-- challenger. A player far enough down a raid's list to fall outside this gets
+-- no row and the trigger stays hidden, which is the trade this number sets.
+local THREAT_QUERY_LIMIT = 5
+
+local function threatTriggerLoaded()
+	local map = loaded_events["WA_THREAT_CHANGED"]
+	if not map then return false end
+	for _ in pairs(map) do return true end
+	return false
+end
+
+-- nil when a query is worth making, else the clause that refused it.
+function WA.ThreatQueryRefusal()
+	if not threatTriggerLoaded() then return "no threat trigger is loaded" end
+	if not ((GetNumRaidMembers and GetNumRaidMembers() > 0)
+		or (GetNumPartyMembers and GetNumPartyMembers() > 0)) then
+		return "not in a party or raid"
+	end
+	if not UnitExists("target") then return "no target" end
+	if UnitIsPlayer("target") then return "the target is a player" end
+	if UnitIsDead("target") then return "the target is dead" end
+	if not UnitCanAttack("player", "target") then return "the target is not attackable" end
+	if UnitClassification("target") == "normal" then
+		return "the server does not answer for a normal mob"
+	end
+	-- The player's own combat, not the target's. A mob somebody else is fighting
+	-- has a threat list with no row for a player who has not touched it, so there
+	-- is nothing for a display to show and, as it happens, nothing the server
+	-- answers with. This does not lose the pull: PLAYER_REGEN_DISABLED is the
+	-- player entering combat, so the clause is already true when it fires.
+	if not UnitAffectingCombat("player") then return "the player is not in combat" end
+	return nil
+end
+
+-- Who asked. A reply reaches only the client that asked for it, but every addon
+-- in that client's process sees it, so a reply this file cannot account for is
+-- proof that something else here is querying -- which is the whole of the
+-- detection below.
+--
+-- Accounting is a queue of our own outstanding requests expired by age, not a
+-- single "awaiting ours" flag. The flag is simpler and wrong: one request the
+-- server never answers would consume the next foreign reply, and then the one
+-- after that, for the rest of the session -- the poll would never stand down
+-- again. Expiring by age makes that failure decay instead of latch.
+--
+-- The window is four times the worst round trip measured against the live
+-- server (0.08-0.17s) and shorter than the poll, so a request the server drops
+-- has aged out before the next one is due.
+local THREAT_REPLY_WINDOW = 0.75
+local ourRequests = {}
+local lastForeignReply = 0
+
+local function expireRequests(now)
+	while ourRequests[1] and now - ourRequests[1] > THREAT_REPLY_WINDOW do
+		table.remove(ourRequests, 1)
+	end
+end
+
+local function noteOurRequest(now)
+	expireRequests(now)
+	table.insert(ourRequests, now)
+end
+
+-- One reply, against the requests of ours still young enough to be answered.
+function WA.ThreatQueryOnReply()
+	local now = GetTime()
+	expireRequests(now)
+	if ourRequests[1] then table.remove(ourRequests, 1) else lastForeignReply = now end
+end
+
+-- false plus the refusing clause, or true plus what went out -- the latter so a
+-- caller can report the route as well as the payload, which is the only thing
+-- that separates "the message never left" from "nobody answered it".
+-- WA.OnThreatQuery, when something has set it, sees every outcome: (info) for a
+-- request that left and (nil, reason) for one the gate stopped. Without it the
+-- automatic path is unobservable -- a query that was never sent and one the
+-- server ignored look identical from outside -- and that is the difference a
+-- session watching this protocol most often needs.
+function WA.SendThreatQuery(limit)
+	local why = WA.ThreatQueryRefusal()
+	if why then
+		if WA.OnThreatQuery then WA.OnThreatQuery(nil, why) end
+		return false, why
+	end
+	local channel = (GetNumRaidMembers and GetNumRaidMembers() > 0) and "RAID" or "PARTY"
+	local msg = "limit=" .. (limit or THREAT_QUERY_LIMIT)
+	WA.SendAddonMessageThrottled(THREAT_QUERY_PREFIX, msg, channel)
+	noteOurRequest(GetTime())
+	local info = { prefix = THREAT_QUERY_PREFIX, msg = msg, channel = channel }
+	if WA.OnThreatQuery then WA.OnThreatQuery(info) end
+	return true, info
+end
+
+-- Tab-targeting through a pack must cost one request, not one per mob.
+local THREAT_SWITCH_THROTTLE = 0.3
+-- The request names no unit: the server answers about whatever
+-- `GetSelectedCreature()` says the player has selected, so it has to arrive
+-- *after* the client's own CMSG_SET_SELECTION for the new target. Sending from
+-- inside the PLAYER_TARGET_CHANGED handler races that packet and loses about ten
+-- times in eleven, which reads as the server ignoring us. Never send in the
+-- event's own frame; this wait is the fix and not a tuning knob.
+local THREAT_SWITCH_SETTLE = 0.15
+local lastSwitchSend, switchPending = 0, false
+
+-- A target change or a pull, deferred and throttled. Deferred rather than
+-- dropped, and that is the point: dropping leaves the one mob the player
+-- actually settled on as the one nobody asked about. One timer serves a whole
+-- burst, and the gate runs again when it fires, because what armed it may be
+-- dead, gone, or a player by then.
+function WA.ThreatQueryOnSwitch()
+	if switchPending then return end
+	local wait = THREAT_SWITCH_THROTTLE - (GetTime() - lastSwitchSend)
+	if wait < THREAT_SWITCH_SETTLE then wait = THREAT_SWITCH_SETTLE end
+	switchPending = true
+	C_Timer.After(wait, function()
+		switchPending = false
+		-- Only a request that went out arms the throttle; a refusal is not traffic.
+		if WA.SendThreatQuery() then lastSwitchSend = GetTime() end
+	end)
+end
+
+-- The timed query, and the only part of this that stands down. A switch request
+-- keeps going out during a hold-off: it costs one message per target change and
+-- it is the latency win, where the timer is the sustained traffic.
+local THREAT_POLL = 1
+-- Twice TWThreat's slowest poll, so one late tick of somebody else's timer does
+-- not hand us their fight. Conservative on purpose: what a raid's worth of
+-- clients does to the server is not measurable from here.
+local THREAT_HOLDOFF = 2.5
+local pollTicker
+
+local function pollTick()
+	if GetTime() - lastForeignReply < THREAT_HOLDOFF then
+		-- Reported, because a poll that has stood down and a poll that never ran
+		-- are the same silence from outside and only one of them is right.
+		if WA.OnThreatQuery then WA.OnThreatQuery(nil, "something else on this client is asking") end
+		return
+	end
+	WA.SendThreatQuery()
+end
+
+-- The poll runs for the length of the player's own fight, which is the only
+-- stretch the gate can pass anyway.
+--
+-- The target-change reset is the load-bearing line. A hold-off is evidence
+-- about the mob it was collected on, and carrying it across a switch makes the
+-- takeover asymmetric: it goes quiet on time, but starts up a whole hold-off
+-- late on every elite->trash switch -- precisely the latency this exists to
+-- remove. Nothing has to notice that the other addon came back, either; its
+-- first reply re-arms the hold-off on its own.
+function WA.ThreatPollOnEvent(event)
+	if event == "PLAYER_TARGET_CHANGED" then
+		lastForeignReply = 0
+	elseif event == "PLAYER_REGEN_DISABLED" then
+		if not pollTicker then pollTicker = C_Timer.NewTicker(THREAT_POLL, pollTick) end
+	elseif event == "PLAYER_REGEN_ENABLED" then
+		if pollTicker then pollTicker:Cancel(); pollTicker = nil end
+	end
+end
+
+end
 
 -- Shared SPELL_GO_SELF dispatch: the totem and swing watchers both consume this
 -- Nampower event (arg1 itemId, 0 for a real spell cast; arg2 spellId -- ref
@@ -4270,21 +4593,30 @@ local function runTsuTrigger(ti, event, a1, a2, a3, a4, a5, a6, a7, a8, a9)
 	for key, state in pairs(states) do
 		if type(state) ~= "table" then bad = key; break end
 	end
+	local allstatesKey = "allstates:" .. ti.triggernum
 	if bad then
-		DEFAULT_CHAT_FRAME:AddMessage("|cffff0000WeakestAuras|r [" .. ti.id
-			.. "] all states table contains a non-table at key: " .. tostring(bad), 1, 0.3, 0.3)
+		WA.ReportForAura(ti.id, allstatesKey, "error", "[" .. ti.id
+			.. "] all states table contains a non-table at key: " .. tostring(bad), true)
 		local keys = {}
 		for key in pairs(states) do table.insert(keys, key) end
 		for i = 1, table.getn(keys) do states[keys[i]] = nil end
 		WA.StopStateTimers(ti.id, ti.triggernum)
 		return true
 	end
+	WA.ReportForAura(ti.id, allstatesKey)
 
+	-- Coerced rather than refused, which is upstream's StateShowNil: a state the
+	-- author never set `show` on is hidden, and saying so is the only way they find
+	-- out why. Never printed -- a trigger can leave it nil on one run and set it on
+	-- the next, so a chat line would come and go with the states.
+	local showWasNil
 	if ti.showNilIsFalse then
 		for _, state in pairs(states) do
-			if state.show == nil then state.show = false end
+			if state.show == nil then state.show = false; showWasNil = true end
 		end
 	end
+	WA.ReportForAura(ti.id, "shownil:" .. ti.triggernum, showWasNil and "warning" or nil,
+		"[" .. ti.id .. "] a custom trigger leaves `show` unset on a state, which reads as hidden.")
 
 	WA.StartStopStateTimers(ti.id, ti.triggernum, states)
 	return dirty
@@ -4477,6 +4809,7 @@ function GenericTrigger.Add(data)
 	local byTrigger = {}
 	events[data.id] = byTrigger
 	unresolvedIds[data.id] = nil
+	WA.ClearWarningPrefix(WA.WarningUidFor(data.id), "unresolved:")
 	compilingId = data.id
 
 	for triggernum = 1, table.getn(data.triggers) do
@@ -4679,6 +5012,7 @@ function GenericTrigger.Delete(id)
 	-- reciprocal-watch refusal depend only on this compile's own order.
 	watchedTriggers[id] = nil
 	unresolvedIds[id] = nil
+	WA.ClearWarningPrefix(WA.WarningUidFor(id), "unresolved:")
 	cancelWatchedDelivery(id)
 	WA.StopStateTimers(id)
 end

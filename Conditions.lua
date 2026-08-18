@@ -84,7 +84,9 @@ end
 -- GetTriggerConditions. [triggernum] = { variable = { display, type, values } }.
 function WA.GetConditionTemplates(data)
 	local out = {}
-	for triggernum = 1, table.getn(data.triggers) do
+	-- A group carries no triggers at all (MergeDefaults clears them), and its
+	-- options window still reaches here for the conditions tab.
+	for triggernum = 1, table.getn(data.triggers or {}) do
 		local system = WA.GetTriggerSystem(data, triggernum)
 		if system and system.GetTriggerConditions then
 			out[triggernum] = system.GetTriggerConditions(data, triggernum) or {}

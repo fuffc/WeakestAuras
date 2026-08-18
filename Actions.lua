@@ -372,6 +372,51 @@ function WA.RunActionCode(data, key, region)
 	return WA.RunAuraFunc(data.id, data.id .. ": " .. key, fn)
 end
 
+-- Whether this aura will make a noise, and how: four keyed warnings recomputed
+-- from `data` on every WA.Add, since that is when any of the four fields can have
+-- changed. Neither severity is a fault -- they exist so a user hunting a stray
+-- sound can find which aura is making it, and they pair with the login squelch
+-- (WA.SquelchingActions): the strip says which aura, the squelch buys time to fix
+-- it. Both fold under a `warning` or an `error`, which is what their rank means.
+--
+-- A condition change is matched on its property *name*, as upstream does, not on
+-- the resolved type: `sound` and `chat` are injected once per region type by
+-- proto.AddProperties and are never sub-region properties, so nothing prefixes
+-- them.
+function WA.UpdateSoundWarnings(data)
+	if not data or not data.uid or not WA.UpdateWarning then return end
+	local uid = data.uid
+	local actions = data.actions or {}
+	local start, finish = actions.start or {}, actions.finish or {}
+
+	local soundCondition, ttsCondition
+	local conditions = data.conditions or {}
+	for i = 1, table.getn(conditions) do
+		local changes = conditions[i].changes or {}
+		for c = 1, table.getn(changes) do
+			local change = changes[c]
+			if change.property == "sound" then
+				soundCondition = true
+			elseif change.property == "chat" and type(change.value) == "table"
+				and change.value.message_type == "TTS" then
+				ttsCondition = true
+			end
+		end
+	end
+
+	WA.UpdateWarning(uid, "sound_action",
+		(start.do_sound or finish.do_sound) and "sound" or nil,
+		"This aura plays a sound via an action.")
+	WA.UpdateWarning(uid, "sound_condition", soundCondition and "sound" or nil,
+		"This aura plays a sound via a condition.")
+	WA.UpdateWarning(uid, "tts_action",
+		((start.do_message and start.message_type == "TTS")
+			or (finish.do_message and finish.message_type == "TTS")) and "tts" or nil,
+		"This aura speaks via an action.")
+	WA.UpdateWarning(uid, "tts_condition", ttsCondition and "tts" or nil,
+		"This aura speaks via a condition.")
+end
+
 function WA.SquelchingActions()
 	local untilTime = WA.actionSquelchUntil
 	return untilTime and GetTime() < untilTime or false

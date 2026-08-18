@@ -552,13 +552,19 @@ function WA.CheckForAnchorCycle(source)
 	return false
 end
 
+-- The warning outlives the cycle on purpose, and is not in the namespaces WA.Add
+-- clears. Breaking the cycle is what this function *does*, so a clear keyed on
+-- "no cycle found" would fire on the very next recompile and take the notice away
+-- before the user could read it. It has no natural clear at all: the saved setting
+-- was destroyed, so the report stands until the aura is deleted or the session
+-- ends -- and losing it on a reload is correct, since the reset is not repeated.
 local function resetAnchorCycle(data)
 	if not data or not WA.CheckForAnchorCycle(data.id) then return false end
 	data.anchorFrameType = "UIPARENT"
 	data.anchorFrameFrame = nil
-	DEFAULT_CHAT_FRAME:AddMessage(
-		"|cffff0000WeakestAuras|r Warning: anchoring in aura '" .. tostring(data.id)
-			.. "' was reset because it creates an anchoring cycle.", 1, 0.3, 0.3)
+	WA.ReportForAura(data.id, "anchorcycle", "warning",
+		"Warning: anchoring in aura '" .. tostring(data.id)
+			.. "' was reset because it creates an anchoring cycle.", true)
 	return true
 end
 
@@ -730,13 +736,55 @@ function WA.RefreshMembership(childId, oldParent, newParent)
 	if newParent and newParent ~= oldParent then WA.RelayoutGroup(newParent) end
 end
 
+local addDisplay
+
+-- Brackets one re-derivation with the two things that have to span the whole of
+-- it -- the code-warning reset and the ambient attribution the compile reporters
+-- read -- and only then runs it. A wrapper rather than lines inside addDisplay
+-- because that has three exits and a group leaves by the first of them, which is
+-- exactly the path a dynamic group's custom sort, grow and anchor compile on.
 function WA.Add(data, simpleChange)
 	-- The aura list's row previews render this display's own appearance fields
 	-- (Regions.lua's modifyThumbnail), so any edit that reaches here -- including
 	-- the pure-visual fast path below -- has to repaint the row, not just the
 	-- region. WA.RefreshList is a no-op while the options panel is closed.
 	if WA.RefreshList then WA.RefreshList() end
+	-- Saved and restored rather than cleared to nil, so a nested Add cannot strand
+	-- the outer one's id -- a stale id is worse than none, since it misattributes
+	-- the next aura's failure instead of falling back to chat.
+	--
+	-- The pcall is what makes the restore unconditional, and it is load-bearing
+	-- rather than defensive: an Add that throws is caught by the safecall around it
+	-- (WA.AddMany), so without this the id would survive the failure and every
+	-- later compile in the session would be blamed on that one aura. The error is
+	-- re-raised at level 0 so the callers that already handle it still do.
+	local prevCompiling = WA.compilingAuraId
+	WA.compilingAuraId = data.id
+	-- Both code namespaces dropped *before* anything recompiles or re-dispatches,
+	-- and inside the bracket so the repaint they ask for is deferred with the rest.
+	-- This is what makes fixing a broken field take its warning away: the compile
+	-- and runtime reporters only ever set, so a failure that no longer happens
+	-- would otherwise stay on the row forever, which is worse than never having
+	-- reported it. Clearing also rearms the once-per-key chat line, so an edit
+	-- that leaves the code still broken says so again.
+	if WA.ClearWarningPrefix then
+		WA.ClearWarningPrefix(data.uid, "compile:")
+		WA.ClearWarningPrefix(data.uid, "runtime:")
+	end
+	local ok, err = pcall(addDisplay, data, simpleChange)
+	WA.compilingAuraId = prevCompiling
+	-- Every warning this Add changed lands on the row in one repaint, now that no
+	-- prototype's resolver can be re-entered under this aura's id.
+	if WA.FlushWarningRepaint then WA.FlushWarningRepaint() end
+	if not ok then error(err, 0) end
+end
+
+function addDisplay(data, simpleChange)
 	if WA.IsGroup(data) then WA.AddGroup(data); return end
+	-- Recomputed here rather than at each field's setter: four fields across two
+	-- action blocks and every condition decide it, and this is the one place all
+	-- of them have already been written.
+	if WA.UpdateSoundWarnings then WA.UpdateSoundWarnings(data) end
 	resetAnchorCycle(data)
 
 	local id = data.id

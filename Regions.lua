@@ -1293,6 +1293,27 @@ WA.RegisterRegionType("texture", {
 	end,
 })
 
+local function regionAnchor(display, point, area)
+	return { display = display, point = point, area = area }
+end
+
+-- Ahead of the registration below, not beside its sibling tables further down: a
+-- local declared after the closure that names it is a different variable, so
+-- getSubRegionAnchors would read a nil global and the icon would offer no
+-- sub-region anchor but the whole region.
+local ICON_SUB_ANCHORS = {
+	TOPLEFT = regionAnchor("Edge / Top Left", true), TOP = regionAnchor("Edge / Top", true), TOPRIGHT = regionAnchor("Edge / Top Right", true),
+	LEFT = regionAnchor("Edge / Left", true), CENTER = regionAnchor("Center", true), RIGHT = regionAnchor("Edge / Right", true),
+	BOTTOMLEFT = regionAnchor("Edge / Bottom Left", true), BOTTOM = regionAnchor("Edge / Bottom", true), BOTTOMRIGHT = regionAnchor("Edge / Bottom Right", true),
+	INNER_TOPLEFT = regionAnchor("Inner / Top Left", true), INNER_TOP = regionAnchor("Inner / Top", true), INNER_TOPRIGHT = regionAnchor("Inner / Top Right", true),
+	INNER_LEFT = regionAnchor("Inner / Left", true), INNER_CENTER = regionAnchor("Inner / Center", true), INNER_RIGHT = regionAnchor("Inner / Right", true),
+	INNER_BOTTOMLEFT = regionAnchor("Inner / Bottom Left", true), INNER_BOTTOM = regionAnchor("Inner / Bottom", true), INNER_BOTTOMRIGHT = regionAnchor("Inner / Bottom Right", true),
+	OUTER_TOPLEFT = regionAnchor("Outer / Top Left", true), OUTER_TOP = regionAnchor("Outer / Top", true), OUTER_TOPRIGHT = regionAnchor("Outer / Top Right", true),
+	OUTER_LEFT = regionAnchor("Outer / Left", true), OUTER_CENTER = regionAnchor("Outer / Center", true), OUTER_RIGHT = regionAnchor("Outer / Right", true),
+	OUTER_BOTTOMLEFT = regionAnchor("Outer / Bottom Left", true), OUTER_BOTTOM = regionAnchor("Outer / Bottom", true), OUTER_BOTTOMRIGHT = regionAnchor("Outer / Bottom Right", true),
+	ALL = regionAnchor("Whole area", nil, true),
+}
+
 WA.RegisterRegionType("icon", {
 	displayName = "Icon",
 	description = "A spell icon with a cooldown swipe, stacks and timer text.",
@@ -1578,23 +1599,6 @@ end
 local function isInverse(o)
 	return string.find(o, "INVERSE") ~= nil
 end
-
-local function regionAnchor(display, point, area)
-	return { display = display, point = point, area = area }
-end
-
-local ICON_SUB_ANCHORS = {
-	TOPLEFT = regionAnchor("Edge / Top Left", true), TOP = regionAnchor("Edge / Top", true), TOPRIGHT = regionAnchor("Edge / Top Right", true),
-	LEFT = regionAnchor("Edge / Left", true), CENTER = regionAnchor("Center", true), RIGHT = regionAnchor("Edge / Right", true),
-	BOTTOMLEFT = regionAnchor("Edge / Bottom Left", true), BOTTOM = regionAnchor("Edge / Bottom", true), BOTTOMRIGHT = regionAnchor("Edge / Bottom Right", true),
-	INNER_TOPLEFT = regionAnchor("Inner / Top Left", true), INNER_TOP = regionAnchor("Inner / Top", true), INNER_TOPRIGHT = regionAnchor("Inner / Top Right", true),
-	INNER_LEFT = regionAnchor("Inner / Left", true), INNER_CENTER = regionAnchor("Inner / Center", true), INNER_RIGHT = regionAnchor("Inner / Right", true),
-	INNER_BOTTOMLEFT = regionAnchor("Inner / Bottom Left", true), INNER_BOTTOM = regionAnchor("Inner / Bottom", true), INNER_BOTTOMRIGHT = regionAnchor("Inner / Bottom Right", true),
-	OUTER_TOPLEFT = regionAnchor("Outer / Top Left", true), OUTER_TOP = regionAnchor("Outer / Top", true), OUTER_TOPRIGHT = regionAnchor("Outer / Top Right", true),
-	OUTER_LEFT = regionAnchor("Outer / Left", true), OUTER_CENTER = regionAnchor("Outer / Center", true), OUTER_RIGHT = regionAnchor("Outer / Right", true),
-	OUTER_BOTTOMLEFT = regionAnchor("Outer / Bottom Left", true), OUTER_BOTTOM = regionAnchor("Outer / Bottom", true), OUTER_BOTTOMRIGHT = regionAnchor("Outer / Bottom Right", true),
-	ALL = regionAnchor("Whole area", nil, true),
-}
 
 local function progressbarAnchor(display, point, area)
 	return { display = display, point = point, area = area }

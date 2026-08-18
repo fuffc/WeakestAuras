@@ -165,13 +165,14 @@ local function customOptionIsValid(option)
 	return true
 end
 
+-- Keyed per index, and never cleared: the option is gone, so a validation pass
+-- after this one finds nothing corrupt and a clear keyed on that would take the
+-- notice away immediately. Deleting the aura is the only thing that drops it, and
+-- losing it on a reload is correct -- the deletion is not repeated.
 local function reportCorruptOption(data, index)
-	if DEFAULT_CHAT_FRAME and DEFAULT_CHAT_FRAME.AddMessage then
-		DEFAULT_CHAT_FRAME:AddMessage(
-			"|cffff0000WeakestAuras|r " .. tostring(data.id) .. " Custom Option #" .. index
-				.. " in " .. tostring(data.id) .. " has been detected as corrupt, and has been deleted.",
-			1, 0.3, 0.3)
-	end
+	WA.ReportForAura(data.id, "corruptoption:" .. index, "warning",
+		tostring(data.id) .. " Custom Option #" .. index .. " in " .. tostring(data.id)
+			.. " has been detected as corrupt, and has been deleted.", true)
 end
 
 local function validateUserConfig(data, options, config)

@@ -693,6 +693,52 @@ function proto.GetSubRegionAnchorPoint(key, fallback)
 	return point
 end
 
+local POINTS = {
+	CENTER = true, TOP = true, BOTTOM = true, LEFT = true, RIGHT = true,
+	TOPLEFT = true, TOPRIGHT = true, BOTTOMLEFT = true, BOTTOMRIGHT = true,
+}
+
+function proto.IsAnchorPoint(value)
+	return POINTS[value] == true
+end
+
+-- SetPoint raises "Unknown region point" on anything outside those nine, and the
+-- error escapes through whatever repaint it was in -- selection preview included,
+-- which is how a bad anchor makes an aura unclickable rather than merely
+-- misplaced. Saved data can hold a combined key ("OUTER_TOPLEFT", "SPARK") where
+-- a bare point belongs, so nothing reaches SetPoint without passing through here.
+function proto.ResolveAnchorPoint(value, fallback)
+	fallback = POINTS[fallback] and fallback or "CENTER"
+	if POINTS[value] then return value end
+	if type(value) ~= "string" then return fallback end
+	local point = proto.GetSubRegionAnchorPoint(value, fallback)
+	return POINTS[point] and point or fallback
+end
+
+local INVERSE_POINTS = {
+	TOPLEFT = "BOTTOMRIGHT", TOP = "BOTTOM", TOPRIGHT = "BOTTOMLEFT",
+	LEFT = "RIGHT", CENTER = "CENTER", RIGHT = "LEFT",
+	BOTTOMLEFT = "TOPRIGHT", BOTTOM = "TOP", BOTTOMRIGHT = "TOPLEFT",
+}
+
+-- The self point upstream's AUTO derives (WA2 SubText.lua): on an icon it reads
+-- the anchored part -- inside keeps the point, outside inverts it so the text
+-- sits clear of the edge -- a bar keeps the point, anything else inverts. Ours
+-- stores a real self point instead of resolving AUTO at paint time, so this is
+-- what fills it in when the anchor comes from upstream.
+function proto.AutoSelfPoint(anchorKey, point, regionType)
+	point = proto.ResolveAnchorPoint(point, "CENTER")
+	if regionType == "icon" then
+		if type(anchorKey) == "string" then
+			if string.sub(anchorKey, 1, 6) == "INNER_" then return point end
+			if string.sub(anchorKey, 1, 6) == "OUTER_" then return INVERSE_POINTS[point] end
+		end
+		return "CENTER"
+	end
+	if regionType == "progressbar" then return point end
+	return INVERSE_POINTS[point]
+end
+
 function proto.GetSubRegionAnchors(parentData, mode)
 	local spec = WA.RegionSpecFor(parentData)
 	local anchors = spec and spec.getSubRegionAnchors and spec.getSubRegionAnchors(parentData) or {}
@@ -724,6 +770,14 @@ function proto.AnchorSubRegion(frame, parent, subData, defaults)
 		yOffset = subRegionAnchorValue(parent, subData, "anchorYOffset", subData.border_offset or defaults.y or 0)
 	else
 		targetKey = subRegionAnchorValue(parent, subData, "anchor_target", defaults.target or "region")
+		-- Upstream stores the anchored part and the point in one value; ours splits
+		-- them across anchor_target and anchor_point. A combined value sitting in
+		-- anchor_point therefore names the part too, unless a target was picked
+		-- separately.
+		if not subData.anchor_target and type(subData.anchor_point) == "string"
+			and not proto.IsAnchorPoint(subData.anchor_point) then
+			targetKey = subData.anchor_point
+		end
 		if subData.anchor_point then
 			targetPoint = subData.anchor_point
 		elseif subData.anchor_target then
@@ -732,6 +786,8 @@ function proto.AnchorSubRegion(frame, parent, subData, defaults)
 			targetPoint = subRegionAnchorValue(parent, subData, "anchor_point", defaults.anchorPoint or "CENTER")
 		end
 		selfPoint = subRegionAnchorValue(parent, subData, "self_point", defaults.selfPoint or targetPoint or "CENTER")
+		targetPoint = proto.ResolveAnchorPoint(targetPoint, "CENTER")
+		selfPoint = proto.ResolveAnchorPoint(selfPoint, targetPoint)
 		xOffset = subRegionAnchorValue(parent, subData, "anchorXOffset", defaults.x or 0)
 		yOffset = subRegionAnchorValue(parent, subData, "anchorYOffset", defaults.y or 0)
 	end

@@ -44,7 +44,10 @@ local S = {
 	-- side at the default window size, so pinning it changed no tab's layout.
 	CONTENT_W = 442,
 	INDENT_W = 14,
-	STATUS_SIZE = 10,
+	-- Matches upstream's own strip and the 16px eye beside it. The strip grows
+	-- leftward from the eye and the trigger summary is pinned to its left edge,
+	-- so this number is what each entry costs that summary.
+	STATUS_SIZE = 16,
 	UNGROUP_W = 12,
 	-- The New pane's rows: a 32px preview plus two lines of text.
 	NEW_ROW_H = 40,
@@ -665,6 +668,17 @@ function S.getInfoOptions(data)
 		-- (upstream never surfaces it in the Information tab either).
 		{ type = "button", name = "Export", onClick = function() S.openExport(data.id) end },
 	}
+	-- Every warning this aura has, titled by the worst severity -- the block the
+	-- row's status icon click arrives at. Upstream puts it midway down its own
+	-- Information tab; here it sits above everything else, because landing on it
+	-- is that click's whole purpose. A group reaches this too, for its own
+	-- warnings only: a click on a group's row icon goes to the offending leaf
+	-- unless the group itself is what is broken.
+	local _, warnTitle, warnBody = WA.FormatWarnings(data.uid)
+	if warnTitle and warnBody then
+		table.insert(fields, 2, { type = "header", name = warnTitle })
+		table.insert(fields, 3, { type = "description", name = warnBody })
+	end
 	-- The only way to promote a grouped aura back to top level: the tree's
 	-- drag-and-drop only ever reorders within the dragged item's current
 	-- parent (see buildPanel's trackDrag) since a drop boundary between two
@@ -1901,12 +1915,8 @@ function S.acquireStatusIcon(parent)
 	if not icon then
 		icon = CreateFrame("Button", nil, parent)
 		icon:SetWidth(S.STATUS_SIZE); icon:SetHeight(S.STATUS_SIZE)
-		local bg = icon:CreateTexture(nil, "BACKGROUND")
-		bg:SetAllPoints(icon)
-		bg:SetTexture(0, 0, 0, 0.9)
 		local fill = icon:CreateTexture(nil, "ARTWORK")
-		fill:SetPoint("TOPLEFT", icon, "TOPLEFT", 1, -1)
-		fill:SetPoint("BOTTOMRIGHT", icon, "BOTTOMRIGHT", -1, 1)
+		fill:SetAllPoints(icon)
 		icon.fill = fill
 		icon:SetScript("OnEnter", function()
 			GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
@@ -1932,15 +1942,14 @@ function S.releaseStatusIcon(icon)
 	table.insert(S.statusPool, icon)
 end
 
--- The load entry's three looks. Colours rather than art: at 10px a texture
--- reads as a smudge, and load state is the one status where the colour alone
--- carries the meaning.
+-- The load entry's three looks, upstream's own art through the same strip the
+-- warning severities use.
 local LOAD_STATUS = {
-	loaded = { tex = { 0.3, 0.9, 0.3, 1 }, title = "Loaded",
+	loaded = { tex = WA.STATUS_TEXTURES .. "loaded.tga", title = "Loaded",
 		desc = "This aura's load conditions currently pass." },
-	standby = { tex = { 0.95, 0.75, 0.2, 0.9 }, title = "Standby",
+	standby = { tex = WA.STATUS_TEXTURES .. "standby.tga", title = "Standby",
 		desc = "This aura belongs to this character, but the moment doesn't qualify -- a combat, zone, group or form condition is holding it back." },
-	unloaded = { tex = { 0.5, 0.5, 0.5, 1 }, title = "Not Loaded",
+	unloaded = { tex = WA.STATUS_TEXTURES .. "unloaded.tga", title = "Not Loaded",
 		desc = "This aura's load conditions don't currently pass, so it isn't active." },
 }
 
@@ -2201,6 +2210,46 @@ local function paintAuraRow(row, entry)
 			if nStandby > 0 then desc = desc .. ", " .. nStandby .. " on standby" end
 		end
 		row.setStatus("load", 1, look.tex, look.title, desc)
+	end
+	-- One warning entry carrying the worst severity, where upstream renders one
+	-- icon per severity. The summary line is pinned to the strip's left edge, so
+	-- each extra icon truncates it -- at LIST_W a child row's summary starts with
+	-- about 86px and every entry costs 18 of them.
+	local wIcon, wTitle, wBody, wLook, wOffender
+	if isGroup then
+		-- A group's own warnings *and* its leaves', worst wins. Its own are not
+		-- hypothetical: a dynamic group's custom sort, grow and per-unit anchor are
+		-- three user-code fields that live on the group, so a group row is the only
+		-- place a failure in one of them can be reported. A leaf that beats it
+		-- carries the offender's id, so the click lands on the fault rather than on
+		-- a container that only contains it.
+		local bestRank
+		local own = WA.MaxWarningSeverity(data.uid)
+		if own then bestRank = WA.WarningRank(own) end
+		local leaves = S.leafDescendants(id)
+		for i = 1, table.getn(leaves) do
+			local child = WeakestAurasDB.displays[leaves[i]]
+			local severity = child and WA.MaxWarningSeverity(child.uid)
+			local rank = severity and WA.WarningRank(severity)
+			if rank and (not bestRank or rank > bestRank) then
+				wOffender, bestRank = leaves[i], rank
+			end
+		end
+		if wOffender then
+			wIcon, wTitle, wBody, wLook = WA.FormatWarnings(WeakestAurasDB.displays[wOffender].uid)
+			wBody = wOffender .. ": " .. (wBody or "")
+		elseif bestRank then
+			wIcon, wTitle, wBody, wLook = WA.FormatWarnings(data.uid)
+		end
+	else
+		wIcon, wTitle, wBody, wLook = WA.FormatWarnings(data.uid)
+	end
+	if wIcon then
+		local target = wOffender or id
+		row.setStatus("warning", 5, wIcon, wTitle, wBody, function()
+			S.setSelection(target)
+			S.selectTab("info")
+		end, wLook)
 	end
 	-- Releases every entry this repaint didn't re-set, so a status that stopped
 	-- applying doesn't ride the row into its next aura.
@@ -3168,7 +3217,12 @@ local function buildPanel()
 			for _, entry in pairs(row.statuses) do entry.stale = true end
 		end
 
-		row.setStatus = function(key, prio, tex, title, desc, onClick)
+		-- `look` is optional and carries what the art needs past its path: a `color`
+		-- vertex tint, and `flip` to turn a glyph the half-turn its own frame drew it
+		-- against. Both are written on *every* set rather than only when given: the
+		-- icons pool across rows, so an entry wanting neither would inherit the tint
+		-- and the orientation of whatever last drew on that frame.
+		row.setStatus = function(key, prio, tex, title, desc, onClick, look)
 			local entry = row.statuses[key]
 			if not entry then
 				entry = { icon = S.acquireStatusIcon(strip) }
@@ -3178,7 +3232,32 @@ local function buildPanel()
 			entry.prio = prio or 5
 			local icon = entry.icon
 			icon.tipTitle, icon.tipDesc, icon.onClick = title, desc, onClick
-			icon.fill:SetTexture(tex[1], tex[2], tex[3], tex[4] or 1)
+			local fill = icon.fill
+			-- Cleared before it is set, because this client leaves the *previous*
+			-- texture on the object when it refuses a path -- so on an icon pooled
+			-- across rows a bad path silently renders as whichever severity drew there
+			-- last, a wrong answer that looks like a right one. Clearing first makes
+			-- a refusal show as nothing, which is the honest reading; the tooltip
+			-- still names the severity either way.
+			--
+			-- Deliberately not a `GetTexture() ~= tex` read-back. That reads back
+			-- *unequal* for a path carrying a file extension, so it blanked every
+			-- shipped `.tga` while leaving the extension-less client paths alone.
+			fill:SetTexture(nil)
+			fill:SetTexture(tex)
+			local color = look and look.color
+			if color then
+				fill:SetVertexColor(color[1], color[2], color[3], color[4] or 1)
+			else
+				fill:SetVertexColor(1, 1, 1, 1)
+			end
+			-- Both axes reversed, which is a half turn. Reversed coords are the same
+			-- mirroring the texture region's own `mirror` uses.
+			if look and look.flip then
+				fill:SetTexCoord(1, 0, 1, 0)
+			else
+				fill:SetTexCoord(0, 1, 0, 1)
+			end
 		end
 
 		row.clearStatus = function(key)

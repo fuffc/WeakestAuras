@@ -120,6 +120,20 @@ local function throttleLib()
 	end
 end
 
+-- One message on somebody else's prefix, paced by ChatThrottleLib where it
+-- exists and sent through the honest original where it does not. Traffic that
+-- is already self-limited wants this rather than the chunk queue below, which
+-- paces for a whole transfer and would sit a latency-sensitive message behind
+-- one.
+function WA.SendAddonMessageThrottled(prefix, msg, channel, prio, queueName)
+	local lib = throttleLib()
+	if lib then
+		lib:SendAddonMessage(prio or "NORMAL", prefix, msg, channel, nil, queueName or prefix)
+		return
+	end
+	rawSend(prefix, msg, channel)
+end
+
 local function enqueue(msg, channel)
 	local lib = throttleLib()
 	if lib then

@@ -198,7 +198,7 @@ local SUBTEXT_KEYS = {
 	"text_text", "text_color", "text_fontSize", "text_font", "text_fontType",
 	"text_visible", "text_justify", "text_justifyV", "text_spacing",
 	"text_shadowColor", "text_shadowXOffset", "text_shadowYOffset",
-	"text_selfPoint", "anchor_point", "anchorXOffset", "anchorYOffset",
+	"anchor_point", "anchorXOffset", "anchorYOffset",
 }
 
 local SUBTEXT_DROP_KEYS = {
@@ -1241,16 +1241,62 @@ local function translateFont(font)
 	return nil, default
 end
 
+local function subAnchorSupported(data, key)
+	local values = WA.regionPrototype.GetSubRegionAnchors(data, "point")
+	for i = 1, table.getn(values) do
+		if values[i] == key then return true end
+	end
+	return false
+end
+
+-- Upstream keeps the anchored part and the point in a single value
+-- ("OUTER_TOPLEFT", "ICON_LEFT", "SPARK"); ours splits them across anchor_target
+-- and anchor_point, the latter being one of the nine SetPoint accepts. Whether a
+-- part exists is asked of the destination region type, since a bar's ICON_* has
+-- no icon to sit on once the display is an icon.
+local function translateSubtextAnchor(destination, source, data, index, report)
+	local anchor = destination.anchor_point
+	if anchor == nil then anchor = source.text_anchorPoint end
+	if type(anchor) ~= "string" or anchor == "AUTO" then
+		if anchor ~= nil then
+			reportDrop(report, "anchor substitution",
+				subDetail("subtext", index, tostring(anchor) .. " -> CENTER"))
+		end
+		anchor = "CENTER"
+	end
+
+	local point = WA.regionPrototype.ResolveAnchorPoint(anchor, "CENTER")
+	local target = anchor
+	if not subAnchorSupported(data, target) then
+		target = subAnchorSupported(data, point) and point or "region"
+		if anchor ~= point then
+			reportDrop(report, "anchor substitution",
+				subDetail("subtext", index, anchor .. " -> " .. target))
+		end
+	end
+
+	destination.anchor_target = target
+	destination.anchor_point = point
+	-- Upstream's own default is AUTO, resolved at paint time from the anchor;
+	-- ours stores a real point, so an AUTO (or absent) self point is resolved here.
+	if WA.regionPrototype.IsAnchorPoint(source.text_selfPoint) then
+		destination.self_point = source.text_selfPoint
+	else
+		destination.self_point = WA.regionPrototype.AutoSelfPoint(anchor, point, data.regionType)
+	end
+end
+
 local function translateSubtext(source, index, data, report)
 	local destination = {}
 	take(destination, source, SUBTEXT_KEYS)
 	destination.type = "subtext"
-	if destination.anchor_point == nil and source.text_anchorPoint ~= nil then
-		destination.anchor_point = WA.DeepCopy(source.text_anchorPoint)
+	if destination.anchorXOffset == nil and source.text_anchorXOffset ~= nil then
+		destination.anchorXOffset = WA.DeepCopy(source.text_anchorXOffset)
 	end
 	if destination.anchorYOffset == nil and source.text_anchorYOffset ~= nil then
 		destination.anchorYOffset = WA.DeepCopy(source.text_anchorYOffset)
 	end
+	translateSubtextAnchor(destination, source, data, index, report)
 	if source.text_font ~= nil then
 		local font, default = translateFont(source.text_font)
 		if font then
@@ -1259,16 +1305,6 @@ local function translateSubtext(source, index, data, report)
 			destination.text_font = default
 			reportDrop(report, "unsupported font", subDetail("subtext", index, tostring(source.text_font)))
 		end
-	end
-	if destination.anchor_point == "AUTO" then
-		destination.anchor_point = "CENTER"
-		reportDrop(report, "anchor substitution", subDetail("subtext", index, "AUTO -> CENTER"))
-	elseif type(destination.anchor_point) == "string"
-		and string.sub(destination.anchor_point, 1, 6) == "INNER_" then
-		local original = destination.anchor_point
-		destination.anchor_point = string.sub(original, 7)
-		reportDrop(report, "anchor substitution",
-			subDetail("subtext", index, original .. " -> " .. destination.anchor_point))
 	end
 	for i = 1, table.getn(SUBTEXT_DROP_KEYS) do
 		local key = SUBTEXT_DROP_KEYS[i]

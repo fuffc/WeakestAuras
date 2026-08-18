@@ -72,8 +72,18 @@ function WA.safecall(errTag, fn, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11)
 		return err
 	end)
 	if not ok then
-		DEFAULT_CHAT_FRAME:AddMessage(
-			"|cffff0000WeakestAuras|r [" .. tostring(errTag) .. "] " .. tostring(res), 1, 0.3, 0.3)
+		local message = "[" .. tostring(errTag) .. "] " .. tostring(res)
+		-- `errTag` is a label for a chat line, and half the call sites are not an
+		-- aura at all (Comm, the trigger-system dispatch), so it cannot key a
+		-- per-aura registry. The aura is read off the ambient instead; nil means
+		-- chat only, which is what a non-aura caller gets. Late-bound because this
+		-- file loads before both the registry and the aura environment.
+		local uid = WA.CurrentWarningUid and WA.CurrentWarningUid()
+		if uid and WA.UpdateWarning then
+			WA.UpdateWarning(uid, "runtime:" .. tostring(errTag), "error", message, true)
+		else
+			DEFAULT_CHAT_FRAME:AddMessage("|cffff0000WeakestAuras|r " .. message, 1, 0.3, 0.3)
+		end
 	end
 	return ok, res
 end

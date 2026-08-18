@@ -320,6 +320,25 @@ local function migrateConditionProperties(data)
 	end
 end
 
+-- A sub-region imported from upstream before the combined anchor was split
+-- carries the anchored part where a bare point belongs ("OUTER_TOPLEFT"), which
+-- SetPoint rejects outright.
+local function migrateSchemaV4(data)
+	local proto = WA.regionPrototype
+	for i = 1, table.getn(data.subRegions or {}) do
+		local subData = data.subRegions[i]
+		local anchor = subData and subData.anchor_point
+		if type(anchor) == "string" and not proto.IsAnchorPoint(anchor) then
+			local point = proto.ResolveAnchorPoint(anchor, "CENTER")
+			subData.anchor_target = subData.anchor_target or anchor
+			subData.anchor_point = point
+			if not proto.IsAnchorPoint(subData.self_point) then
+				subData.self_point = proto.AutoSelfPoint(anchor, point, data.regionType)
+			end
+		end
+	end
+end
+
 local function migrateSchemaV3(data)
 	if data.regionType == "text" then
 		for oldKey, newKey in pairs(TEXT_REGION_RENAMES) do
@@ -446,6 +465,11 @@ function WA.MergeDefaults(data)
 	if data.internalVersion < 3 then
 		migrateSchemaV3(data)
 		data.internalVersion = 3
+	end
+
+	if data.internalVersion < 4 then
+		migrateSchemaV4(data)
+		data.internalVersion = 4
 	end
 end
 
@@ -929,6 +953,7 @@ function WA.DeleteAura(id)
 
 	detach(id)
 	WA.Remove(data)
+	if WA.ClearWarningsFor then WA.ClearWarningsFor(data.uid) end
 	WeakestAurasDB.displays[id] = nil
 end
 

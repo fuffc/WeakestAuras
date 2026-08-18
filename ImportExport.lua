@@ -219,7 +219,7 @@ local function installOne(data, parentId)
 	data.id = newId
 	if not data.uid or WA.FindByUID(data.uid) then data.uid = WA.NewUID() end
 	data.parent = parentId
-	data.internalVersion = 3
+	data.internalVersion = 4
 	WeakestAurasDB.displays[newId] = data
 	local ok, err = pcall(WA.MergeDefaults, data)
 	if not ok then
@@ -371,7 +371,7 @@ function WA.UpdatePendingImport(pending, targetId)
 		if not UPDATE_PRESERVED[key] then target[key] = WA.DeepCopy(value) end
 	end
 	target.id, target.uid, target.parent = targetId, original.uid, original.parent
-	target.internalVersion = 3
+	target.internalVersion = 4
 	local ok, err = pcall(WA.MergeDefaults, target)
 	if not ok then
 		for key in pairs(target) do target[key] = nil end

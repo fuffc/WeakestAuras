@@ -230,7 +230,8 @@
 --   labels        -- value -> display label; optional (defaults to the raw value)
 --   tips          -- value -> tooltip line; optional
 --   previews      -- value -> true; adds a per-row preview button
---   previewTexture -- texture path for the preview button (optional)
+--   previewTexture -- texture path for the preview button; optional, and defaults
+--                    to PREVIEW_TEXTURE below
 --   onPreview(v)  -- called by a row preview without selecting or closing
 --   swatches      -- optional: value -> texture path. Turns the picker into a
 --                    preview picker: the button's face and every menu entry draw
@@ -349,7 +350,7 @@
 -- Returns { height = <total pixel height used below (x,y)>, refresh = fn,
 --           frame = <the list's outer frame> }.
 
-local MAJOR, MINOR = "LibWidgets-1.0", 20
+local MAJOR, MINOR = "LibWidgets-1.0", 21
 -- Bind the global only on the winning copy. NewLibrary returns nil for a copy
 -- that loses the version race; assigning that nil straight to the global would
 -- wipe out the winner's binding (an older/equal copy loading last nulls it),
@@ -443,6 +444,17 @@ local WIDGET_BACKDROP = {
 }
 
 local ICON_DELETE = "Interface\\Buttons\\UI-GroupLoot-Pass-Up"
+
+-- NewDropButton's default row-preview glyph: the client's guild-MOTD horn, which
+-- reads as "play this" and is 16x16, the size a preview button draws it at.
+--
+-- A client path rather than a file under `textures\`, and deliberately so. This
+-- library cannot resolve its own location (see the self-path note in the header),
+-- so anything it ships is reachable only through a `spec.textureDir` the caller
+-- has to supply -- which a *default* cannot require. It also lives in the base
+-- `interface.MPQ` rather than a patch archive, so it is present on any client this
+-- library runs on.
+local PREVIEW_TEXTURE = "Interface\\Buttons\\UI-GuildButton-MOTD-Up"
 
 local MOVE_OK   = { 0.2, 0.9, 0.2 }
 local MOVE_NONE = { 0.5, 0.5, 0.5 }
@@ -538,6 +550,7 @@ end
 -- The delete-row art the list editor uses, published so a consumer's own
 -- delete affordance outside a list reads as the same control.
 LibWidgets.ICON_DELETE = ICON_DELETE
+LibWidgets.PREVIEW_TEXTURE = PREVIEW_TEXTURE
 
 -- Leading tristate chip: a colour-tinted circle swatch that cycles through
 -- leadingControl.states on click. iconPath is the caller's spec.textureDir-
@@ -1664,7 +1677,7 @@ function LibWidgets.NewDropButton(parent, spec)
 			preview:SetPoint("RIGHT", item, "RIGHT", -1, 0)
 			local previewIcon = preview:CreateTexture(nil, "ARTWORK")
 			previewIcon:SetAllPoints(preview)
-			previewIcon:SetTexture(previewTexture or "Interface\\ChatFrame\\UI-ChatIcon-Chat")
+			previewIcon:SetTexture(previewTexture or PREVIEW_TEXTURE)
 			previewIcon:SetVertexColor(1, 0.82, 0.15, 1)
 			preview.icon = previewIcon
 			preview:SetScript("OnClick", function()

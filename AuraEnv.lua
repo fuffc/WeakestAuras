@@ -98,6 +98,17 @@ function WA.DeactivateAuraEnv()
 	depth = depth - 1
 end
 
+-- The aura whose code is running, or nil outside any. This is the whole of the
+-- runtime half of error attribution: the stack above already tracks it for the
+-- benefit of user code, so a reporter that has no aura in hand -- WA.safecall,
+-- reached from dozens of sites of which only some are an aura at all -- reads it
+-- here rather than having a uid threaded down to it. Upstream's current_uid, for
+-- the same reason and off the same stack.
+function WA.CurrentAuraId()
+	local env = customEnv.aura_env
+	return env and env.id or nil
+end
+
 -- Drops an aura's stored environment. The seams are deletion and the aura's
 -- custom source changing -- **not** WA.Add, which upstream's equivalent reset
 -- hangs off. WA.Add fires per drag step here (a `range` field's `set` calls it,
@@ -147,12 +158,30 @@ function WA.WrapFunctionSource(source, encloseInFunction)
 	return "return " .. source
 end
 
+-- The aura being compiled, which WA.Add sets around its whole re-derivation. The
+-- compile half of attribution needs its own ambient because compiling happens
+-- *outside* the aura-env sandwich above -- and one variable set at the top of
+-- WA.Add covers every custom-code site at once, since Add is the funnel every
+-- trigger, condition, action and region compile hangs off.
+WA.compilingAuraId = nil
+
 -- Reports a compile failure the way WA.safecall reports a runtime one, so a
--- broken aura reads the same whichever half of user code broke.
+-- broken aura reads the same whichever half of user code broke. A nil errTag
+-- suppresses the report entirely, which is how the options editor's own syntax
+-- check stays quiet while the user is still typing.
+--
+-- Keyed by the code site, so two broken fields on one aura are two reports rather
+-- than one overwriting the other. Nothing here clears them: WA.Add drops the
+-- whole `compile:` namespace before it recompiles, which is what makes a fixed
+-- field's warning go away without every compile site remembering to.
 local function refuse(errTag, err)
-	if errTag then
-		DEFAULT_CHAT_FRAME:AddMessage(
-			"|cffff0000WeakestAuras|r [" .. tostring(errTag) .. "] " .. tostring(err), 1, 0.3, 0.3)
+	if not errTag then return nil, err end
+	local message = "[" .. tostring(errTag) .. "] " .. tostring(err)
+	local uid = WA.CurrentWarningUid and WA.CurrentWarningUid()
+	if uid and WA.UpdateWarning then
+		WA.UpdateWarning(uid, "compile:" .. tostring(errTag), "error", message, true)
+	else
+		DEFAULT_CHAT_FRAME:AddMessage("|cffff0000WeakestAuras|r " .. message, 1, 0.3, 0.3)
 	end
 	return nil, err
 end

@@ -140,7 +140,16 @@ W.CODE_FONT = "Interface\\AddOns\\WeakestAuras\\fonts\\RobotoMono.ttf"
 -- the UI's usual body size. Only the default: WeakestAurasDB.codeEditorFontSize
 -- overrides it (/wa codefont <6-16>), and the widget takes it per paint.
 W.CODE_FONT_SIZE = 9
-W.SOUND_PREVIEW_TEXTURE = "Interface\\AddOns\\DPSMate\\images\\UI-GuildButton-MOTD-Up"
+-- The client's own guild-MOTD horn, 16x16 and amber, which is also what a drop
+-- button's row preview draws with nothing passed -- taken from the library rather
+-- than respelled so the two cannot drift apart. Shared with the `sound` warning
+-- severity, so the mark that means "play this" in the picker means "this aura
+-- plays one" on the aura list's row.
+--
+-- Spelled out as a fallback because an older LibWidgets copy can win the version
+-- race and publish no such field (see LIBWIDGETS_DEV).
+W.SOUND_PREVIEW_TEXTURE = LibWidgets.PREVIEW_TEXTURE
+	or "Interface\\Buttons\\UI-GuildButton-MOTD-Up"
 
 -- Falls back to the client's own bar art rather than erroring, so an older
 -- LibWidgets copy winning the version race degrades a bar's *look* instead of
