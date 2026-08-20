@@ -863,6 +863,27 @@ function WA.SpellInRange(spellId, unit)
 	return UnitInRange(unit) and true or false
 end
 
+-- IsUsableSpell covers cast requirements but not proc state. When a spell is
+-- present on a direct action-bar slot, IsUsableAction includes that state (for
+-- example, Overpower after a dodge); spells without such a slot keep the
+-- spell-level fallback used by the upstream trigger.
+function WA.ActionUsability(spellId)
+	if GetActionInfo and IsUsableAction then
+		for slot = 1, 120 do
+			local actionType, actionId = GetActionInfo(slot)
+			if actionType == "spell" and actionId == spellId then
+				local usable, insufficientResources = IsUsableAction(slot)
+				return usable and true or false, insufficientResources and true or false
+			end
+		end
+	end
+	if IsUsableSpell then
+		local usable, insufficientResources = IsUsableSpell(spellId)
+		return usable and true or false, insufficientResources and true or false
+	end
+	return false, false
+end
+
 -- The unit token a trigger actually targets: the dropdown's choice, or the
 -- free-text override when the dropdown's "specific" entry is selected (raid17,
 -- partyN, or a SuperWoW GUID). Resolved at compile time and baked into the
@@ -2215,7 +2236,7 @@ PROTOTYPES["actionusable"] = {
 	wa2Event = "Action Usable",
 	category = "spell",
 	progressType = "none",
-	events = function() return { "SPELL_UPDATE_USABLE", "SPELL_COOLDOWN_CHANGED", "PLAYER_TARGET_CHANGED" } end,
+	events = function() return { "SPELL_UPDATE_USABLE", "ACTIONBAR_UPDATE_USABLE", "ACTIONBAR_SLOT_CHANGED", "SPELL_COOLDOWN_CHANGED", "PLAYER_TARGET_CHANGED" } end,
 	force_events = true,
 	loadFunc = function(trigger)
 		local id = WA.ResolveSpellID(trigger.spellName)
@@ -2233,7 +2254,7 @@ PROTOTYPES["actionusable"] = {
 		local id = WA.ResolveSpellID(trigger.spellName) or 0
 		return "local spellId = " .. fmt(id) .. "\n"
 			.. "local usable, insufficientResources = false, false\n"
-			.. "if IsUsableSpell then local _u, _m = IsUsableSpell(spellId) usable = _u and true or false insufficientResources = _m and true or false end\n"
+			.. "usable, insufficientResources = WeakestAuras.ActionUsability(spellId)\n"
 			.. "local startTime, duration = WeakestAuras.SpellCdInfo(spellId, false)\n"
 			.. "local expirationTime = (startTime and duration and (startTime + duration)) or 0\n"
 			.. "local ready = (duration == nil or duration <= 0 or not startTime or startTime == 0 or expirationTime <= GetTime())\n"
