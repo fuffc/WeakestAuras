@@ -3578,7 +3578,13 @@ WA.RegisterRegionType("progresstexture", {
 			self.progress = clampProgress(self, p)
 			progTexFill(self)
 		end
+		-- Clearing the script first is what makes a static fill hold still: the
+		-- timed path below leaves a countdown installed that recomputes progress
+		-- from expirationTime on every frame, and it outlives the state that
+		-- armed it. A region reaches here from a timed one whenever the options
+		-- preview hands back a previewed window, so this is not hypothetical.
 		function region:UpdateValue()
+			self:SetScript("OnUpdate", nil)
 			local total = self.total or 0
 			self:SetProgress(total > 0 and (self.value or 0) / total or 1)
 		end
