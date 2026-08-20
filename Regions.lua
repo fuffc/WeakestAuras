@@ -1060,7 +1060,7 @@ WA.RegisterRegionType("dynamicgroup", {
 			})
 			table.insert(fields, {
 				type = "range", name = "Start Angle", key = "rotation", min = 0, max = 360, step = 3,
-				get = function() return data.rotation end,
+				get = function() return data.rotation or 0 end,
 				set = function(v) data.rotation = v; WA.Add(data) end,
 			})
 			if constantFactor == "SPACING" then
@@ -1340,7 +1340,7 @@ WA.RegisterRegionType("texture", {
 			{
 				type = "color", name = "Color", key = "color",
 				half = true,
-				get = function() return data.color end,
+				get = function() return data.color or { 1, 1, 1, 1 } end,
 				set = function(v) data.color = v; WA.Add(data, true) end,
 			},
 			{
@@ -1351,13 +1351,13 @@ WA.RegisterRegionType("texture", {
 			},
 			{
 				type = "range", name = "Alpha", key = "alpha", min = 0, max = 1, step = 0.05, half = true,
-				get = function() return data.alpha end,
+				get = function() return data.alpha or 1 end,
 				set = function(v) data.alpha = v; WA.Add(data, true) end,
 			},
 			{
 				type = "select", name = "Blend mode", key = "blendMode", half = true,
 				values = TEXTURE_BLEND_MODES, labels = TEXTURE_BLEND_LABELS,
-				get = function() return data.blendMode end,
+				get = function() return data.blendMode or "BLEND" end,
 				set = function(v) data.blendMode = v; WA.Add(data, true) end,
 			},
 			{
@@ -1367,7 +1367,7 @@ WA.RegisterRegionType("texture", {
 			},
 			{
 				type = "range", name = "Rotation", key = "rotation", min = 0, max = 360, step = 1, half = true,
-				get = function() return data.rotation end,
+				get = function() return data.rotation or 0 end,
 				set = function(v) data.rotation = v; WA.Add(data, true) end,
 			},
 			{ type = "header", name = "Size" },
@@ -1590,7 +1590,7 @@ WA.RegisterRegionType("icon", {
 			},
 			{
 				type = "range", name = "Alpha", key = "alpha", min = 0, max = 1, step = 0.05, half = true,
-				get = function() return data.alpha end,
+				get = function() return data.alpha or 1 end,
 				set = function(v) data.alpha = v; WA.Add(data, true) end,
 			},
 			{ type = "header", name = "Size" },
@@ -2465,7 +2465,7 @@ WA.RegisterRegionType("progressbar", {
 			},
 			{
 				type = "range", name = "Alpha", key = "alpha", min = 0, max = 1, step = 0.05, half = true,
-				get = function() return data.alpha end,
+				get = function() return data.alpha or 1 end,
 				set = function(v) data.alpha = v; WA.Add(data, true) end,
 			},
 			{
@@ -3528,8 +3528,8 @@ WA.RegisterRegionType("progresstexture", {
 			{ type = "select", name = "Orientation", key = "orientation", get = function() return data.orientation end, set = function(v) data.orientation = v; WA.Add(data, true); WA.RefreshOptions() end, values = PROGTEX_ORIENTATIONS, labels = PROGTEX_ORIENTATION_LABELS },
 			{ type = "toggle", name = "Inverse", key = "inverse", half = true, get = function() return data.inverse end, set = function(v) data.inverse = v; WA.Add(data, true) end },
 			{ type = "toggle", name = "Mirror", key = "mirror", half = true, get = function() return data.mirror end, set = function(v) data.mirror = v; WA.Add(data, true) end },
-			{ type = "range", name = "Texture rotation", key = "rotation", min = 0, max = 360, step = 1, half = true, get = function() return data.rotation end, set = function(v) data.rotation = v; WA.Add(data, true) end },
-			{ type = "range", name = "Alpha", key = "alpha", min = 0, max = 1, step = 0.05, half = true, get = function() return data.alpha end, set = function(v) data.alpha = v; WA.Add(data, true) end },
+			{ type = "range", name = "Texture rotation", key = "rotation", min = 0, max = 360, step = 1, half = true, get = function() return data.rotation or 0 end, set = function(v) data.rotation = v; WA.Add(data, true) end },
+			{ type = "range", name = "Alpha", key = "alpha", min = 0, max = 1, step = 0.05, half = true, get = function() return data.alpha or 1 end, set = function(v) data.alpha = v; WA.Add(data, true) end },
 			{ type = "range", name = "Crop X", key = "crop_x", min = 0, max = 2, step = 0.01, half = true, get = function() return data.crop_x end, set = function(v) data.crop_x = v; WA.Add(data, true) end },
 			{ type = "range", name = "Crop Y", key = "crop_y", min = 0, max = 2, step = 0.01, half = true, get = function() return data.crop_y end, set = function(v) data.crop_y = v; WA.Add(data, true) end },
 			{ type = "range", name = "Re-center X", key = "user_x", min = -0.5, max = 0.5, step = 0.01, half = true, get = function() return data.user_x end, set = function(v) data.user_x = v; WA.Add(data, true) end },
@@ -3778,12 +3778,12 @@ WA.RegisterRegionType("text", {
 			},
 			{
 				type = "range", name = "Alpha", key = "alpha", min = 0, max = 1, step = 0.05, half = true,
-				get = function() return data.alpha end,
+				get = function() return data.alpha or 1 end,
 				set = function(v) data.alpha = v; WA.Add(data, true) end,
 			},
 			{
 				type = "color", name = "Color", key = "color",
-				get = function() return data.color end,
+				get = function() return data.color or { 1, 1, 1, 1 } end,
 				set = function(v) data.color = v; WA.Add(data, true) end,
 			},
 		}

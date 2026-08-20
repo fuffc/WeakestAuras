@@ -671,17 +671,17 @@ function S.addSourceFields(fields, data)
 	-- "Imported from", never "this is that aura": the pair survives editing and
 	-- re-export, so it names an origin with exactly the strength of uid.
 	line = line .. "\nCheck that page for a newer version of this aura."
-	table.insert(fields, { type = "header", name = "Source" })
-	table.insert(fields, { type = "description", name = line })
+	table.insert(fields, { type = "header", name = "Source", soloOnly = true })
+	table.insert(fields, { type = "description", name = line, soloOnly = true })
 	table.insert(fields, {
-		type = "button", name = "Copy Source Link",
+		type = "button", name = "Copy Source Link", soloOnly = true,
 		onClick = function() S.openURLDialog("Aura Source", url) end,
 	})
 	-- Two-click confirm, the Delete button's affordance: erasing the stamp is
 	-- unrecoverable from inside the game -- nothing re-derives it but importing
 	-- the site's string again.
 	table.insert(fields, {
-		type = "button", name = "Clear Source Link",
+		type = "button", name = "Clear Source Link", soloOnly = true,
 		onClick = function()
 			if this.confirming then
 				this.confirming = nil
@@ -697,11 +697,17 @@ function S.addSourceFields(fields, data)
 	})
 end
 
+-- `soloOnly` marks what a multi-selection's merged Info tab must not carry: an
+-- identity (the name header, Rename), an op whose fan-out is wrong (Delete's
+-- two-click confirm lives on one button, so the second member's closure would
+-- read the first's arming and fire immediately), or per-aura prose (warnings,
+-- provenance). What remains -- Description, URL, the compatibility toggle --
+-- is upstream's own multi Information surface.
 function S.getInfoOptions(data)
 	local fields = {
-		{ type = "header", name = data.id },
+		{ type = "header", name = data.id, soloOnly = true },
 		{
-			type = "input", name = "Rename",
+			type = "input", name = "Rename", key = "id", soloOnly = true,
 			get = function() return data.id end,
 			set = function(v)
 				v = S.trim(v)
@@ -709,7 +715,7 @@ function S.getInfoOptions(data)
 			end,
 		},
 		{
-			type = "select", name = "Region type",
+			type = "select", name = "Region type", key = "regionType", soloOnly = true,
 			-- Filtered to data's own leaf/group category -- see WA.RegionTypeList's
 			-- comment for why converting across that boundary isn't offered here.
 			values = WA.RegionTypeList(WA.IsGroup(data)),
@@ -720,7 +726,7 @@ function S.getInfoOptions(data)
 		-- Author metadata, travelling with every export and surviving a WA2
 		-- import (upstream's Information tab holds the same pair).
 		{
-			type = "input", name = "Description",
+			type = "input", name = "Description", key = "desc",
 			get = function() return data.desc or "" end,
 			set = function(v)
 				v = S.trim(v)
@@ -728,7 +734,7 @@ function S.getInfoOptions(data)
 			end,
 		},
 		{
-			type = "input", name = "URL",
+			type = "input", name = "URL", key = "url",
 			get = function() return data.url or "" end,
 			set = function(v)
 				v = S.trim(v)
@@ -755,6 +761,7 @@ function S.getInfoOptions(data)
 		table.insert(fields, { type = "header", name = "Compatibility Options" })
 		table.insert(fields, {
 			type = "toggle", name = "Custom Trigger: ignore Lua errors while previewing",
+			key = "information.ignoreOptionsEventErrors",
 			get = function()
 				return (data.information and data.information.ignoreOptionsEventErrors) and true or false
 			end,
@@ -771,7 +778,7 @@ function S.getInfoOptions(data)
 			end,
 		})
 	end
-	table.insert(fields, { type = "button", name = "Export",
+	table.insert(fields, { type = "button", name = "Export", soloOnly = true,
 		onClick = function() S.openExport(data.id) end })
 	-- Every warning this aura has, titled by the worst severity -- the block the
 	-- row's status icon click arrives at. Upstream puts it midway down its own
@@ -781,18 +788,15 @@ function S.getInfoOptions(data)
 	-- unless the group itself is what is broken.
 	local _, warnTitle, warnBody = WA.FormatWarnings(data.uid)
 	if warnTitle and warnBody then
-		table.insert(fields, 2, { type = "header", name = warnTitle })
-		table.insert(fields, 3, { type = "description", name = warnBody })
+		table.insert(fields, 2, { type = "header", name = warnTitle, soloOnly = true })
+		table.insert(fields, 3, { type = "description", name = warnBody, soloOnly = true })
 	end
-	-- The only way to promote a grouped aura back to top level: the tree's
-	-- drag-and-drop only ever reorders within the dragged item's current
-	-- parent (see buildPanel's trackDrag) since a drop boundary between two
-	-- different parents' rows is genuinely ambiguous once groups interleave
-	-- their children into the flat list -- dropping *onto* a group row is
-	-- the unambiguous way in, this button is the unambiguous way out.
+	-- Dragging a child to a top-level boundary also promotes it (trackDrag
+	-- targets the hovered row's list); this button is the same move as a plain
+	-- affordance, without the aim.
 	if data.parent then
 		table.insert(fields, {
-			type = "button", name = "Ungroup (remove from \"" .. data.parent .. "\")",
+			type = "button", name = "Ungroup (remove from \"" .. data.parent .. "\")", soloOnly = true,
 			onClick = function()
 				WA.RemoveChildFromGroup(data.id)
 				S.refreshList()
@@ -806,7 +810,7 @@ function S.getInfoOptions(data)
 	-- a tab repaint resets the label, which is the wanted behaviour -- a
 	-- half-confirmed delete should not survive switching away and back.
 	table.insert(fields, {
-		type = "button", name = "Delete",
+		type = "button", name = "Delete", soloOnly = true,
 		onClick = function()
 			if this.confirming then
 				this.confirming = nil
@@ -835,7 +839,16 @@ S.collapsed = {}
 
 function S.isCollapsed(data, key, default)
 	local v = S.collapsed[data.id .. "::" .. key]
-	if v == nil then return default end
+	if v == nil then v = default end
+	-- A mass-edit merge build reads each member with fold forced open: folding
+	-- is presentation, so a folded section must still contribute its fields to
+	-- the merge (which member a write reaches must never depend on what
+	-- someone folded). The genuine answer -- generator defaults included -- is
+	-- recorded for the merged pane's own fold state.
+	if S.foldProbe then
+		S.foldProbe[key] = v and true or false
+		return false
+	end
 	return v
 end
 
@@ -897,6 +910,7 @@ function S.collapsibleSections(fields, data, prefix)
 				-- reuses, and fold state is ours rather than its.
 				local hdr = {}
 				for k, v in pairs(f) do hdr[k] = v end
+				hdr.key = hdr.key or key
 				hdr.collapsed = collapsed
 				hdr.onToggle = function()
 					S.setCollapsed(data, key, not collapsed)
@@ -965,7 +979,12 @@ function S.appendDisplayEffectsOptions(fields, data)
 			local collapsed
 			if not enforced then collapsed = S.isCollapsed(data, key, false) end
 			table.insert(fields, {
-				type = "header", name = label, collapsed = collapsed,
+				-- The header's key carries the sub's type as well as its index --
+				-- index alone is ambiguous the moment two auras' effect lists
+				-- differ in type at the same position. Fold state stays under the
+				-- bare index (`foldKey`): conditions address effects by index, and
+				-- S.remapCollapsed carries "sub:<n>" through structural renumbering.
+				type = "header", name = label, key = key .. ":" .. sub.type, foldKey = key, collapsed = collapsed,
 				onToggle = not enforced and function()
 					S.setCollapsed(data, key, not collapsed)
 					S.refreshTabContent()
@@ -1046,7 +1065,7 @@ function S.appendDisplayEffectsOptions(fields, data)
 	table.sort(addable)
 	if table.getn(addable) > 0 then
 		table.insert(fields, {
-			type = "menu", name = "+ Add Display Effect", values = addable, labels = addLabels,
+			type = "menu", name = "+ Add Display Effect", scope = "tab", values = addable, labels = addLabels,
 			onSelect = function(name)
 				local spec = WA.subRegionTypes[name]
 				if not spec then return end
@@ -1079,6 +1098,22 @@ end
 -- shows up here for free. Structural edits (add/remove a condition, nested
 -- check or change, or switching a variable/property whose type changes the
 -- value widget) re-render the tab via S.refreshTabContent.
+--
+-- One generator serves every selection shape, always running over a merged
+-- copy of the members' condition lists -- upstream ConditionOptions.lua's
+-- reference-merge. Conditions align across members by check shape (same
+-- trigger and variable; combination trees only when strictly equal), and a
+-- merged condition's check carries references[id] = { conditionIndex, op,
+-- value } locating it in each member. Every write fans through those
+-- references into the members' real lists and keeps the merged copy in sync,
+-- so reads stay fresh between repaints; a single aura is a one-member merge
+-- on the same path, where nothing can disagree. Disagreement wears the same
+-- dress as the other mass-edit tabs -- blanked value, blue caption,
+-- per-member value tooltip -- and a condition or change only some members
+-- carry ("subset") gets the blue caption, the member list, and upstream's
+-- copy-to-all affordance. The merge decorations (references, samevalue,
+-- sameop, referenceCount) live on the merged copy only; nothing written back
+-- to a member ever carries them.
 -- ---------------------------------------------------------------------------
 
 function S.sortedKeys(map)
@@ -1138,111 +1173,310 @@ function S.defaultPropertyValue(pentry)
 	return nil
 end
 
--- Appends the op/value editor for a check, picking the widget by variable type.
-local function appendCheckValue(fields, data, check, vtype, template, indent)
-	if vtype == "combination" then return end
-	if vtype == "number" or vtype == "timer" or vtype == "elapsedTimer" then
-		local label = vtype == "timer" and "Remaining (s)"
-			or (vtype == "elapsedTimer" and "Elapsed (s)" or "Value")
-		table.insert(fields, {
-			type = "opnumber", name = label, indent = indent,
-			getOp = function() return check.op or ">=" end,
-			setOp = function(v) check.op = v; WA.Add(data) end,
-			getVal = function() return check.value end,
-			setVal = function(v) check.value = v; WA.Add(data) end,
-		})
-	elseif vtype == "bool" then
-		table.insert(fields, {
-			type = "toggle", name = "Is true", indent = indent,
-			get = function() return check.value == true or check.value == "true" end,
-			set = function(v) check.op = "=="; check.value = v and true or false; WA.Add(data) end,
-		})
-	elseif vtype == "select" then
-		table.insert(fields, {
-			type = "select", name = "Value", indent = indent,
-			values = (template and template.values) or {},
-			get = function() return check.value end,
-			set = function(v) check.op = "=="; check.value = v; WA.Add(data) end,
-		})
-	else -- string
-		table.insert(fields, {
-			type = "select", name = "Op", half = true, indent = indent,
-			values = { "==", "~=" },
-			get = function() return check.op or "==" end,
-			set = function(v) check.op = v; WA.Add(data) end,
-		})
-		table.insert(fields, {
-			type = "input", name = "Value", half = true, indent = indent,
-			get = function() return check.value end,
-			set = function(v) check.value = v; WA.Add(data) end,
-		})
+local function mergeValuesEqual(a, b)
+	if type(a) ~= "table" or type(b) ~= "table" then return a == b end
+	for k, v in pairs(a) do
+		if not mergeValuesEqual(v, b[k]) then return false end
 	end
+	for k in pairs(b) do
+		if a[k] == nil then return false end
+	end
+	return true
 end
 
--- Appends the value widget for one property change, picked by property type.
-local function appendChangeValue(fields, data, change, pentry)
-	local ptype = pentry and pentry.type
-	if pentry and pentry.action then
-		if ptype == "sound" and WA.ActionSoundFields then
-			local value = change.value or {}
-			WA.ActionSoundFields(fields, data, value, true)
-		elseif ptype == "chat" and WA.ActionMessageFields then
-			local value = change.value or {}
-			WA.ActionMessageFields(fields, data, value, "condition", true)
-		elseif ptype == "customcode" then
-			table.insert(fields, { type = "code", height = 80, name = "Custom Code",
-				get = function() return change.value end,
-				set = function(v) change.value = v; WA.Add(data) end })
-		elseif ptype == "glowexternal" then
-			WA.ConditionGlowFields(fields, data, change)
+-- One member's current value as a tooltip-line string: booleans as on/off,
+-- a colour or name list as its comma-joined parts, a code blob cut at its
+-- first line.
+local function mergeValueText(v)
+	if v == nil then return "-" end
+	if v == true then return "on" end
+	if v == false then return "off" end
+	if type(v) == "table" then
+		local parts = {}
+		for i = 1, table.getn(v) do
+			local piece = v[i]
+			if type(piece) == "number" then piece = math.floor(piece * 100 + 0.5) / 100 end
+			table.insert(parts, tostring(piece))
 		end
-		return
+		return table.concat(parts, ", ")
 	end
-	if ptype == "bool" then
-		table.insert(fields, {
-			type = "toggle", name = "Value", half = true,
-			get = function() return change.value and true or false end,
-			set = function(v) change.value = v and true or false; WA.Add(data) end,
-		})
-	elseif ptype == "color" then
-		table.insert(fields, {
-			type = "color", name = "Value", half = true,
-			get = function() return change.value end,
-			set = function(v) change.value = v; WA.Add(data) end,
-		})
-	-- A property naming only a `softMax` is still a track-and-box field, not the
-	-- plain input box below: the ceiling it omits is the hard one.
-	elseif ptype == "number" and pentry.min and (pentry.max or pentry.softMax) then
-		table.insert(fields, {
-			type = "range", name = "Value", half = true, min = pentry.min, max = pentry.max,
-			softMax = pentry.softMax, step = pentry.step or 1,
-			get = function() return change.value end,
-			set = function(v) change.value = v; WA.Add(data) end,
-		})
-	elseif ptype == "list" then
-		local vals, labels = {}, {}
-		for k, lbl in pairs(pentry.values or {}) do table.insert(vals, k); labels[k] = lbl end
-		table.sort(vals)
-		table.insert(fields, {
-			type = "select", name = "Value", half = true, values = vals, labels = labels,
-			get = function() return change.value end,
-			set = function(v) change.value = v; WA.Add(data) end,
-		})
+	local s = tostring(v)
+	local nl = string.find(s, "\n", 1, true)
+	if nl then s = string.sub(s, 1, nl - 1) .. "..." end
+	if string.len(s) > 60 then s = string.sub(s, 1, 57) .. "..." end
+	return s
+end
+
+-- Property types whose change value is a table of independently-edited keys
+-- (the sound/chat/glow editors). Custom code stores its string directly here,
+-- unlike upstream's { custom = ... } wrapper, so it merges as a scalar.
+local TABLE_VALUE_PROPERTY = { sound = true, chat = true, glowexternal = true }
+
+local function conditionPropertyType(property, props)
+	local entry = property and props[property]
+	return entry and entry.type
+end
+
+-- First-contributor samevalue shape: per-key for table values -- over the
+-- keys actually present, because chat's message_format_* keys are open-ended
+-- and a fixed subproperty list would miss them -- a plain flag otherwise.
+local function initSameValue(change, props)
+	local ptype = conditionPropertyType(change.property, props)
+	if TABLE_VALUE_PROPERTY[ptype] and type(change.value) == "table" then
+		change.samevalue = {}
+		for k in pairs(change.value) do change.samevalue[k] = true end
 	else
-		table.insert(fields, {
-			type = "input", name = "Value", half = true,
-			get = function() return change.value end,
-			set = function(v) change.value = (ptype == "number") and tonumber(v) or v; WA.Add(data) end,
-		})
+		change.samevalue = true
 	end
 end
 
-function S.appendConditionOptions(fields, data)
+-- Union of the members' condition-variable templates per trigger index, and
+-- the largest member trigger count (sizes the Trigger dropdown). A variable
+-- two members type differently goes "incompatible" in a fresh table -- never
+-- mutating a member's own template -- so no value editor paints for it.
+-- Mirrors upstream's mergeConditionTemplates.
+local function mergedConditionTemplates(members)
+	local out, numTriggers = {}, 0
+	for m = 1, table.getn(members) do
+		local n = table.getn(members[m].triggers or {})
+		if n > numTriggers then numTriggers = n end
+		local mine = WA.GetConditionTemplates(members[m])
+		for triggernum, vars in pairs(mine) do
+			out[triggernum] = out[triggernum] or {}
+			for name, tmpl in pairs(vars) do
+				local have = out[triggernum][name]
+				if not have then
+					out[triggernum][name] = tmpl
+				elseif have.type ~= tmpl.type then
+					out[triggernum][name] = { display = tmpl.display, type = "incompatible" }
+				end
+			end
+		end
+	end
+	return out, numTriggers
+end
+
+-- Union of the members' changeable properties: type conflicts go
+-- incompatible, list value sets merge into a fresh entry so no member's own
+-- registry table is mutated. Mirrors upstream's buildAllPotentialProperties.
+local function mergedConditionProperties(members)
+	local out = {}
+	for m = 1, table.getn(members) do
+		for k, v in pairs(WA.GetProperties(members[m])) do
+			local have = out[k]
+			if not have then
+				out[k] = v
+			elseif have.type ~= v.type then
+				out[k] = { display = have.display, type = "incompatible" }
+			elseif have.type == "list" and v.values and have.values ~= v.values then
+				local values = {}
+				for key, label in pairs(have.values or {}) do values[key] = label end
+				for key, label in pairs(v.values) do
+					if values[key] == nil then values[key] = label end
+				end
+				local copy = {}
+				for key, entry in pairs(have) do copy[key] = entry end
+				copy.values = values
+				out[k] = copy
+			end
+		end
+	end
+	return out
+end
+
+local function getOrCreateSubCheck(base, path)
+	for i = 1, table.getn(path) do
+		base.checks = base.checks or {}
+		base.checks[path[i]] = base.checks[path[i]] or {}
+		base = base.checks[path[i]]
+	end
+	return base
+end
+
+local function removeSubCheck(base, path)
+	getOrCreateSubCheck(base, path)
+	local parent = base
+	for i = 1, table.getn(path) - 1 do parent = parent.checks[path[i]] end
+	table.remove(parent.checks, path[table.getn(path)])
+end
+
+-- Deep equality for combination subtrees: only strictly equal trees merge,
+-- which is what lets everything below a merged combination count as
+-- agreement by construction (upstream compareSubChecks).
+local function compareSubChecks(a, b, templates)
+	if a == nil and b == nil then return true end
+	if a == nil or b == nil then return false end
+	if table.getn(a) ~= table.getn(b) then return false end
+	for i = 1, table.getn(a) do
+		if a[i].trigger ~= b[i].trigger or a[i].variable ~= b[i].variable then return false end
+		if a[i].trigger == -2 then
+			if not compareSubChecks(a[i].checks, b[i].checks, templates) then return false end
+		else
+			local vtype = S.conditionVarType(a[i], templates)
+			if vtype == "bool" then
+				if a[i].value ~= b[i].value then return false end
+			else
+				if a[i].op ~= b[i].op or a[i].value ~= b[i].value then return false end
+			end
+		end
+	end
+	return true
+end
+
+-- The next merged condition (from a moving start point, so shared runs keep
+-- their relative order) the needle can merge into: same trigger and
+-- variable, and for a combination the whole subtree equal.
+local function findMatchingCondition(all, needle, start, templates)
+	while true do
+		local cond = all[start]
+		if not cond then return nil end
+		if cond.check.trigger == needle.check.trigger and cond.check.variable == needle.check.variable then
+			if cond.check.trigger == -2 then
+				if compareSubChecks(cond.check.checks, needle.check.checks, templates) then return start end
+			else
+				return start
+			end
+		end
+		start = start + 1
+	end
+end
+
+-- The first merged change of the same property this member hasn't already
+-- claimed -- two same-property changes on one member stay two rows.
+local function findMatchingProperty(all, change, id)
+	for i = 1, table.getn(all) do
+		if all[i].property == change.property then
+			if not (all[i].references and all[i].references[id]) then return i end
+		end
+	end
+	return nil
+end
+
+local function mergeConditionChange(all, change, id, changeIndex, props)
+	local ptype = conditionPropertyType(all.property, props)
+	if TABLE_VALUE_PROPERTY[ptype] and type(all.value) == "table" and type(change.value) == "table" then
+		-- Per-key merge over the union of keys either side holds. A key
+		-- present on one side and absent on the other is a disagreement, not
+		-- an adoption.
+		if type(all.samevalue) ~= "table" then all.samevalue = {} end
+		local keys = {}
+		for k in pairs(all.value) do keys[k] = true end
+		for k in pairs(change.value) do keys[k] = true end
+		for k in pairs(keys) do
+			if all.samevalue[k] == false then
+				-- settled as a conflict by an earlier member
+			elseif mergeValuesEqual(all.value[k], change.value[k]) then
+				all.samevalue[k] = true
+			else
+				all.value[k] = nil
+				all.samevalue[k] = false
+			end
+		end
+	elseif TABLE_VALUE_PROPERTY[ptype] then
+		if type(all.value) ~= type(change.value) then
+			all.value = nil
+			all.samevalue = nil
+		end
+	elseif not mergeValuesEqual(all.value, change.value) then
+		all.value = nil
+		all.samevalue = false
+	end
+	all.references = all.references or {}
+	all.references[id] = { changeIndex = changeIndex, value = change.value }
+	all.referenceCount = (all.referenceCount or 0) + 1
+end
+
+local function mergeCondition(all, cond, id, conditionIndex, props)
+	if all.check.op ~= cond.check.op then
+		all.check.op = nil
+		all.check.sameop = false
+	end
+	if all.check.value ~= cond.check.value then
+		all.check.value = nil
+		all.check.samevalue = false
+	end
+	all.check.references[id] = { conditionIndex = conditionIndex, op = cond.check.op, value = cond.check.value }
+	all.check.referenceCount = all.check.referenceCount + 1
+	local insertPoint = 1
+	for changeIndex = 1, table.getn(cond.changes) do
+		local change = cond.changes[changeIndex]
+		local match = findMatchingProperty(all.changes, change, id)
+		if not match then
+			local copy = WA.DeepCopy(change)
+			initSameValue(copy, props)
+			copy.references = { [id] = { changeIndex = changeIndex, value = change.value } }
+			copy.referenceCount = 1
+			table.insert(all.changes, insertPoint, copy)
+			insertPoint = insertPoint + 1
+		else
+			mergeConditionChange(all.changes[match], change, id, changeIndex, props)
+			insertPoint = match + 1
+		end
+	end
+end
+
+-- Folds one member's condition list into the merged copy (upstream
+-- mergeConditions): matched conditions merge in place, unmatched ones
+-- deep-copy in at the moving insert point.
+local function mergeConditions(all, list, id, templates, props)
+	local insertPoint = 1
+	for conditionIndex = 1, table.getn(list) do
+		local cond = list[conditionIndex]
+		local match = findMatchingCondition(all, cond, insertPoint, templates)
+		if not match then
+			local copy = WA.DeepCopy(cond)
+			copy.check.samevalue = true
+			copy.check.sameop = true
+			copy.check.references = { [id] = { conditionIndex = conditionIndex, op = cond.check.op, value = cond.check.value } }
+			copy.check.referenceCount = 1
+			for changeIndex = 1, table.getn(copy.changes or {}) do
+				local change = copy.changes[changeIndex]
+				initSameValue(change, props)
+				change.references = { [id] = { changeIndex = changeIndex, value = cond.changes[changeIndex].value } }
+				change.referenceCount = 1
+			end
+			table.insert(all, insertPoint, copy)
+			insertPoint = insertPoint + 1
+		else
+			mergeCondition(all[match], cond, id, conditionIndex, props)
+			insertPoint = match + 1
+		end
+	end
+end
+
+-- Whether a change's value is whole enough to travel in a copy-to-all: the
+-- load-bearing keys must agree for a table value (upstream checkSameValue).
+local function checkSameValue(samevalue, ptype)
+	if ptype == "chat" then
+		return type(samevalue) == "table" and samevalue.message_type and samevalue.message
+	elseif ptype == "sound" then
+		return type(samevalue) == "table" and samevalue.sound and samevalue.sound_type
+	else
+		return samevalue
+	end
+end
+
+-- The whole conditions pane for a member set -- one path for every selection
+-- shape, a single aura being a one-member merge where nothing can disagree.
+local function conditionOptionsCore(fields, members)
+	local memberCount = table.getn(members)
+	local multi = memberCount > 1
+	local templates, numTriggers = mergedConditionTemplates(members)
+	local props = mergedConditionProperties(members)
+
+	-- The merged condition list. Members fold in reverse, as upstream's do.
+	local conditions = {}
+	for m = table.getn(members), 1, -1 do
+		local data = members[m]
+		data.conditions = data.conditions or {}
+		for ci = 1, table.getn(data.conditions) do
+			data.conditions[ci].check = data.conditions[ci].check or {}
+			data.conditions[ci].changes = data.conditions[ci].changes or {}
+		end
+		mergeConditions(conditions, data.conditions, data.id, templates, props)
+	end
+
 	table.insert(fields, { type = "header", name = "Conditions" })
-	data.conditions = data.conditions or {}
-	local templates = WA.GetConditionTemplates(data)
-	local props = WA.GetProperties(data)
-	local numTriggers = table.getn(data.triggers or {})
 
 	-- Trigger dropdown: Combinations (-2), each trigger number, plus Global (-1).
 	local trigVals, trigLabels = {}, {}
@@ -1270,37 +1504,232 @@ function S.appendConditionOptions(fields, data)
 		return check
 	end
 
-	local appendConditionCheck
-	appendConditionCheck = function(out, check, parent, childIndex, depth)
-		depth = depth or 0
+	-- -----------------------------------------------------------------------
+	-- Write plumbing. Every edit walks the merged condition's references into
+	-- each member's real list and keeps the merged copy in sync, so a read
+	-- between repaints stays fresh. Repaint policy: structural edits always
+	-- repaint; value writes repaint only under a multi-member pane, where the
+	-- disagreement dress has to follow the data.
+	-- -----------------------------------------------------------------------
 
-		local function setTrigger(v)
-			local trigger = tonumber(v)
-			check.trigger = trigger
-			if trigger == -2 then
-				if check.variable ~= "AND" and check.variable ~= "OR" then check.variable = "AND" end
-				check.op, check.value = nil, nil
-				check.checks = check.checks or { newConditionCheck() }
-			else
-				check.checks = nil
-				local vars = S.conditionVariableList(trigger, templates)
-				check.variable = vars[1]
-				local vt, tmpl = S.conditionVarType(check, templates)
-				check.op, check.value = S.defaultOpValue(vt, tmpl)
-			end
-			WA.Add(data); S.refreshTabContent()
+	local function eachRef(cond, fn)
+		for id, ref in pairs(cond.check.references) do
+			local child = WeakestAurasDB.displays[id]
+			local ccond = child and child.conditions and child.conditions[ref.conditionIndex]
+			if ccond then fn(child, ccond, ref.conditionIndex) end
 		end
+	end
+
+	local function fanCheck(cond, path, fn, structural)
+		S.beginRepaintBatch()
+		eachRef(cond, function(child, ccond)
+			fn(getOrCreateSubCheck(ccond.check, path))
+			WA.Add(child)
+		end)
+		fn(getOrCreateSubCheck(cond.check, path))
+		if structural or multi then S.refreshTabContent() end
+		S.endRepaintBatch()
+	end
+
+	local function eachChangeRef(cond, change, fn)
+		for id, ref in pairs(change.references) do
+			local condRef = cond.check.references[id]
+			local child = WeakestAurasDB.displays[id]
+			local ccond = child and condRef and child.conditions and child.conditions[condRef.conditionIndex]
+			local cchange = ccond and ccond.changes and ccond.changes[ref.changeIndex]
+			if cchange then fn(child, cchange, ccond, ref.changeIndex) end
+		end
+	end
+
+	local function fanChangeValue(cond, change, v)
+		S.beginRepaintBatch()
+		eachChangeRef(cond, change, function(child, cchange)
+			cchange.value = type(v) == "table" and WA.DeepCopy(v) or v
+			WA.Add(child)
+		end)
+		change.value = v
+		if multi then S.refreshTabContent() end
+		S.endRepaintBatch()
+	end
+
+	-- The sound/chat/glow editors write individual keys into a change's value
+	-- table, so the merged copy can't be handed to them directly. They get a
+	-- write-through proxy instead: reads fall through to the merged value,
+	-- writes fan the one key to every referenced member. The proxy itself
+	-- stays empty -- that is what keeps __newindex firing on every write, not
+	-- just the first per key.
+	local function changeValueProxy(cond, change)
+		if type(change.value) ~= "table" then change.value = {} end
+		local merged = change.value
+		return setmetatable({}, {
+			__index = merged,
+			__newindex = function(_, k, v)
+				S.beginRepaintBatch()
+				eachChangeRef(cond, change, function(child, cchange)
+					if type(cchange.value) ~= "table" then cchange.value = {} end
+					cchange.value[k] = type(v) == "table" and WA.DeepCopy(v) or v
+					WA.Add(child)
+				end)
+				merged[k] = v
+				if multi then S.refreshTabContent() end
+				S.endRepaintBatch()
+			end,
+		})
+	end
+
+	-- Disagreement and subset dress, matching the other mass-edit tabs: blue
+	-- caption, per-member value tooltip; a condition or change only some
+	-- members carry gets the blue plus the member list.
+	local function isSubset(carrier)
+		return multi and (carrier.referenceCount or 0) < memberCount
+	end
+	local function blue(name) return "|cFF4080FF" .. name .. "|r" end
+	local function subsetTooltip(carrier)
+		local lines = {}
+		for id in pairs(carrier.references) do
+			table.insert(lines, "|cFFE0E000" .. id .. "|r")
+		end
+		return { title = "Only on:", lines = lines }
+	end
+	-- Whether a merged change carries any disagreement. samevalue is nil when
+	-- the members' value types don't even match (one edited a table, one
+	-- never touched the change and holds nil) -- upstream's blueIfNoValue2
+	-- reads that as "differs", and so does this.
+	local function changeDiverges(change)
+		local same = change.samevalue
+		if same == false or same == nil then return true end
+		if type(same) == "table" then
+			for _, flag in pairs(same) do
+				if flag == false then return true end
+			end
+		end
+		return false
+	end
+	local function checkTooltip(name, cond, withOp)
+		local lines = {}
+		for id, ref in pairs(cond.check.references) do
+			local text = mergeValueText(ref.value)
+			if withOp then text = tostring(ref.op or "-") .. " " .. text end
+			table.insert(lines, "|cFFE0E000" .. id .. ":|r " .. text)
+		end
+		return { title = name, lines = lines }
+	end
+	local function changeTooltip(name, change, subkey)
+		local lines = {}
+		for id, ref in pairs(change.references) do
+			local v = ref.value
+			if subkey then v = type(v) == "table" and v[subkey] or nil end
+			table.insert(lines, "|cFFE0E000" .. id .. ":|r " .. mergeValueText(v))
+		end
+		return { title = name, lines = lines }
+	end
+
+	-- Appends the op/value editor for a check, picking the widget by variable
+	-- type. Only a top-level check can carry disagreement -- merged
+	-- combination subtrees are strictly equal by construction -- and `mode`
+	-- says which half of it a widget wears (the string case splits op and
+	-- value across two).
+	local function appendCheckValue(out, cond, path, check, vtype, template, indent)
+		if vtype == "combination" or vtype == "incompatible" then return end
+		local top = table.getn(path) == 0
+		local opDiff = multi and top and cond.check.sameop == false
+		local valDiff = multi and top and cond.check.samevalue == false
+		local function dress(f, plainName, mode)
+			local diff = (mode ~= "value" and opDiff) or (mode ~= "op" and valDiff)
+			if diff then
+				f.name = blue(plainName)
+				f.tooltip = checkTooltip(plainName, cond, mode ~= "value")
+			end
+			return f
+		end
+		if vtype == "number" or vtype == "timer" or vtype == "elapsedTimer" then
+			local label = vtype == "timer" and "Remaining (s)"
+				or (vtype == "elapsedTimer" and "Elapsed (s)" or "Value")
+			table.insert(out, dress({
+				type = "opnumber", name = label, indent = indent,
+				getOp = function() if opDiff then return nil end return check.op or ">=" end,
+				setOp = function(v) fanCheck(cond, path, function(c) c.op = v end) end,
+				getVal = function() if valDiff then return nil end return check.value end,
+				setVal = function(v) fanCheck(cond, path, function(c) c.value = v end) end,
+			}, label, "both"))
+		elseif vtype == "bool" then
+			table.insert(out, dress({
+				type = "toggle", name = "Is true", indent = indent, tristate = multi,
+				get = function()
+					if valDiff then return nil end
+					return check.value == true or check.value == "true"
+				end,
+				set = function(v)
+					fanCheck(cond, path, function(c) c.op = "=="; c.value = v and true or false end)
+				end,
+			}, "Is true", "value"))
+		elseif vtype == "select" then
+			table.insert(out, dress({
+				type = "select", name = "Value", indent = indent,
+				values = (template and template.values) or {},
+				get = function() if valDiff then return nil end return check.value end,
+				set = function(v)
+					fanCheck(cond, path, function(c) c.op = "=="; c.value = v end)
+				end,
+			}, "Value", "value"))
+		else -- string
+			table.insert(out, dress({
+				type = "select", name = "Op", half = true, indent = indent,
+				values = { "==", "~=" },
+				get = function() if opDiff then return nil end return check.op or "==" end,
+				set = function(v) fanCheck(cond, path, function(c) c.op = v end) end,
+			}, "Op", "op"))
+			table.insert(out, dress({
+				type = "input", name = "Value", half = true, indent = indent,
+				get = function() if valDiff then return nil end return check.value end,
+				set = function(v) fanCheck(cond, path, function(c) c.value = v end) end,
+			}, "Value", "value"))
+		end
+	end
+
+	local appendConditionCheck
+	appendConditionCheck = function(out, cond, check, path, depth)
+		local top = table.getn(path) == 0
 
 		local triggerField = {
 			type = "select", name = "Trigger", half = true, indent = depth,
 			values = trigVals, labels = trigLabels,
 			get = function() return tostring(check.trigger or 1) end,
-			set = setTrigger,
+			set = function(v)
+				local trigger = tonumber(v)
+				local seed
+				if trigger == -2 then
+					seed = newConditionCheck()
+				else
+					seed = { trigger = trigger }
+					local vars = S.conditionVariableList(trigger, templates)
+					seed.variable = vars[1]
+					local vt, tmpl = S.conditionVarType(seed, templates)
+					seed.op, seed.value = S.defaultOpValue(vt, tmpl)
+				end
+				fanCheck(cond, path, function(c)
+					c.trigger = trigger
+					if trigger == -2 then
+						if c.variable ~= "AND" and c.variable ~= "OR" then c.variable = "AND" end
+						c.op, c.value = nil, nil
+						c.checks = c.checks or { WA.DeepCopy(seed) }
+					else
+						c.checks = nil
+						c.variable = seed.variable
+						c.op, c.value = seed.op, seed.value
+					end
+				end, true)
+			end,
 		}
-		if parent then
+		if not top then
 			triggerField.actions = { W.DeleteAction(function()
-				table.remove(parent.checks, childIndex)
-				WA.Add(data); S.refreshTabContent()
+				S.beginRepaintBatch()
+				eachRef(cond, function(child, ccond)
+					removeSubCheck(ccond.check, path)
+					WA.Add(child)
+				end)
+				S.refreshTabContent()
+				S.endRepaintBatch()
 			end) }
 		end
 		table.insert(out, triggerField)
@@ -1311,82 +1740,374 @@ function S.appendConditionOptions(fields, data)
 			values = varVals, labels = varLabels,
 			get = function() return check.variable end,
 			set = function(v)
-				check.variable = v
-				if check.trigger == -2 then
-					check.op, check.value = nil, nil
-					check.checks = check.checks or { newConditionCheck() }
-				else
-					check.checks = nil
-					local vt, tmpl = S.conditionVarType(check, templates)
-					check.op, check.value = S.defaultOpValue(vt, tmpl)
-				end
-				WA.Add(data); S.refreshTabContent()
+				local probe = { trigger = check.trigger, variable = v }
+				local vt, tmpl = S.conditionVarType(probe, templates)
+				local op, value = S.defaultOpValue(vt, tmpl)
+				local sub = (check.trigger == -2) and newConditionCheck() or nil
+				fanCheck(cond, path, function(c)
+					c.variable = v
+					if c.trigger == -2 then
+						c.op, c.value = nil, nil
+						c.checks = c.checks or { WA.DeepCopy(sub) }
+					else
+						c.checks = nil
+						c.op, c.value = op, value
+					end
+				end, true)
 			end,
 		})
 
 		local vtype, template = S.conditionVarType(check, templates)
-		appendCheckValue(out, data, check, vtype, template, depth)
+		appendCheckValue(out, cond, path, check, vtype, template, depth)
 
 		if check.trigger == -2 then
-			check.checks = check.checks or {}
-			for i = 1, table.getn(check.checks) do
-				if not check.checks[i] then check.checks[i] = newConditionCheck() end
-				appendConditionCheck(out, check.checks[i], check, i, depth + 1)
+			local subChecks = check.checks or {}
+			for ci = 1, table.getn(subChecks) do
+				local subPath = {}
+				for pi = 1, table.getn(path) do subPath[pi] = path[pi] end
+				table.insert(subPath, ci)
+				appendConditionCheck(out, cond, subChecks[ci], subPath, depth + 1)
 			end
 			table.insert(out, {
 				type = "button", name = "+ Add nested check", indent = depth,
 				onClick = function()
-					table.insert(check.checks, newConditionCheck())
-					WA.Add(data); S.refreshTabContent()
+					local seed = newConditionCheck()
+					fanCheck(cond, path, function(c)
+						c.checks = c.checks or {}
+						table.insert(c.checks, WA.DeepCopy(seed))
+					end, true)
 				end,
 			})
 		end
 	end
 
-	for ci = 1, table.getn(data.conditions) do
-		local cond = data.conditions[ci]
-		local idx = ci
-		cond.check = cond.check or { trigger = numTriggers >= 1 and 1 or -1 }
-		cond.changes = cond.changes or {}
-		local check = cond.check
+	-- Appends the value widget for one property change, picked by property
+	-- type. The sound/chat/glow editors paint against the write-through
+	-- proxy, then their captions are dressed after the fact per subkey, off
+	-- the samevalue table the merge filled in.
+	local function appendChangeValue(out, cond, change, pentry)
+		local ptype = pentry and pentry.type
+		local valDiff = multi and change.samevalue == false
+		local function dress(f, plainName)
+			if valDiff then
+				f.name = blue(plainName)
+				f.tooltip = changeTooltip(plainName, change, nil)
+			end
+			return f
+		end
+		if pentry and pentry.action then
+			local start = table.getn(out)
+			if ptype == "sound" and WA.ActionSoundFields then
+				WA.ActionSoundFields(out, members[1], changeValueProxy(cond, change), true)
+			elseif ptype == "chat" and WA.ActionMessageFields then
+				WA.ActionMessageFields(out, members[1], changeValueProxy(cond, change), "condition", true)
+			elseif ptype == "customcode" then
+				table.insert(out, dress({ type = "code", height = 80, name = "Custom Code",
+					get = function() if valDiff then return nil end return change.value end,
+					set = function(v) fanChangeValue(cond, change, v) end }, "Custom Code"))
+			elseif ptype == "glowexternal" then
+				WA.ConditionGlowFields(out, members[1], { value = changeValueProxy(cond, change) })
+			end
+			local same = change.samevalue
+			-- samevalue nil means the members' value types didn't even match
+			-- (one edited a table, another still holds nil): every keyed
+			-- subkey is a disagreement then, not none of them.
+			if multi and (same == nil or type(same) == "table") then
+				for fi = start + 1, table.getn(out) do
+					local f = out[fi]
+					local diff
+					-- The chat colour field is a composite over the r/g/b keys.
+					if same == nil then
+						diff = f.key ~= nil
+					elseif f.key == "message_color" then
+						diff = same.r == false or same.g == false or same.b == false
+					else
+						diff = f.key and same[f.key] == false
+					end
+					if diff then
+						local plain = f.name
+						f.name = blue(plain)
+						f.tooltip = changeTooltip(plain, change,
+							f.key ~= "message_color" and f.key or nil)
+						-- The helper's own get falls back to its default over
+						-- the blanked merged key, which would paint one
+						-- member's-looking value as if everyone agreed; a
+						-- disagreeing subkey blanks like every other merged
+						-- field.
+						if f.type == "color" then
+							f.get = function() return { 0, 0, 0, 1 } end
+						else
+							if f.type == "toggle" then f.tristate = true end
+							f.get = function() return nil end
+						end
+					end
+				end
+			end
+			return
+		end
+		if ptype == "incompatible" then
+			table.insert(out, { type = "description",
+				name = "The selected auras type this property differently; it cannot be edited here." })
+			return
+		end
+		if ptype == "bool" then
+			table.insert(out, dress({
+				type = "toggle", name = "Value", half = true, tristate = multi,
+				get = function()
+					if valDiff then return nil end
+					return change.value and true or false
+				end,
+				set = function(v) fanChangeValue(cond, change, v and true or false) end,
+			}, "Value"))
+		elseif ptype == "color" then
+			-- A disagreeing colour shows black -- the swatch has to show
+			-- something pickable, and the blue caption is what says "differ".
+			table.insert(out, dress({
+				type = "color", name = "Value", half = true,
+				get = function()
+					if valDiff then return { 0, 0, 0, 1 } end
+					return change.value
+				end,
+				set = function(v) fanChangeValue(cond, change, v) end,
+			}, "Value"))
+		-- A property naming only a `softMax` is still a track-and-box field, not
+		-- the plain input box below: the ceiling it omits is the hard one.
+		elseif ptype == "number" and pentry.min and (pentry.max or pentry.softMax) then
+			table.insert(out, dress({
+				type = "range", name = "Value", half = true, min = pentry.min, max = pentry.max,
+				softMax = pentry.softMax, step = pentry.step or 1,
+				get = function() if valDiff then return nil end return change.value end,
+				set = function(v) fanChangeValue(cond, change, v) end,
+			}, "Value"))
+		elseif ptype == "list" then
+			local vals, labels = {}, {}
+			for k, lbl in pairs(pentry.values or {}) do table.insert(vals, k); labels[k] = lbl end
+			table.sort(vals)
+			table.insert(out, dress({
+				type = "select", name = "Value", half = true, values = vals, labels = labels,
+				get = function() if valDiff then return nil end return change.value end,
+				set = function(v) fanChangeValue(cond, change, v) end,
+			}, "Value"))
+		else
+			table.insert(out, dress({
+				type = "input", name = "Value", half = true,
+				get = function() if valDiff then return nil end return change.value end,
+				set = function(v) fanChangeValue(cond, change, (ptype == "number") and tonumber(v) or v) end,
+			}, "Value"))
+		end
+	end
 
-		-- Collapsible + deletable, same as a trigger/display-effect section. The
-		-- delete lives in the header rather than as a trailing button precisely
-		-- so a folded condition can still be removed.
-		local key = "cond:" .. idx
-		local collapsed = S.isCollapsed(data, key, table.getn(data.conditions) > 1)
-		table.insert(fields, {
-			type = "header", name = "Condition " .. idx, collapsed = collapsed,
-			actions = W.ListActions(data.conditions, idx, function()
-				S.clearCollapsed(data, "cond:")
-				WA.Add(data); S.refreshTabContent()
-			end),
+	for i = 1, table.getn(conditions) do
+		local cond = conditions[i]
+		local idx = i
+		local subset = isSubset(cond.check)
+
+		-- Fold state lives per member under that member's own index; the
+		-- merged section folds when ANY member has it folded (upstream's
+		-- convention), and toggling writes every member.
+		local defaultCollapsed = table.getn(conditions) > 1
+		local collapsed = false
+		eachRef(cond, function(child, ccond, childIndex)
+			if S.isCollapsed(child, "cond:" .. childIndex, defaultCollapsed) then collapsed = true end
+		end)
+
+		-- Structural ops fan per reference into each member's list at its own
+		-- index; each op handles its own fold bookkeeping, and the repaint
+		-- comes from ListActions' onChanged.
+		local function eachRefStructural(fn)
+			S.beginRepaintBatch()
+			eachRef(cond, function(child, ccond, childIndex)
+				fn(child, ccond, childIndex)
+				WA.Add(child)
+			end)
+			S.endRepaintBatch()
+		end
+
+		-- Collapsible + deletable, same as a trigger/display-effect section.
+		-- The delete lives in the header rather than as a trailing button
+		-- precisely so a folded condition can still be removed. The title
+		-- carries the changes' property names (upstream's GetConditionTitle):
+		-- bare positional numbers made a move look like a no-op, since the
+		-- reordered list reads identically. A change the members disagree on
+		-- -- or that only some carry -- blues its name in the title and adds a
+		-- line to the header tooltip, because a folded section otherwise hides
+		-- every divergence mark its rows wear. The header cap counts visible
+		-- characters only; cutting a colour-coded string mid-escape would
+		-- bleed the colour into the rest of the line.
+		local hdrName = "Condition " .. idx
+		local tipLines = {}
+		if subset then
+			local carriers = {}
+			for id in pairs(cond.check.references) do table.insert(carriers, id) end
+			table.sort(carriers)
+			table.insert(tipLines, "|cFFE0E000Only on " .. table.concat(carriers, ", ") .. "|r")
+		end
+		local parts, visible = {}, 0
+		for cj = 1, table.getn(cond.changes) do
+			local change = cond.changes[cj]
+			local entry = change.property and props[change.property]
+			if entry and entry.display then
+				local plain = entry.display
+				local text = plain
+				if multi and isSubset(change) then
+					local carriers = {}
+					for id in pairs(change.references) do table.insert(carriers, id) end
+					table.sort(carriers)
+					table.insert(tipLines, plain .. " |cFFE0E000only on " .. table.concat(carriers, ", ") .. "|r")
+					if not subset then text = blue(plain) end
+				elseif multi and changeDiverges(change) then
+					table.insert(tipLines, plain .. " |cFFE0E000differs|r")
+					if not subset then text = blue(plain) end
+				end
+				if visible + string.len(plain) > 40 and table.getn(parts) > 0 then
+					table.insert(parts, "...")
+					break
+				end
+				visible = visible + string.len(plain) + 2
+				table.insert(parts, text)
+			end
+		end
+		if table.getn(parts) > 0 then hdrName = hdrName .. ": " .. table.concat(parts, ", ") end
+
+		-- Reordering happens on the merged pane's own axis: the section swaps
+		-- slots and every member's list is rewritten into the pane's order of
+		-- the conditions it carries, fold state following by the same map. A
+		-- per-member relative swap (upstream's semantics) moves only where a
+		-- member can, which re-pairs same-variable conditions mid-move and
+		-- reads as sections recombining at random.
+		local function moveSection(delta)
+			local target = idx + delta
+			if target < 1 or target > table.getn(conditions) then return end
+			conditions[idx], conditions[target] = conditions[target], conditions[idx]
+			S.beginRepaintBatch()
+			for m = 1, table.getn(members) do
+				local child = members[m]
+				local list, map, touched = {}, {}, false
+				for s = 1, table.getn(conditions) do
+					local ref = conditions[s].check.references[child.id]
+					if ref then
+						table.insert(list, child.conditions[ref.conditionIndex])
+						map[ref.conditionIndex] = table.getn(list)
+						if ref.conditionIndex ~= table.getn(list) then touched = true end
+					end
+				end
+				if touched then
+					for s = 1, table.getn(list) do child.conditions[s] = list[s] end
+					S.remapCollapsed(child, "cond:", map)
+					WA.Add(child)
+				end
+			end
+			S.endRepaintBatch()
+		end
+		local hdr = {
+			type = "header", name = subset and blue(hdrName) or hdrName,
+			key = "cond:" .. idx, collapsed = collapsed,
+			actions = W.ListActions(conditions, idx, S.refreshTabContent, {
+				duplicate = function()
+					eachRefStructural(function(child, ccond, childIndex)
+						table.insert(child.conditions, childIndex + 1, WA.DeepCopy(ccond))
+						S.clearCollapsed(child, "cond:")
+					end)
+				end,
+				moveUp = function() moveSection(-1) end,
+				moveDown = function() moveSection(1) end,
+				delete = function()
+					eachRefStructural(function(child, ccond, childIndex)
+						table.remove(child.conditions, childIndex)
+						S.clearCollapsed(child, "cond:")
+					end)
+				end,
+			}),
 			onToggle = function()
-				S.setCollapsed(data, key, not collapsed)
+				eachRef(cond, function(child, ccond, childIndex)
+					S.setCollapsed(child, "cond:" .. childIndex, not collapsed)
+				end)
 				S.refreshTabContent()
 			end,
-		})
-		if not collapsed then
-			appendConditionCheck(fields, check, nil, nil, 0)
+		}
+		if table.getn(tipLines) > 0 then
+			hdr.tooltip = { title = "Condition " .. idx, lines = tipLines }
+		end
+		table.insert(fields, hdr)
 
-			for chi = 1, table.getn(cond.changes) do
-				local change = cond.changes[chi]
-				local cidx = chi
+		if not collapsed then
+			appendConditionCheck(fields, cond, cond.check, {}, 0)
+
+			if subset then
+				-- Upstream's "Copy to all auras": plant this condition into
+				-- every member that lacks it, right after wherever that member
+				-- last shared a condition with the pane, carrying only the
+				-- changes whose values the sharing members agree on.
 				table.insert(fields, {
-					type = "select", name = "Change", half = true, values = propVals, labels = propLabels,
-					get = function() return change.property end,
-					set = function(v)
-						change.property = v
-						change.value = S.defaultPropertyValue(props[v])
-						WA.Add(data); S.refreshTabContent()
+					type = "button", name = "Copy to all selected",
+					onClick = function()
+						S.beginRepaintBatch()
+						for m = 1, table.getn(members) do
+							local child = members[m]
+							if not cond.check.references[child.id] then
+								local insertPoint = 1
+								for back = idx, 1, -1 do
+									local ref = conditions[back].check.references[child.id]
+									if ref then insertPoint = ref.conditionIndex + 1; break end
+								end
+								local newCond = { check = {
+									trigger = cond.check.trigger, variable = cond.check.variable,
+									op = cond.check.op, value = cond.check.value,
+								}, changes = {} }
+								if cond.check.checks then
+									newCond.check.checks = WA.DeepCopy(cond.check.checks)
+								end
+								for cj = 1, table.getn(cond.changes) do
+									local change = cond.changes[cj]
+									local ptype = conditionPropertyType(change.property, props)
+									if checkSameValue(change.samevalue, ptype) then
+										table.insert(newCond.changes, { property = change.property,
+											value = type(change.value) == "table"
+												and WA.DeepCopy(change.value) or change.value })
+									end
+								end
+								table.insert(child.conditions, insertPoint, newCond)
+								WA.Add(child)
+							end
+						end
+						S.refreshTabContent()
+						S.endRepaintBatch()
 					end,
 				})
-				appendChangeValue(fields, data, change, change.property and props[change.property])
+			end
+
+			for j = 1, table.getn(cond.changes) do
+				local change = cond.changes[j]
+				local changeSubset = isSubset(change)
+				local sel = {
+					type = "select", name = changeSubset and blue("Change") or "Change",
+					half = true, values = propVals, labels = propLabels,
+					get = function() return change.property end,
+					set = function(v)
+						local default = S.defaultPropertyValue(props[v])
+						S.beginRepaintBatch()
+						eachChangeRef(cond, change, function(child, cchange)
+							cchange.property = v
+							cchange.value = type(default) == "table" and WA.DeepCopy(default) or default
+							WA.Add(child)
+						end)
+						S.refreshTabContent()
+						S.endRepaintBatch()
+					end,
+				}
+				if changeSubset then sel.tooltip = subsetTooltip(change) end
+				table.insert(fields, sel)
+				appendChangeValue(fields, cond, change, change.property and props[change.property])
 				table.insert(fields, {
 					type = "button", name = "Remove change",
 					onClick = function()
-						table.remove(cond.changes, cidx)
-						WA.Add(data); S.refreshTabContent()
+						S.beginRepaintBatch()
+						eachChangeRef(cond, change, function(child, cchange, ccond, changeIndex)
+							table.remove(ccond.changes, changeIndex)
+							WA.Add(child)
+						end)
+						S.refreshTabContent()
+						S.endRepaintBatch()
 					end,
 				})
 			end
@@ -1394,8 +2115,15 @@ function S.appendConditionOptions(fields, data)
 				type = "button", name = "+ Add change",
 				onClick = function()
 					local firstProp = propVals[1]
-					table.insert(cond.changes, { property = firstProp, value = S.defaultPropertyValue(props[firstProp]) })
-					WA.Add(data); S.refreshTabContent()
+					local default = S.defaultPropertyValue(props[firstProp])
+					S.beginRepaintBatch()
+					eachRef(cond, function(child, ccond)
+						table.insert(ccond.changes, { property = firstProp,
+							value = type(default) == "table" and WA.DeepCopy(default) or default })
+						WA.Add(child)
+					end)
+					S.refreshTabContent()
+					S.endRepaintBatch()
 				end,
 			})
 		end
@@ -1404,11 +2132,38 @@ function S.appendConditionOptions(fields, data)
 	table.insert(fields, {
 		type = "button", name = "+ Add Condition",
 		onClick = function()
-			data.conditions = data.conditions or {}
-			table.insert(data.conditions, { check = newConditionCheck(), changes = {} })
-			WA.Add(data); S.refreshTabContent()
+			local seed = { check = newConditionCheck(), changes = {} }
+			S.beginRepaintBatch()
+			for m = 1, table.getn(members) do
+				local child = members[m]
+				child.conditions = child.conditions or {}
+				table.insert(child.conditions, WA.DeepCopy(seed))
+				S.setCollapsed(child, "cond:" .. table.getn(child.conditions), false)
+				WA.Add(child)
+			end
+			S.refreshTabContent()
+			S.endRepaintBatch()
 		end,
 	})
+end
+
+function S.appendConditionOptions(fields, data)
+	conditionOptionsCore(fields, { data })
+end
+
+-- The merged conditions pane for a multi-selection or a group's leaves; the
+-- id list is the only thing distinguishing the two shapes.
+function S.buildMergedConditionFields(ids)
+	local fields = {}
+	local members = {}
+	for i = 1, table.getn(ids) do
+		local data = WeakestAurasDB.displays[ids[i]]
+		if data then table.insert(members, data) end
+	end
+	if table.getn(members) > 0 then
+		conditionOptionsCore(fields, members)
+	end
+	return fields
 end
 
 -- ---------------------------------------------------------------------------
@@ -1527,7 +2282,7 @@ function S.appendTriggerOptions(fields, data)
 	-- one trigger; a single-trigger aura keeps the tab uncluttered.
 	if numTriggers > 1 then
 		table.insert(fields, {
-			type = "select", name = "Show If", half = true,
+			type = "select", name = "Show If", key = "disjunctive", half = true,
 			values = { "all", "any", "custom" }, labels = DISJUNCTIVE_LABELS,
 			get = function() return triggers.disjunctive or "all" end,
 			set = function(v) triggers.disjunctive = v; WA.Add(data); S.refreshTabContent() end,
@@ -1539,7 +2294,7 @@ function S.appendTriggerOptions(fields, data)
 			modeLabels[tostring(n)] = "Trigger " .. n
 		end
 		table.insert(fields, {
-			type = "select", name = "Dynamic Info From", half = true, values = modeVals, labels = modeLabels,
+			type = "select", name = "Dynamic Info From", key = "activeTriggerMode", half = true, values = modeVals, labels = modeLabels,
 			get = function()
 				local atm = triggers.activeTriggerMode
 				if atm == nil or atm == WA.trigger_modes.first_active then return "auto" end
@@ -1553,7 +2308,7 @@ function S.appendTriggerOptions(fields, data)
 
 		if (triggers.disjunctive or "all") == "custom" then
 			table.insert(fields, {
-				type = "code", height = 60,
+				type = "code", height = 60, key = "customTriggerLogic",
 				name = "Custom Logic (e.g. function(t) return t[1] and not t[2] end)",
 				-- Raw, not `or ""`: nil means never configured (open at the
 				-- default below), "" means cleared and left cleared.
@@ -1585,7 +2340,7 @@ function S.appendTriggerOptions(fields, data)
 		local collapsed = S.isCollapsed(data, key, numTriggers > 1)
 
 		local header = {
-			type = "header", name = title, collapsed = collapsed,
+			type = "header", name = title, key = key, collapsed = collapsed,
 			onToggle = function()
 				S.setCollapsed(data, key, not collapsed)
 				S.refreshTabContent()
@@ -1611,7 +2366,7 @@ function S.appendTriggerOptions(fields, data)
 	end
 
 	table.insert(fields, {
-		type = "button", name = "+ Add Trigger",
+		type = "button", name = "+ Add Trigger", scope = "tab",
 		onClick = function()
 			local idx = WA.AddTrigger(data)
 			-- Open the new one; the others keep whatever fold state they had.
@@ -1628,14 +2383,14 @@ function S.appendActionOptions(fields, data)
 	data.actions.finish = data.actions.finish or {}
 	local function codeField(block, enabled, source, name)
 		local out = {
-			type = "toggle", name = name,
+			type = "toggle", name = name, key = enabled,
 			get = function() return block[enabled] and true or false end,
 			set = function(v) block[enabled] = v and true or false; WA.Add(data); S.refreshTabContent() end,
 		}
 		local fields = { out }
 		if block[enabled] then
 			table.insert(fields, {
-				type = "code", height = 80, name = source,
+				type = "code", height = 80, name = source, key = source,
 				get = function() return block[source] end,
 				set = function(v) block[source] = v; WA.Add(data) end,
 			})
@@ -1643,7 +2398,7 @@ function S.appendActionOptions(fields, data)
 		return fields
 	end
 
-	table.insert(fields, { type = "header", name = "Custom Functions" })
+	table.insert(fields, { type = "header", name = "Custom Functions", key = "actions.init" })
 	local initFields = codeField(data.actions.init, "do_custom", "custom", "Custom Init")
 	for i = 1, table.getn(initFields) do table.insert(fields, initFields[i]) end
 	local loadFields = codeField(data.actions.init, "do_custom_load", "customOnLoad", "Custom On Load")
@@ -1651,14 +2406,14 @@ function S.appendActionOptions(fields, data)
 	local unloadFields = codeField(data.actions.init, "do_custom_unload", "customOnUnload", "Custom On Unload")
 	for i = 1, table.getn(unloadFields) do table.insert(fields, unloadFields[i]) end
 
-	table.insert(fields, { type = "header", name = "On Show" })
+	table.insert(fields, { type = "header", name = "On Show", key = "actions.start" })
 	if WA.ActionMessageFields then WA.ActionMessageFields(fields, data, data.actions.start, "start") end
 	if WA.ActionSoundFields then WA.ActionSoundFields(fields, data, data.actions.start) end
 	if WA.ActionGlowFields then WA.ActionGlowFields(fields, data, data.actions.start, "start") end
 	local startFields = codeField(data.actions.start, "do_custom", "custom", "Custom Code")
 	for i = 1, table.getn(startFields) do table.insert(fields, startFields[i]) end
 
-	table.insert(fields, { type = "header", name = "On Hide" })
+	table.insert(fields, { type = "header", name = "On Hide", key = "actions.finish" })
 	if WA.ActionMessageFields then WA.ActionMessageFields(fields, data, data.actions.finish, "finish") end
 	if WA.ActionSoundFields then WA.ActionSoundFields(fields, data, data.actions.finish) end
 	if WA.ActionGlowFields then WA.ActionGlowFields(fields, data, data.actions.finish, "finish") end
@@ -1674,33 +2429,33 @@ function S.appendAnimationOptions(fields, data)
 		local key = blocks[i]
 		local block = data.animation[key] or { type = "none", duration_type = "seconds" }
 		data.animation[key] = block
-		table.insert(fields, { type = "header", name = names[key] })
+		table.insert(fields, { type = "header", name = names[key], key = "animation." .. key })
 		table.insert(fields, {
-			type = "select", name = "Type", values = WA.anim_type_values, labels = WA.anim_types,
+			type = "select", name = "Type", key = "type", values = WA.anim_type_values, labels = WA.anim_types,
 			get = function() return block.type or "none" end,
 			set = function(v) block.type = v; WA.Add(data, true); S.refreshTabContent() end,
 		})
 		if block.type == "preset" then
 			local values = key == "start" and WA.anim_start_preset_values or key == "main" and WA.anim_main_preset_values or WA.anim_finish_preset_values
 			local labels = key == "start" and WA.anim_start_preset_types or key == "main" and WA.anim_main_preset_types or WA.anim_finish_preset_types
-			table.insert(fields, { type = "select", name = "Preset", values = values, labels = labels,
+			table.insert(fields, { type = "select", name = "Preset", key = "preset", values = values, labels = labels,
 				get = function() return block.preset end,
 				set = function(v) block.preset = v; block.type = "preset"; WA.Add(data, true) end })
 		end
 		if block.type == "custom" then
 			local durationValues = key == "finish" and WA.duration_values_no_choice or WA.duration_values
 			local durationLabels = key == "finish" and WA.duration_types_no_choice or WA.duration_types
-			table.insert(fields, { type = "select", name = "Time In", values = durationValues, labels = durationLabels,
+			table.insert(fields, { type = "select", name = "Time In", key = "duration_type", values = durationValues, labels = durationLabels,
 				get = function() return block.duration_type or "seconds" end,
 				set = function(v) block.duration_type = v; WA.Add(data, true) end })
-			table.insert(fields, { type = "input", name = "Duration", get = function() return tostring(block.duration or "") end,
+			table.insert(fields, { type = "input", name = "Duration", key = "duration", get = function() return tostring(block.duration or "") end,
 				set = function(v) block.duration = v; WA.Add(data, true) end })
-			table.insert(fields, { type = "select", name = "Ease Type", values = WA.anim_ease_values, labels = WA.anim_ease_types,
+			table.insert(fields, { type = "select", name = "Ease Type", key = "easeType", values = WA.anim_ease_values, labels = WA.anim_ease_types,
 				get = function() return block.easeType or "none" end,
 				set = function(v) block.easeType = v; WA.Add(data, true) end })
 			local function slot(use, label, types, capability, prefix)
 				if capability and not capability() then return end
-				table.insert(fields, { type = "toggle", name = label, get = function() return block[use] end,
+				table.insert(fields, { type = "toggle", name = label, key = use, get = function() return block[use] end,
 					set = function(v) block[use] = v and true or false; WA.Add(data, true); S.refreshTabContent() end })
 				if block[use] then
 					local typeValues = prefix == "alpha" and WA.anim_alpha_values
@@ -1709,7 +2464,7 @@ function S.appendAnimationOptions(fields, data)
 						or prefix == "rotate" and WA.anim_rotate_values
 						or WA.anim_color_values
 					local typeLabels = types
-					table.insert(fields, { type = "select", name = "Type", values = typeValues, labels = typeLabels, get = function() return block[prefix .. "Type"] end,
+					table.insert(fields, { type = "select", name = "Type", key = prefix .. "Type", values = typeValues, labels = typeLabels, get = function() return block[prefix .. "Type"] end,
 						set = function(v) block[prefix .. "Type"] = v; WA.Add(data, true) end })
 				end
 			end
@@ -1967,30 +2722,11 @@ function S.openNewPane()
 	S.refreshTabContent()
 end
 
-function S.refreshTabContent()
-	-- Drop popups hosted on the panel (LibWidgets menus now float above the
-	-- content ScrollFrame rather than being parented to their button) before a
-	-- repaint hides their buttons, so none can survive a tab/aura switch.
-	LibWidgets.CloseAllMenus()
-	if S.activeTab == "new" then S.paintNewPane(); return end
-	local n = table.getn(S.selection)
-	if n > 1 then
-		-- Per-field mass editing is not available --
-		-- so a multi-selection just parks the content pane here regardless of
-		-- which tab is active, rather than showing single-aura content for an
-		-- arbitrary member.
-		paintContent({ { type = "header", name = n .. " auras selected" } })
-		return
-	end
-	local data = S.primaryId() and WeakestAurasDB.displays[S.primaryId()]
-	if not data then
-		-- Nothing picked: offer creation rather than a placeholder telling the
-		-- reader to go and create something.
-		S.activeTab = "new"
-		S.paintNewPane()
-		return
-	end
-	if S.activeTab == "display" then
+-- One aura's field array for a tab -- the single source both the ordinary
+-- single-selection paint and the mass-edit merge build from, so the two can
+-- never drift apart on what a tab contains.
+function S.buildTabFields(tab, data)
+	if tab == "display" then
 		-- Resolved rather than looked up, so an aura naming a type this addon
 		-- lacks gets the fallback's tab (which says so) instead of a blank one.
 		local region = WA.RegionSpecFor(data)
@@ -2002,69 +2738,497 @@ function S.refreshTabContent()
 		-- Subregion (text/border/glow) editing lives under Display, matching
 		-- upstream (appended to the region options, not a separate tab).
 		if not WA.IsGroup(data) then S.appendDisplayEffectsOptions(fields, data) end
-		paintContent(fields)
-	elseif S.activeTab == "trigger" then
+		return fields
+	elseif tab == "trigger" then
 		local fields = {}
 		S.appendTriggerOptions(fields, data)
-		paintContent(fields)
-	elseif S.activeTab == "conditions" then
+		return fields
+	elseif tab == "conditions" then
 		local fields = {}
 		S.appendConditionOptions(fields, data)
-		paintContent(fields)
-	elseif S.activeTab == "animation" then
+		return fields
+	elseif tab == "animation" then
 		local fields = {}
 		S.appendAnimationOptions(fields, data)
-		paintContent(fields)
-	elseif S.activeTab == "action" then
+		return fields
+	elseif tab == "action" then
 		local fields = {}
 		S.appendActionOptions(fields, data)
-		paintContent(S.collapsibleSections(fields, data, "actions:"))
-	elseif S.activeTab == "load" then
+		return S.collapsibleSections(fields, data, "actions:")
+	elseif tab == "load" then
 		local fields = {}
 		S.appendLoadOptions(fields, data)
-		paintContent(fields)
-	elseif S.activeTab == "config" then
+		return fields
+	elseif tab == "config" then
 		local fields = {}
 		WA.CustomOptionsFields(fields, data)
-		paintContent(fields)
-	else
-		paintContent(S.getInfoOptions(data))
+		return fields
 	end
+	return S.getInfoOptions(data)
 end
 
--- Groups have no trigger and no runtime state, so five of the tabs don't apply
--- to one. (Text editing lives under Display, which every region -- group or leaf
--- -- has.)
-local LEAF_ONLY_TABS = {
+-- Repaint batching for mass-edit fan-out: one merged write runs N per-member
+-- set closures, and most of those call S.refreshTabContent themselves --
+-- unbatched, that is N full repaints per keystroke. Inside a batch the calls
+-- collapse into one repaint at the closing end. Depth-counted so nested
+-- batches compose.
+local repaintBatchDepth, repaintBatchDirty = 0, false
+
+-- The tabs a multi-selection mass-edits through the generic key-merge
+-- (S.buildMergedFields). Selection members are always leaves, so every leaf
+-- tab applies. Conditions and Custom Options mass-edit too, each via its own
+-- merge (S.buildMergedConditionFields; WA.CustomOptionsFieldsMerged).
+local MULTI_TABS = {
+	info = true, display = true, trigger = true,
+	load = true, action = true, animation = true,
+}
+
+-- The tabs where a sole-selected group stands for its recursive leaf
+-- descendants and mass-edits them, as upstream's real groups do on every
+-- ordinary tab. Info and Display stay the group's own -- Display is the
+-- container-settings tab, upstream's dedicated Group tab -- and Custom runs
+-- its own group merge (WA.CustomOptionsFields).
+local GROUP_CHILD_TABS = {
 	trigger = true, conditions = true, animation = true, action = true, load = true,
 }
 
--- Hands the strip the tab list with the inapplicable ones marked hidden, which
--- is what makes it reflow over the tabs that remain. Hiding a button in place
--- would leave its slot behind: a tab is anchored to its predecessor and anchors
--- resolve against hidden frames, so a group's strip would read as two tabs and
--- five tab-shaped holes.
-function S.rebuildTabs()
+function S.beginRepaintBatch()
+	repaintBatchDepth = repaintBatchDepth + 1
+end
+
+function S.endRepaintBatch()
+	repaintBatchDepth = repaintBatchDepth - 1
+	if repaintBatchDepth <= 0 then
+		repaintBatchDepth = 0
+		if repaintBatchDirty then
+			repaintBatchDirty = false
+			S.refreshTabContent()
+		end
+	end
+end
+
+function S.refreshTabContent()
+	if repaintBatchDepth > 0 then repaintBatchDirty = true; return end
+	-- Drop popups hosted on the panel (LibWidgets menus now float above the
+	-- content ScrollFrame rather than being parented to their button) before a
+	-- repaint hides their buttons, so none can survive a tab/aura switch.
+	LibWidgets.CloseAllMenus()
+	if S.activeTab == "new" then S.paintNewPane(); return end
+	local n = table.getn(S.selection)
+	if n > 1 then
+		-- Mass edit: the merged field array across every selected aura.
+		-- Conditions and Custom Options run their own merges (a
+		-- reference-merge and the per-reference config paths that already
+		-- serve the group case).
+		if MULTI_TABS[S.activeTab] then
+			paintContent(S.buildMergedFields(S.activeTab, S.selection))
+		elseif S.activeTab == "conditions" then
+			paintContent(S.buildMergedConditionFields(S.selection))
+		elseif S.activeTab == "config" then
+			local merged = {}
+			WA.CustomOptionsFieldsMerged(merged, S.selection)
+			paintContent(merged)
+		else
+			paintContent({ { type = "header", name = n .. " auras selected" } })
+		end
+		return
+	end
 	local data = S.primaryId() and WeakestAurasDB.displays[S.primaryId()]
-	local isGroup = data and WA.IsGroup(data)
+	if not data then
+		-- Nothing picked: offer creation rather than a placeholder telling the
+		-- reader to go and create something.
+		S.activeTab = "new"
+		S.paintNewPane()
+		return
+	end
+	if WA.IsGroup(data) and GROUP_CHILD_TABS[S.activeTab] then
+		-- A group's leaf tabs mass-edit its recursive leaf descendants through
+		-- the same merges the multi-selection pane runs; which id list feeds
+		-- them is the only difference between the two.
+		local leaves = S.leafDescendants(data.id)
+		local ln = table.getn(leaves)
+		if ln == 0 then
+			paintContent({ { type = "header", name = "0 child auras" } })
+		elseif MULTI_TABS[S.activeTab] then
+			paintContent(S.buildMergedFields(S.activeTab, leaves))
+		else
+			paintContent(S.buildMergedConditionFields(leaves))
+		end
+		return
+	end
+	paintContent(S.buildTabFields(S.activeTab, data))
+end
+
+-- ---------------------------------------------------------------------------
+-- Mass edit: one field array merged across several auras. Each member's own
+-- generators run with fold forced open (see S.isCollapsed), so a field absent
+-- from a member's array means "inapplicable to this member" -- a use_ gate off,
+-- a type without the field -- never "folded away". Fields match across members
+-- by section-qualified key; a merged read blanks (nil) on disagreement; a
+-- merged write fans out through each contributing member's own set closure, so
+-- per-member side effects (WA.Add, dependent-field resets, repaints) keep
+-- their single-aura semantics. Buttons and menu picks run per member the same
+-- way. Mirrors upstream's CreateGetAll/CreateSetAll/CreateExecuteAll
+-- (WeakAurasOptions/CommonOptions.lua), with the descriptor `key` playing the
+-- role of the AceConfig option path and S.selection the role of tempGroup's
+-- children. mergeValuesEqual/mergeValueText live up by the conditions merge,
+-- which shares them.
+-- ---------------------------------------------------------------------------
+
+-- The identity one member's field is matched to another's by. A field carrying
+-- `scope = "tab"` (the trailing structural add buttons) matches tab-wide, so
+-- members with different section counts still share it. An unkeyed passive
+-- (space, description) has no identity and rides along from the first member
+-- that shows it.
+local function mergeIdentity(sectionKey, f)
+	if f.type == "header" then
+		return f.key and ("H:" .. f.key) or nil
+	end
+	local section = (f.scope == "tab") and "" or sectionKey
+	if f.key then return section .. "/" .. f.key end
+	if (f.type == "button" or f.type == "menu") and f.name then
+		return section .. "/" .. f.type .. ":" .. f.name
+	end
+	return nil
+end
+
+-- Whether the contributors' reads disagree right now -- what earns a merged
+-- field upstream's blue "these differ" label. Distinct from a merged get
+-- returning nil, which agreement on nil (a code field nobody configured) also
+-- produces.
+local function contributorsDisagree(list, getterKey)
+	local first, have = nil, false
+	for i = 1, table.getn(list) do
+		local f = list[i]
+		if f[getterKey] then
+			local v = f[getterKey]()
+			if f.type == "toggle" and getterKey == "get" then v = v and true or false end
+			if not have then
+				first, have = v, true
+			elseif not mergeValuesEqual(first, v) then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+-- The per-member value listing a disagreeing merged field hangs off its
+-- caption -- upstream's descIfNoValue convention, one gold-named line per
+-- contributor.
+local function mergeTooltip(item, plainName)
+	local lines = {}
+	for i = 1, table.getn(item.list) do
+		local c = item.list[i]
+		local text
+		if c.getOp or c.getVal then
+			text = tostring(c.getOp and c.getOp() or "") .. " " .. tostring(c.getVal and c.getVal() or "")
+		elseif c.get then
+			local v = c.get()
+			if c.type == "toggle" then v = v and true or false end
+			text = mergeValueText(v)
+		end
+		if text then
+			table.insert(lines, "|cFFE0E000" .. tostring(item.ids and item.ids[i] or "?") .. ":|r " .. text)
+		end
+	end
+	return { title = plainName, lines = lines }
+end
+
+-- All members agree -> the value; any disagreement -> nil, which the widgets
+-- render as their blank state rather than silently showing one member's value.
+-- A toggle's nil and false read the same per member before comparing.
+local function mergedGet(list, getterKey)
+	return function()
+		local first, have = nil, false
+		for i = 1, table.getn(list) do
+			local f = list[i]
+			if f[getterKey] then
+				local v = f[getterKey]()
+				if f.type == "toggle" and getterKey == "get" then v = v and true or false end
+				if not have then
+					first, have = v, true
+				elseif not mergeValuesEqual(first, v) then
+					return nil
+				end
+			end
+		end
+		return first
+	end
+end
+
+local function mergedCall(list, fnKey)
+	return function(v)
+		S.beginRepaintBatch()
+		for i = 1, table.getn(list) do
+			local fn = list[i][fnKey]
+			if fn then fn(v) end
+		end
+		S.endRepaintBatch()
+	end
+end
+
+-- A namelist widget mutates the very table its get() returns and then fires
+-- the change callbacks, so handing it one member's real list would edit that
+-- member alone. The merged field gets a throwaway proxy instead -- a copy of
+-- the agreed list, or empty when the members disagree (from which only Add is
+-- reachable, so an index-addressed op can never land on rows the members
+-- don't share) -- and every structural op re-applies itself to each member's
+-- real list before that member's own callbacks run.
+local function mergeNamelist(f, list)
+	local proxy = {}
+	local agreed = true
+	local first = list[1].get and list[1].get()
+	for i = 2, table.getn(list) do
+		if not mergeValuesEqual(first, list[i].get and list[i].get()) then agreed = false end
+	end
+	if agreed and first then
+		for i = 1, table.getn(first) do proxy[i] = first[i] end
+	end
+	f.get = function() return proxy end
+	f.onChange = nil
+	local function each(op)
+		S.beginRepaintBatch()
+		for i = 1, table.getn(list) do
+			local c = list[i]
+			local l = c.get and c.get()
+			if l then op(c, l) end
+		end
+		S.endRepaintBatch()
+	end
+	f.onAdd = function(text)
+		each(function(c, l)
+			table.insert(l, text)
+			if c.onAdd then c.onAdd(text) elseif c.onChange then c.onChange() end
+		end)
+	end
+	f.onRemove = function(index)
+		each(function(c, l)
+			table.remove(l, index)
+			if c.onRemove then c.onRemove(index) elseif c.onChange then c.onChange() end
+		end)
+	end
+	f.onReorder = function(fromIndex, before)
+		each(function(c, l)
+			local moved = table.remove(l, fromIndex)
+			local at = before > fromIndex and before - 1 or before
+			table.insert(l, at, moved)
+			if c.onReorder then c.onReorder(fromIndex, before) elseif c.onChange then c.onChange() end
+		end)
+	end
+	return agreed
+end
+
+function S.buildMergedFields(tab, ids)
+	local members = {}
+	for i = 1, table.getn(ids) do
+		local data = WeakestAurasDB.displays[ids[i]]
+		if data then
+			S.foldProbe = {}
+			local fields = S.buildTabFields(tab, data)
+			local folds = S.foldProbe
+			S.foldProbe = nil
+			table.insert(members, { data = data, fields = fields, folds = folds })
+		end
+	end
+	if table.getn(members) == 0 then return {} end
+
+	-- Sections in first-appearance order, each holding its merged header and
+	-- an ordered item list; "" is the tab-scope run before any header and
+	-- "anon:" sections hang off plain (unkeyed, unfoldable) headers, matched
+	-- by name. Identity entries collect one contributor descriptor per member.
+	local sections, sectionByKey = {}, {}
+	local function sectionFor(key)
+		local s = sectionByKey[key]
+		if not s then
+			s = { key = key, items = {} }
+			sectionByKey[key] = s
+			table.insert(sections, s)
+		end
+		return s
+	end
+	local entries = {}
+	for m = 1, table.getn(members) do
+		local cur = sectionFor("")
+		-- The keyed section a plain header's subsection lives inside. A plain
+		-- header ("Spell Selection" inside a trigger) subdivides the keyed
+		-- section around it rather than ending it: its anonymous section is
+		-- qualified by the outer key -- or trigger 2's "Spell Selection" would
+		-- merge into trigger 1's -- and folds when the outer section folds.
+		local outer = nil
+		local fields = members[m].fields
+		for i = 1, table.getn(fields) do
+			local f = fields[i]
+			if f.soloOnly then
+				-- Single-aura-only: an identity, a per-aura op, or per-aura
+				-- prose. Skipped outright -- neither a section nor a passive.
+			elseif f.type == "header" then
+				if f.key then
+					cur = sectionFor(f.key)
+					outer = cur
+				else
+					cur = sectionFor((outer and outer.key .. "/" or "")
+						.. "anon:" .. (f.name or "?"))
+					cur.outer = outer
+				end
+				if not cur.header then cur.header = { spine = f, list = {} } end
+				if cur.header.lastMember ~= m then
+					cur.header.lastMember = m
+					table.insert(cur.header.list, f)
+				end
+			else
+				local ident = mergeIdentity(cur.key, f)
+				if ident then
+					local e = entries[ident]
+					if not e then
+						e = { spine = f, list = {}, ids = {} }
+						entries[ident] = e
+						local home = (f.scope == "tab") and sectionFor("__tail") or cur
+						table.insert(home.items, e)
+					end
+					if e.lastMember ~= m then
+						e.lastMember = m
+						table.insert(e.list, f)
+						table.insert(e.ids, members[m].data.id)
+					end
+				elseif m == 1 then
+					table.insert(cur.items, { passive = f })
+				end
+			end
+		end
+	end
+
+	-- "__tail" (the tab-scope add buttons) always flattens last: a member with
+	-- more sections than the spine appends them at the end, and the add button
+	-- belongs below those too, as it sits below every section in a single
+	-- member's own array.
+	local flat = {}
+	for s = 1, table.getn(sections) do
+		if sections[s].key ~= "__tail" then table.insert(flat, sections[s]) end
+	end
+	if sectionByKey["__tail"] then table.insert(flat, sectionByKey["__tail"]) end
+
+	local merged = {}
+	for s = 1, table.getn(flat) do
+		local section = flat[s]
+		local collapsed = false
+		-- A subsection of a folded keyed section disappears with it, header and
+		-- all -- what the single-aura generator does by omitting everything up
+		-- to the next trigger header. The outer always flattens first (it was
+		-- created first), so its state is already decided here.
+		if section.outer and section.outer.nowCollapsed then
+			collapsed = true
+		elseif section.header then
+			local spine = section.header.spine
+			local hdr = {}
+			for k, v in pairs(spine) do hdr[k] = v end
+			-- Per-member structural actions (duplicate/reorder arrows) act on
+			-- one member's list; until they fan out they are withheld rather
+			-- than silently editing whichever member built the spine.
+			hdr.actions = nil
+			if spine.collapsed ~= nil then
+				-- Folded if ANY member has it folded (upstream's convention,
+				-- ConditionOptions.lua) -- so the body only ever paints when
+				-- every member is contributing to it. Toggling writes the new
+				-- state to every member. Fold state lives under the header's
+				-- foldKey where that differs from its identity key (the display
+				-- effects, whose folds are addressed by bare index).
+				local foldKey = spine.foldKey or section.key
+				for m = 1, table.getn(members) do
+					if members[m].folds[foldKey] then collapsed = true end
+				end
+				hdr.collapsed = collapsed
+				local newState = not collapsed
+				hdr.onToggle = function()
+					for m = 1, table.getn(members) do
+						S.setCollapsed(members[m].data, foldKey, newState)
+					end
+					S.refreshTabContent()
+				end
+			end
+			if spine.onDelete then
+				hdr.onDelete = mergedCall(section.header.list, "onDelete")
+			end
+			table.insert(merged, hdr)
+		end
+		section.nowCollapsed = collapsed
+		if not collapsed then
+			for i = 1, table.getn(section.items) do
+				local item = section.items[i]
+				if item.passive then
+					table.insert(merged, item.passive)
+				else
+					local f = {}
+					for k, v in pairs(item.spine) do f[k] = v end
+					f.actions = nil
+					-- Never auto-seed a merged field (see poolCode): its nil read
+					-- means disagreement at least as often as never-configured,
+					-- and the seed would write the default into every member.
+					f.noSeed = true
+					-- A merged toggle's nil is real disagreement (per-member reads
+					-- are coerced before comparing), so it alone earns the
+					-- indeterminate dash; an ordinary toggle's nil just means
+					-- false.
+					if item.spine.type == "toggle" then f.tristate = true end
+					local disagree = false
+					if item.spine.type == "namelist" then
+						disagree = not mergeNamelist(f, item.list)
+					else
+						if item.spine.get then
+							f.get = mergedGet(item.list, "get")
+							disagree = contributorsDisagree(item.list, "get")
+						end
+						if item.spine.set then f.set = mergedCall(item.list, "set") end
+						if item.spine.getOp then
+							f.getOp = mergedGet(item.list, "getOp")
+							disagree = disagree or contributorsDisagree(item.list, "getOp")
+						end
+						if item.spine.setOp then f.setOp = mergedCall(item.list, "setOp") end
+						if item.spine.getVal then
+							f.getVal = mergedGet(item.list, "getVal")
+							disagree = disagree or contributorsDisagree(item.list, "getVal")
+						end
+						if item.spine.setVal then f.setVal = mergedCall(item.list, "setVal") end
+						if item.spine.onClick then f.onClick = mergedCall(item.list, "onClick") end
+						if item.spine.onSelect then f.onSelect = mergedCall(item.list, "onSelect") end
+						-- A disagreeing colour shows black, as upstream's does --
+						-- the swatch has to show something pickable, and the blue
+						-- label below is what says "these differ", not the well.
+						if disagree and item.spine.type == "color" then
+							local realGet = f.get
+							f.get = function() return realGet() or { 0, 0, 0, 1 } end
+						end
+					end
+					-- Upstream's convention for "the members disagree": the
+					-- field's label turns blue (replaceNameDescFuncs) and its
+					-- caption carries a per-member value tooltip (descIfNoValue).
+					-- Both computed per build, and every edit repaints.
+					if disagree then
+						f.tooltip = mergeTooltip(item, f.name)
+						if f.name then f.name = "|cFF4080FF" .. f.name .. "|r" end
+					end
+					table.insert(merged, f)
+				end
+			end
+		end
+	end
+	return merged
+end
+
+-- Hands the strip the tab list. Every tab applies to every selection shape --
+-- a group's leaf tabs mass-edit its descendants (GROUP_CHILD_TABS) -- so the
+-- list is static.
+function S.rebuildTabs()
 	local list = {}
 	for i = 1, table.getn(S.TAB_DEFS) do
 		local def = S.TAB_DEFS[i]
-		list[i] = {
-			value = def.key, text = def.name,
-			hidden = isGroup and LEAF_ONLY_TABS[def.key] or false,
-		}
+		list[i] = { value = def.key, text = def.name }
 	end
 	S.tabStrip.setTabs(list)
 end
 
--- Steps off a tab that has just stopped applying, back to Info.
+-- Re-syncs the strip after a selection change.
 function S.updateTabAvailability()
-	local data = S.primaryId() and WeakestAurasDB.displays[S.primaryId()]
-	local isGroup = data and WA.IsGroup(data)
-	if isGroup and LEAF_ONLY_TABS[S.activeTab] then
-		S.activeTab = "info"
-	end
 	S.rebuildTabs()
 	S.tabStrip.select(S.activeTab)
 end
@@ -3254,14 +4418,12 @@ local function buildPanel()
 	-- there's no cursor-move event on 1.12 to key off of otherwise.
 	--
 	-- Two drop modes, chosen by where the cursor lands: near a row boundary
-	-- reorders among the dragged item's *current* siblings only (a boundary
-	-- straddling two different parents -- e.g. between a group's last child
-	-- and the next top-level item -- is genuinely ambiguous once an expanded
-	-- group's children interleave into the flat rendered list, so boundary
-	-- drags never cross parents); hovering over a group row's body instead
-	-- drops *into* that group. Moving a child back out to top level has no
-	-- corresponding drag gesture -- see the Info tab's Ungroup button
-	-- (S.getInfoOptions) for that direction instead.
+	-- inserts before/after the *hovered* row, in that row's own sibling list --
+	-- so a boundary drop can move an aura between parents, and the one
+	-- boundary line between a group's last child and the next top-level row
+	-- means whichever of the two rows the cursor is actually over (the
+	-- indicator's indent shows which list won). Hovering over a group row's
+	-- body instead drops *into* that group, at the end.
 	local dragLayer = CreateFrame("Frame", nil, listBg)
 	dragLayer:SetAllPoints(scroll)
 	dragLayer:SetFrameLevel(listBg:GetFrameLevel() + 10)
@@ -3358,19 +4520,64 @@ local function buildPanel()
 			return
 		end
 
-		-- Convert the boundary (an index into the full rendered rows list) into
-		-- an index among just reorder.parentId's own children, so any other
-		-- parent's rows interleaved above it in the view don't shift the count.
-		local siblingCount = 0
-		for i = 1, offset + p do
-			local entry = rows[i]
-			local data = entry and WeakestAurasDB.displays[entry.id]
-			if data and data.parent == reorder.parentId then siblingCount = siblingCount + 1 end
+		-- The drop target is the hovered row's own sibling list: before it from
+		-- the upper half, after it from the lower. Deriving the target from the
+		-- grabbed row's parent instead once turned "drag these two out of the
+		-- group" into "append them both to it" -- the boundary index was being
+		-- read against a list the cursor was nowhere near.
+		local anchorEntry = hoverEntry
+		local after = frac >= 0.5
+		if not anchorEntry then
+			-- Past the last painted row: after whatever is rendered last.
+			anchorEntry = rows[offset + count]
+			after = true
 		end
-		reorder.before = siblingCount + 1
+		local anchorData = anchorEntry and not anchorEntry.header
+			and WeakestAurasDB.displays[anchorEntry.id]
+		if not anchorData then
+			reorder.before = nil
+			indicator:Hide()
+			return
+		end
+		local targetParent = anchorData.parent
+
+		-- Refusals the commit could not survive: a container the dragged item
+		-- may not join (a group into a dynamic group), and a group dropped into
+		-- its own subtree. Leaves pass both trivially, so a bulk selection
+		-- (always leaves) never trips either -- what is checked is whatever is
+		-- actually being dragged.
+		local dragged = reorder.bulk and S.selection or { reorder.fromId }
+		for i = 1, table.getn(dragged) do
+			local d = WeakestAurasDB.displays[dragged[i]]
+			if not d or not WA.CanPlaceAura(d.regionType, targetParent) then
+				reorder.before = nil
+				indicator:Hide()
+				return
+			end
+			local up = targetParent
+			while up do
+				if up == dragged[i] then
+					reorder.before = nil
+					indicator:Hide()
+					return
+				end
+				local upData = WeakestAurasDB.displays[up]
+				up = upData and upData.parent
+			end
+		end
+
+		local siblings = S.siblingList(targetParent)
+		local idx = S.indexOfId(siblings, anchorEntry.id)
+		if not idx then
+			reorder.before = nil
+			indicator:Hide()
+			return
+		end
+		reorder.parentId = targetParent
+		reorder.before = after and idx + 1 or idx
 
 		indicator:ClearAllPoints()
-		indicator:SetPoint("TOPLEFT", dragLayer, "TOPLEFT", 0, -py + 1)
+		indicator:SetPoint("TOPLEFT", dragLayer, "TOPLEFT", 2 + anchorEntry.depth * S.INDENT_W, -py + 1)
 		indicator:SetPoint("TOPRIGHT", dragLayer, "TOPRIGHT", 0, -py + 1)
 		indicator:Show()
 	end

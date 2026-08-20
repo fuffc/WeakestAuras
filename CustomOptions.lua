@@ -1522,17 +1522,18 @@ local function groupLeafData(data)
 	return leaves
 end
 
-local function mergedGroupOptions(data)
+-- The merged user-mode option list for a member set -- a group's leaves or a
+-- multi-selection, the list being the only difference.
+local function mergedMemberOptions(members)
 	local merged = {}
-	local leaves = groupLeafData(data)
-	for i = 1, table.getn(leaves) do
-		local child = leaves[i]
+	for i = 1, table.getn(members) do
+		local child = members[i]
 		mergeOptions(merged, child, child.authorOptions or {}, child.config or {}, {}, nil)
 	end
 	return merged
 end
 
-local function userModeFields(fields, data, options)
+local function userModeFields(fields, data, options, members)
 	local merged = options ~= nil
 	options = options or data.authorOptions or {}
 	userOptionFields(fields, data, options, data.config or {}, {}, 0)
@@ -1541,9 +1542,8 @@ local function userModeFields(fields, data, options)
 		type = "button", name = "Reset to Defaults",
 		onClick = function()
 			if merged then
-				local leaves = groupLeafData(data)
-				for i = 1, table.getn(leaves) do
-					local child = leaves[i]
+				for i = 1, table.getn(members) do
+					local child = members[i]
 					child.config = {}
 					WA.ValidateUserConfig(child)
 					WA.Add(child, true)
@@ -1572,10 +1572,25 @@ end
 function WA.CustomOptionsFields(fields, data)
 	if not data then return end
 	if WA.IsGroup(data) then
-		userModeFields(fields, data, mergedGroupOptions(data))
+		local members = groupLeafData(data)
+		userModeFields(fields, data, mergedMemberOptions(members), members)
 	elseif data.authorMode then
 		authorModeFields(fields, data)
 	else
 		userModeFields(fields, data)
 	end
+end
+
+-- The merged Custom Options pane for a multi-selection: the same member
+-- merge the group tab runs, fed the selection instead of a group's leaves.
+-- User mode only, as the group pane is -- Author Mode stays a single-aura
+-- affair.
+function WA.CustomOptionsFieldsMerged(fields, ids)
+	local members = {}
+	for i = 1, table.getn(ids) do
+		local data = WeakestAurasDB.displays[ids[i]]
+		if data then table.insert(members, data) end
+	end
+	if table.getn(members) == 0 then return end
+	userModeFields(fields, members[1], mergedMemberOptions(members), members)
 end

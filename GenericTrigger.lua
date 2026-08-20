@@ -5643,7 +5643,10 @@ local function buildOptions(data, triggernum)
 					"|cffff5555Not registered by this client: " .. table.concat(invalid, ", ")
 					.. ".|r The names remain saved for addon-generated events." })
 			end
-			table.insert(more, { type = "input", name = "Find Event", half = true,
+			-- A "__" key names a session-local control (this writes a search box's
+			-- text, not aura data) -- the marker is what lets a reader of keys tell
+			-- the two apart.
+			table.insert(more, { type = "input", name = "Find Event", key = "__findEvent", half = true,
 				get = function() return customEventSearch[optionKey] or "" end,
 				set = function(v) customEventSearch[optionKey] = v or ""; WA.RefreshOptions() end })
 			table.insert(more, { type = "menu", name = "Insert Event", half = true,

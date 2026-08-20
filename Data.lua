@@ -845,8 +845,16 @@ end
 -- (dragging a child out of a group, into a different one, or between top level
 -- and a group), which the aura list's group drop-targets commit through.
 function WA.ReorderAura(id, newParentId, before)
-	if newParentId == id then return end
 	if not WeakestAurasDB.displays[id] then return end
+	-- A target anywhere inside id's own subtree would detach the branch from
+	-- the tree and close it into a cycle; the parent chain up from the target
+	-- passing through id itself is the test (covers newParentId == id too).
+	local up = newParentId
+	while up do
+		if up == id then return end
+		local upData = WeakestAurasDB.displays[up]
+		up = upData and upData.parent
+	end
 	local oldParent = WeakestAurasDB.displays[id].parent
 
 	local newList

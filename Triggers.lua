@@ -87,7 +87,7 @@ function WA.TriggerTypeFields(data, t)
 	end
 
 	local fields = { {
-		type = "select", name = "Category",
+		type = "select", name = "Category", key = "category",
 		values = catKeys, labels = catLabels,
 		get = function() return categoryOf(t.type) end,
 		set = function(v)

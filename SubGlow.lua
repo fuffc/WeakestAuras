@@ -836,7 +836,7 @@ local GLOW_FRAME_LABELS = {
 -- rather than under a `value`. `finish` alone offers "Hide all glows": on show
 -- there is nothing lit yet to clear.
 function WA.ActionGlowFields(fields, data, block, when)
-	table.insert(fields, { type = "toggle", name = "Glow External Element",
+	table.insert(fields, { type = "toggle", name = "Glow External Element", key = "do_glow",
 		get = function() return block.do_glow and true or false end,
 		set = function(v)
 			block.do_glow = v and true or false
@@ -846,7 +846,7 @@ function WA.ActionGlowFields(fields, data, block, when)
 	if not block.do_glow then return end
 	WA.ConditionGlowFields(fields, data, { value = block })
 	if when == "finish" then
-		table.insert(fields, { type = "toggle", name = "Hide all glows",
+		table.insert(fields, { type = "toggle", name = "Hide all glows", key = "hide_all_glows",
 			get = function() return block.hide_all_glows and true or false end,
 			set = function(v) block.hide_all_glows = v and true or false; WA.Add(data) end })
 	end
@@ -867,16 +867,16 @@ function WA.ConditionGlowFields(fields, data, change)
 		end
 	end
 
-	table.insert(fields, { type = "select", name = "Glow Action", values = { "show", "hide" },
+	table.insert(fields, { type = "select", name = "Glow Action", key = "glow_action", values = { "show", "hide" },
 		labels = { show = "Show", hide = "Hide" },
 		get = function() return get("glow_action", "show") end,
 		set = set("glow_action", true) })
-	table.insert(fields, { type = "select", name = "Frame Type",
+	table.insert(fields, { type = "select", name = "Frame Type", key = "glow_frame_type",
 		values = GLOW_FRAME_TYPES, labels = GLOW_FRAME_LABELS,
 		get = function() return get("glow_frame_type", "PARENTFRAME") end,
 		set = set("glow_frame_type", true) })
 	if get("glow_frame_type", "PARENTFRAME") == "FRAMESELECTOR" then
-		table.insert(fields, { type = "input", name = "Frame Name",
+		table.insert(fields, { type = "input", name = "Frame Name", key = "glow_frame",
 			get = function() return get("glow_frame", "") end,
 			set = set("glow_frame") })
 	end
@@ -884,52 +884,52 @@ function WA.ConditionGlowFields(fields, data, change)
 	if get("glow_action", "show") ~= "show" then return end
 
 	local glowType = get("glow_type", "buttonOverlay")
-	table.insert(fields, { type = "select", name = "Glow Type",
+	table.insert(fields, { type = "select", name = "Glow Type", key = "glow_type",
 		values = GLOW_TYPE_ORDER, labels = WA.glow_types,
 		get = function() return glowType end,
 		set = set("glow_type", true) })
-	table.insert(fields, { type = "toggle", name = "Use custom color", half = true,
+	table.insert(fields, { type = "toggle", name = "Use custom color", key = "use_glow_color", half = true,
 		get = function() return get("use_glow_color", false) and true or false end,
 		set = set("use_glow_color", true) })
 	if get("use_glow_color", false) then
-		table.insert(fields, { type = "color", name = "Color", half = true,
+		table.insert(fields, { type = "color", name = "Color", key = "glow_color", half = true,
 			get = function() return get("glow_color", nil) end,
 			set = set("glow_color") })
 	end
 	if glowType == "Pixel" or glowType == "ACShine" then
-		table.insert(fields, { type = "range", name = "Lines", min = 1, max = 30, step = 1, half = true,
+		table.insert(fields, { type = "range", name = "Lines", key = "glow_lines", min = 1, max = 30, step = 1, half = true,
 			get = function() return get("glow_lines", 8) end,
 			set = set("glow_lines") })
 	end
 	if glowType == "Pixel" or glowType == "ACShine" or glowType == "Pulse" then
-		table.insert(fields, { type = "range", name = "Frequency", min = -2, max = 2, step = 0.05, half = true,
+		table.insert(fields, { type = "range", name = "Frequency", key = "glow_frequency", min = -2, max = 2, step = 0.05, half = true,
 			get = function() return get("glow_frequency", 0.25) end,
 			set = set("glow_frequency") })
 	end
 	if glowType == "Pixel" then
-		table.insert(fields, { type = "range", name = "Length", min = 1, max = 20, step = 1, half = true,
+		table.insert(fields, { type = "range", name = "Length", key = "glow_length", min = 1, max = 20, step = 1, half = true,
 			get = function() return get("glow_length", 10) end,
 			set = set("glow_length") })
-		table.insert(fields, { type = "range", name = "Thickness", min = 1, max = 20, step = 1, half = true,
+		table.insert(fields, { type = "range", name = "Thickness", key = "glow_thickness", min = 1, max = 20, step = 1, half = true,
 			get = function() return get("glow_thickness", 1) end,
 			set = set("glow_thickness") })
-		table.insert(fields, { type = "toggle", name = "Border", half = true,
+		table.insert(fields, { type = "toggle", name = "Border", key = "glow_border", half = true,
 			get = function() return get("glow_border", false) and true or false end,
 			set = set("glow_border") })
 	end
-	table.insert(fields, { type = "range", name = "Scale", min = 0.05, max = 10, step = 0.05,
+	table.insert(fields, { type = "range", name = "Scale", key = "glow_scale", min = 0.05, max = 10, step = 0.05,
 		get = function() return get("glow_scale", 1) end,
 		set = set("glow_scale") })
-	table.insert(fields, { type = "range", name = "Extra width", min = -200, max = 200, step = 1, half = true,
+	table.insert(fields, { type = "range", name = "Extra width", key = "glow_extraWidth", min = -200, max = 200, step = 1, half = true,
 		get = function() return get("glow_extraWidth", 0) end,
 		set = set("glow_extraWidth") })
-	table.insert(fields, { type = "range", name = "Extra height", min = -200, max = 200, step = 1, half = true,
+	table.insert(fields, { type = "range", name = "Extra height", key = "glow_extraHeight", min = -200, max = 200, step = 1, half = true,
 		get = function() return get("glow_extraHeight", 0) end,
 		set = set("glow_extraHeight") })
-	table.insert(fields, { type = "range", name = "X Offset", min = -100, max = 100, step = 1, half = true,
+	table.insert(fields, { type = "range", name = "X Offset", key = "glow_XOffset", min = -100, max = 100, step = 1, half = true,
 		get = function() return get("glow_XOffset", 0) end,
 		set = set("glow_XOffset") })
-	table.insert(fields, { type = "range", name = "Y Offset", min = -100, max = 100, step = 1, half = true,
+	table.insert(fields, { type = "range", name = "Y Offset", key = "glow_YOffset", min = -100, max = 100, step = 1, half = true,
 		get = function() return get("glow_YOffset", 0) end,
 		set = set("glow_YOffset") })
 end

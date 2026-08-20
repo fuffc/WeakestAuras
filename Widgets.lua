@@ -66,15 +66,36 @@
 -- (frames can't be destroyed on this client, so the old approach leaked a page
 -- of controls per tab switch) -- see the widget pool below.
 --
--- `key` is redundant with get/set today (BuildOptions never reads it) but is
--- deliberately kept in sync with the property each field actually reads/
--- writes (data.<key> for region fields, data.triggers[n].trigger.<key> for
--- trigger fields). get/set are closures bound to one
--- specific `data` table, so nothing outside that closure can tell which
--- property a field maps to; a future mass-edit-N-auras-at-once feature needs
--- that identity to wrap get/set as "read/write across every selected aura"
--- instead of one, without having to revisit every field definition in
--- Regions.lua/Triggers.lua a second time. Keep setting it on every new field.
+-- `key` is redundant with get/set (BuildOptions never reads it) but is the
+-- field's stable identity: get/set are closures bound to one specific `data`
+-- table, so nothing outside them can tell which property a field maps to, and
+-- editing a field across N selected auras at once needs that identity to match
+-- "the same field" between one aura's descriptor array and another's. Every
+-- settable field carries one -- tools/optionsim's key gate enforces it. The
+-- conventions:
+--   - the key names the property the set writes (data.<key> for region fields,
+--     data.triggers[n].trigger.<key> for trigger fields); a nested path is
+--     dotted ("information.ignoreOptionsEventErrors")
+--   - a field writing several properties as a unit gets one coined name
+--     ("message_color" for action.r/g/b)
+--   - a "__" prefix names a session-local control (a search box) whose set
+--     never touches aura data
+--   - foldable/deletable section headers carry the section's own key
+--     ("trigger:<n>", "sub:<n>:<type>", "region:<name>"), which is what
+--     qualifies a field key that repeats across sections
+--   - `scope = "tab"` marks a field whose identity is tab-wide rather than
+--     section-local: the trailing structural add buttons, which sit after the
+--     last section and would otherwise take that section's qualification and
+--     stop matching between auras with different section counts
+--   - `soloOnly` marks a field that never joins a merged (multi-selection)
+--     array: an identity (Rename), an op whose fan-out is wrong (Delete's
+--     two-click confirm), per-aura prose (warnings, provenance)
+--   - `tristate` is stamped by the merge onto merged toggles alone: their nil
+--     read is real disagreement and draws the indeterminate dash, where an
+--     ordinary toggle's nil just means false
+--   - `tooltip` ({ title, lines }) hangs a hover zone over the field's
+--     caption -- the merge attaches one to a disagreeing field listing each
+--     member's own value.
 
 if WeakestAuras.disabled then return end
 
@@ -683,7 +704,7 @@ local function poolPreviewIcon(page)
 	end)
 end
 
-local function poolCheck(page, text, onClick, get)
+local function poolCheck(page, text, onClick, get, tristate)
 	local cb = acquire(page, "check", function()
 		local bind = {}
 		local w = LibWidgets.NewCheckBox(page, {
@@ -694,7 +715,13 @@ local function poolCheck(page, text, onClick, get)
 	end)
 	cb.bind.onClick = onClick
 	cb.label:SetText(text or "")
-	cb.setChecked(get and get())
+	-- Only a field that declares `tristate` (a mass-edit merged toggle) shows
+	-- the indeterminate dash on nil -- an ordinary field's get returning nil
+	-- just means false, and a dash there would read as disagreement where
+	-- there is none.
+	local v = get and get()
+	if not tristate then v = v and true or false end
+	cb.setChecked(v)
 	return cb
 end
 
@@ -864,11 +891,31 @@ local function poolActionButton(page, action)
 	return poolIconButton(page, action.icon, action.onClick, action.tooltip)
 end
 
--- A bare click target laid over a collapsible header's title line.
-local function poolHitArea(page, onClick)
-	local b = acquire(page, "hitarea", function() return CreateFrame("Button", nil, page) end)
+-- A bare click target laid over a collapsible header's title line. It doubles
+-- as the header's tooltip zone (`f.tooltip`, the mass-edit member listing) --
+-- a separate zone over the title would sit on this button and steal its
+-- toggle clicks. Assigned every acquire, so a pooled area reused by a
+-- tooltip-less header goes quiet again.
+local function poolHitArea(page, onClick, tooltip)
+	local b = acquire(page, "hitarea", function()
+		local z = CreateFrame("Button", nil, page)
+		z:SetScript("OnEnter", function()
+			if not this.tipTitle then return end
+			GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
+			GameTooltip:SetText(this.tipTitle, 1, 1, 1)
+			local lines = this.tipLines or EMPTY
+			for i = 1, table.getn(lines) do
+				GameTooltip:AddLine(lines[i], 0.9, 0.9, 0.9, true)
+			end
+			GameTooltip:Show()
+		end)
+		z:SetScript("OnLeave", function() GameTooltip:Hide() end)
+		return z
+	end)
 	b:SetHeight(16)
 	b:SetScript("OnClick", onClick)
+	b.tipTitle = tooltip and tooltip.title or nil
+	b.tipLines = tooltip and tooltip.lines or nil
 	return b
 end
 
@@ -1046,7 +1093,10 @@ local function poolCode(page, f, width, height)
 	-- impossible to keep. A `code` field's `get` must therefore return the raw
 	-- stored value, not `... or ""`.
 	local stored = f.get()
-	local seeding = (stored == nil and f.default ~= nil)
+	-- `noSeed` (a mass-edit merged field): nil there means the sources disagree
+	-- at least as often as "never configured", and a seed would go through the
+	-- merged set -- writing the default into every one of them on mere paint.
+	local seeding = (stored == nil and f.default ~= nil and not f.noSeed)
 	local text = stored or ""
 	if seeding then
 		text = (type(f.default) == "function" and f.default() or f.default) or ""
@@ -1167,6 +1217,39 @@ local FIELD_LEAD = {
 
 local function fieldLead(f) return FIELD_LEAD[f.type] or 0 end
 
+-- A hover zone over a field's caption for `f.tooltip` ({ title, lines }) --
+-- the per-member value listing a disagreeing mass-edit field carries.
+-- FontStrings take no mouse events on this client, so the zone is its own
+-- pooled button, sized to the caption text rather than the column so it can
+-- never sit over a control (or a code field's Reset button) and steal its
+-- clicks.
+local function poolTipZone(page, f, label, x, y, h)
+	if not f.tooltip then return end
+	local zone = acquire(page, "tipzone", function()
+		local z = CreateFrame("Button", nil, page)
+		z:SetScript("OnEnter", function()
+			GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
+			GameTooltip:SetText(this.tipTitle or "", 1, 1, 1)
+			local lines = this.tipLines or EMPTY
+			for i = 1, table.getn(lines) do
+				GameTooltip:AddLine(lines[i], 0.9, 0.9, 0.9, true)
+			end
+			GameTooltip:Show()
+		end)
+		z:SetScript("OnLeave", function() GameTooltip:Hide() end)
+		return z
+	end)
+	zone.tipTitle = f.tooltip.title
+	zone.tipLines = f.tooltip.lines
+	local tw = label and label.GetStringWidth and label:GetStringWidth() or 0
+	if not tw or tw < 24 then tw = 80 end
+	zone:SetWidth(tw + 6)
+	zone:SetHeight(h or 14)
+	zone:ClearAllPoints()
+	zone:SetPoint("TOPLEFT", x, y)
+	return zone
+end
+
 -- Places one field at (x, y) with widget width `w` and returns the vertical
 -- space it consumed. Headers are handled by the caller (they're always
 -- full-width). Shared by the single-column and two-column paths so both stay
@@ -1180,8 +1263,9 @@ local function placeField(page, f, x, y, w)
 	end
 	local lead = fieldLead(f)
 	if f.type == "toggle" then
-		local cb = poolCheck(page, f.name, f.set, f.get)
+		local cb = poolCheck(page, f.name, f.set, f.get, f.tristate)
 		cb:SetPoint("TOPLEFT", x, y)
+		poolTipZone(page, f, cb.label, x + 24, y, 20)
 		return 24
 	elseif f.type == "space" then
 		local line = 24
@@ -1189,6 +1273,7 @@ local function placeField(page, f, x, y, w)
 	elseif f.type == "input" then
 		local label = poolLabel(page, f.name)
 		label:SetPoint("TOPLEFT", x, y)
+		poolTipZone(page, f, label, x, y, 14)
 		local e = poolEditBox(page, w, f.set)
 		local v = f.get()
 		e:SetText(v ~= nil and tostring(v) or "")
@@ -1197,6 +1282,7 @@ local function placeField(page, f, x, y, w)
 	elseif f.type == "multiline" then
 		local label = poolLabel(page, f.name)
 		label:SetPoint("TOPLEFT", x, y)
+		poolTipZone(page, f, label, x, y, 14)
 		-- Wants far more width than a normal field's capped column; size to the
 		-- page rather than the passed `w`. Commits on focus lost, not per
 		-- keystroke -- a custom-trigger `set` recompiles the aura, and Enter is a
@@ -1218,6 +1304,7 @@ local function placeField(page, f, x, y, w)
 	elseif f.type == "code" then
 		local label = poolLabel(page, f.name)
 		label:SetPoint("TOPLEFT", x, y)
+		poolTipZone(page, f, label, x, y, 14)
 		-- Same page-width sizing as `multiline`: code wants far more room than a
 		-- normal field's capped column.
 		local mw = (page:GetWidth() or 400) - x - 16
@@ -1235,6 +1322,7 @@ local function placeField(page, f, x, y, w)
 	elseif f.type == "spell" or f.type == "item" or f.type == "talent" or f.type == "icon" or f.type == "texture" then
 		local label = poolLabel(page, f.name)
 		label:SetPoint("TOPLEFT", x, y)
+		poolTipZone(page, f, label, x, y, 14)
 		local icon = poolPreviewIcon(page)
 		icon:SetPoint("TOPLEFT", x, y - lead)
 		-- `spell`/`item` store what the user typed and preview whatever it
@@ -1296,7 +1384,8 @@ local function placeField(page, f, x, y, w)
 	elseif f.type == "namelist" then
 		local label = poolLabel(page, f.name)
 		label:SetPoint("TOPLEFT", x, y)
-		local n = table.getn(f.get())
+		poolTipZone(page, f, label, x, y, 14)
+		local n = table.getn(f.get() or EMPTY)
 		local visibleRows = n < 2 and 2 or (n > 5 and 5 or n)
 		local rightInset = (page:GetWidth() or 400) - (x + w)
 		local frame = poolListEditor(page, f, x, y - lead, rightInset, visibleRows)
@@ -1329,6 +1418,7 @@ local function placeField(page, f, x, y, w)
 		s.setValue(f.get())
 		s.bind.set = f.set
 		s:SetPoint("TOPLEFT", x, y)
+		poolTipZone(page, f, s.label, x, y, 14)
 		return 38
 	elseif f.type == "disclosure" then
 		-- A settings fold: a gear plus a one-line label, the whole line clickable.
@@ -1344,13 +1434,14 @@ local function placeField(page, f, x, y, w)
 		if f.summary and f.summary ~= "" then text = text .. "|cff9d9d9d: " .. f.summary .. "|r" end
 		local label = poolLabel(page, text)
 		label:SetPoint("TOPLEFT", x + 20, y - 2)
-		local hit = poolHitArea(page, f.onToggle or function() end)
+		local hit = poolHitArea(page, f.onToggle or function() end, f.tooltip)
 		hit:SetPoint("TOPLEFT", x + 20, y)
 		hit:SetPoint("TOPRIGHT", page, "TOPLEFT", x + 24 + (label:GetStringWidth() or 0), y)
 		return 22
 	elseif f.type == "select" then
 		local label = poolLabel(page, f.name)
 		label:SetPoint("TOPLEFT", x, y)
+		poolTipZone(page, f, label, x, y, 14)
 		local dw = w < 160 and w or 160
 		local actionCount = table.getn(f.actions or {})
 		if actionCount > 0 then
@@ -1370,6 +1461,7 @@ local function placeField(page, f, x, y, w)
 	elseif f.type == "opnumber" then
 		local label = poolLabel(page, f.name)
 		label:SetPoint("TOPLEFT", x, y)
+		poolTipZone(page, f, label, x, y, 14)
 		local op = poolDropdown(page, 52, W.OPERATORS, nil, f.setOp, f.getOp)
 		op:SetPoint("TOPLEFT", x, y - lead)
 		local e = poolEditBox(page, 60, function(v) f.setVal(tonumber(v)) end)
@@ -1380,6 +1472,7 @@ local function placeField(page, f, x, y, w)
 	elseif f.type == "color" then
 		local label = poolLabel(page, f.name)
 		label:SetPoint("TOPLEFT", x, y - 3)
+		poolTipZone(page, f, label, x, y - 3, 16)
 		local sw = poolColor(page, f.get, f.set)
 		sw:SetPoint("TOPLEFT", x + 100, y)
 		return 26
@@ -1394,6 +1487,7 @@ local function placeField(page, f, x, y, w)
 	elseif f.type == "anchorgrid" then
 		local label = poolLabel(page, f.name)
 		label:SetPoint("TOPLEFT", x, y)
+		poolTipZone(page, f, label, x, y, 14)
 		local gw = f.width or w
 		local grid = poolAnchorGrid(page, f, gw)
 		grid:SetPoint("TOPLEFT", x, y - lead)
@@ -1510,7 +1604,7 @@ function W.BuildOptions(page, fields)
 			-- label, and it stops at rightEdge so it can never sit on top of the
 			-- delete button and swallow its clicks.
 			if f.collapsed ~= nil then
-				local hit = poolHitArea(page, f.onToggle or function() end)
+				local hit = poolHitArea(page, f.onToggle or function() end, f.tooltip)
 				hit:SetPoint("TOPLEFT", leftEdge, y + 2)
 				hit:SetPoint("TOPRIGHT", page, "TOPLEFT", rightEdge, y + 2)
 			end

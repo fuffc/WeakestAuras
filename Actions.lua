@@ -449,32 +449,34 @@ end
 local function messageFields(fields, data, action, when, condition)
 	local prefix = "actions:" .. when .. ":"
 	if not condition then
-		table.insert(fields, { type = "toggle", name = "Chat Message",
+		table.insert(fields, { type = "toggle", name = "Chat Message", key = "do_message",
 			get = function() return action.do_message and true or false end,
 			set = function(v) action.do_message = v and true or false; WA.Add(data); WA.RefreshOptions() end })
 	end
-	table.insert(fields, { type = "select", name = "Message Type", values = MESSAGE_TYPES, labels = MESSAGE_LABELS,
+	table.insert(fields, { type = "select", name = "Message Type", key = "message_type", values = MESSAGE_TYPES, labels = MESSAGE_LABELS,
 		get = function() return action.message_type or "PRINT" end,
 		set = function(v) action.message_type = v; WA.Add(data); WA.RefreshOptions() end })
-	table.insert(fields, { type = "input", name = "Message",
+	table.insert(fields, { type = "input", name = "Message", key = "message",
 		get = function() return action.message end,
 		set = function(v) action.message = v; WA.SetDefaultFormatters(v, function(k, d) return actionFormatGet(action, k, d) end,
 			function(k, x) actionFormatSet(data, action, k, x) end, data); WA.Add(data); WA.RefreshOptions() end })
 	if action.message_type == "WHISPER" then
-		table.insert(fields, { type = "input", name = "Send To",
+		table.insert(fields, { type = "input", name = "Send To", key = "message_dest",
 			get = function() return action.message_dest end,
 			set = function(v) action.message_dest = v; WA.Add(data); WA.RefreshOptions() end })
-		table.insert(fields, { type = "toggle", name = "Is Unit",
+		table.insert(fields, { type = "toggle", name = "Is Unit", key = "message_dest_isunit",
 			get = function() return action.message_dest_isunit and true or false end,
 			set = function(v) action.message_dest_isunit = v and true or false; WA.Add(data) end })
 	end
 	if action.message_type == "PRINT" or action.message_type == "ERROR" or action.message_type == "COMBAT" then
-		table.insert(fields, { type = "color", name = "Color",
+		-- One field writing action.r/g/b as a unit, so the key is a coined name
+		-- rather than any one of the three properties.
+		table.insert(fields, { type = "color", name = "Color", key = "message_color",
 			get = function() return { action.r or 1, action.g or 1, action.b or 1, 1 } end,
 			set = function(v) action.r, action.g, action.b = v[1], v[2], v[3]; WA.Add(data) end })
 	end
 	if action.do_message and messageCustomNeeded(action) then
-		table.insert(fields, { type = "code", height = 80, name = "Message Custom Code",
+		table.insert(fields, { type = "code", height = 80, name = "Message Custom Code", key = "message_custom",
 			get = function() return action.message_custom end,
 			set = function(v) action.message_custom = v; WA.Add(data) end })
 	end
@@ -496,32 +498,32 @@ local function soundFields(fields, data, action, condition)
 		if key ~= " custom" and key ~= " KitID" then previews[key] = true end
 	end
 	if condition then
-		table.insert(fields, { type = "select", name = "Sound Type", values = { "Play", "Loop" },
+		table.insert(fields, { type = "select", name = "Sound Type", key = "sound_type", values = { "Play", "Loop" },
 			get = function() return action.sound_type or "Play" end,
 			set = function(v) action.sound_type = v; WA.Add(data); WA.RefreshOptions() end })
 	else
-		table.insert(fields, { type = "toggle", name = "Play Sound",
+		table.insert(fields, { type = "toggle", name = "Play Sound", key = "do_sound",
 			get = function() return action.do_sound and true or false end,
 			set = function(v) action.do_sound = v and true or false; WA.Add(data); WA.RefreshOptions() end })
-		table.insert(fields, { type = "toggle", name = "Loop",
+		table.insert(fields, { type = "toggle", name = "Loop", key = "do_loop",
 			get = function() return action.do_loop and true or false end,
 			set = function(v) action.do_loop = v and true or false; WA.Add(data); WA.RefreshOptions() end })
 	end
 	if (condition and action.sound_type == "Loop") or (not condition and action.do_loop) then
-		table.insert(fields, { type = "range", name = "Repeat After", min = 0.1, max = 60, step = 0.1,
+		table.insert(fields, { type = "range", name = "Repeat After", key = "sound_repeat", min = 0.1, max = 60, step = 0.1,
 			get = function() return action.sound_repeat or 1 end,
 			set = function(v) action.sound_repeat = v; WA.Add(data) end })
 	end
-	table.insert(fields, { type = "select", name = "Sound", values = WA.SoundValues, labels = WA.sound_types,
+	table.insert(fields, { type = "select", name = "Sound", key = "sound", values = WA.SoundValues, labels = WA.sound_types,
 		previews = previews, onPreview = function(v) if v ~= " custom" and v ~= " KitID" then WA.PreviewSound(v) end end,
 		get = function() return action.sound or "" end,
 		set = function(v) action.sound = v; WA.Add(data); WA.RefreshOptions() end })
 	if action.sound == " custom" then
-		table.insert(fields, { type = "input", name = "Sound File Path",
+		table.insert(fields, { type = "input", name = "Sound File Path", key = "sound_path",
 			get = function() return action.sound_path end,
 			set = function(v) action.sound_path = v; WA.PreviewSound(v); WA.Add(data) end })
 	elseif action.sound == " KitID" then
-		table.insert(fields, { type = "input", name = "Sound Kit Name",
+		table.insert(fields, { type = "input", name = "Sound Kit Name", key = "sound_kit_id",
 			get = function() return action.sound_kit_id end,
 			set = function(v) action.sound_kit_id = v; WA.PreviewSound(v, true); WA.Add(data) end })
 	end

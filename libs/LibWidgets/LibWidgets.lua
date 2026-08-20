@@ -359,7 +359,7 @@
 -- Returns { height = <total pixel height used below (x,y)>, refresh = fn,
 --           frame = <the list's outer frame> }.
 
-local MAJOR, MINOR = "LibWidgets-1.0", 21
+local MAJOR, MINOR = "LibWidgets-1.0", 22
 -- Bind the global only on the winning copy. NewLibrary returns nil for a copy
 -- that loses the version race; assigning that nil straight to the global would
 -- wipe out the winner's binding (an older/equal copy loading last nulls it),
@@ -827,14 +827,31 @@ function LibWidgets.NewCheckBox(parent, spec)
 	fs:SetPoint("LEFT", cb, "RIGHT", 2, 0)
 	fs:SetText(spec.text or "")
 	cb.label = fs
+	-- The indeterminate marker: a small grey square over the unchecked box,
+	-- shown when the state is nil rather than true/false -- several sources
+	-- whose values disagree. A plain texture rather than a tint on the
+	-- template's check art, so no CheckButton texture method has to exist on
+	-- the client.
+	local dash = cb:CreateTexture(nil, "OVERLAY")
+	dash:SetWidth(8); dash:SetHeight(8)
+	dash:SetPoint("CENTER", cb, "CENTER", 0, 0)
+	dash:SetTexture(0.6, 0.6, 0.6, 0.9)
+	dash:Hide()
+	cb.blankDash = dash
 	cb:SetScript("OnClick", function()
 		LibWidgets.CloseAllMenus()
+		dash:Hide()
 		if spec.onClick then spec.onClick(this:GetChecked() and true or false) end
 	end)
 	-- Resync from external state without echoing back through onClick (OnClick
-	-- fires only on a user click, not SetChecked).
-	function cb.setChecked(on) cb:SetChecked(on and true or false) end
-	if spec.get then cb:SetChecked(spec.get() and true or false) end
+	-- fires only on a user click, not SetChecked). nil is a third display
+	-- state, not false: the dash shows over an unchecked box, and a click from
+	-- there reads as checking it.
+	function cb.setChecked(on)
+		cb:SetChecked(on and true or false)
+		if on == nil then dash:Show() else dash:Hide() end
+	end
+	if spec.get then cb.setChecked(spec.get()) end
 	return cb
 end
 
@@ -918,8 +935,13 @@ function LibWidgets.NewColorSwatch(parent, spec)
 	b:SetBackdropBorderColor(0.4, 0.4, 0.4, 0.8)
 	local tex = b:CreateTexture(nil, "OVERLAY")
 	tex:SetPoint("CENTER", 0, 0); tex:SetWidth(sz); tex:SetHeight(sz)
+	b.swatch = tex
 	local function paint()
-		local c = get() or { 1, 1, 1, 1 }
+		local c = get()
+		-- nil is "no one value" (several sources disagreeing): the empty well
+		-- shows rather than an invented colour.
+		if not c then tex:Hide(); return end
+		tex:Show()
 		tex:SetTexture(c[1] or 1, c[2] or 1, c[3] or 1, c[4] or 1)
 	end
 	paint()
@@ -1239,6 +1261,11 @@ local SPIN_GRIP_ACTIVE = { 1, 0.95, 0.5, 1 }
 function LibWidgets.NewSpinBox(parent, spec)
 	spec = spec or {}
 	local value = spec.min or 0
+	-- Blank: no one value to show (several sources disagreeing). The box
+	-- empties and the fill drops to nothing; `value` holds min underneath so
+	-- the first step or drag starts somewhere sensible. Any real move or typed
+	-- number leaves the state.
+	local blank = false
 	local focused, escaping, dragging = false, false, false
 	local dragStartX, dragStartValue
 
@@ -1344,6 +1371,7 @@ function LibWidgets.NewSpinBox(parent, spec)
 		local span = f.trackSpan or 0
 		local p = (hi > lo) and (value - lo) / (hi - lo) or 0
 		if p < 0 then p = 0 elseif p > 1 then p = 1 end
+		if blank then p = 0 end
 		local w = p * span
 		if w < 1 then fill:Hide() else fill:SetWidth(w); fill:Show() end
 		handle:ClearAllPoints()
@@ -1353,18 +1381,23 @@ function LibWidgets.NewSpinBox(parent, spec)
 		label:SetText(spec.label or "")
 		-- Never while the box has focus: that would overwrite what is being typed.
 		if not focused then
-			edit:SetText(spec.fmt and spec.fmt(value) or formatNumber(value, spec.decimals or 2))
+			if blank then
+				edit:SetText("")
+			else
+				edit:SetText(spec.fmt and spec.fmt(value) or formatNumber(value, spec.decimals or 2))
+			end
 		end
 
 		-- Half a step of slack, so a value sitting exactly on an end still reads
-		-- as "no further this way" through float error.
+		-- as "no further this way" through float error. A blank box keeps both
+		-- arrows live: either step is a way to pick a first value.
 		local slack = (step or 1) * 0.5
-		if value - lo < slack then
+		if not blank and value - lo < slack then
 			left:Disable(); left.icon:SetVertexColor(0.35, 0.35, 0.35)
 		else
 			left:Enable(); left.icon:SetVertexColor(1, 1, 1)
 		end
-		if hi - value < slack then
+		if not blank and hi - value < slack then
 			right:Disable(); right.icon:SetVertexColor(0.35, 0.35, 0.35)
 		else
 			right:Enable(); right.icon:SetVertexColor(1, 1, 1)
@@ -1376,7 +1409,8 @@ function LibWidgets.NewSpinBox(parent, spec)
 	setValue = function(v, fire, cap)
 		if cap == nil then cap = spec.max end
 		v = snap(v, cap)
-		local changed = (v ~= value)
+		local changed = (v ~= value) or blank
+		blank = false
 		value = v
 		paint()
 		if fire and changed and spec.onChange then spec.onChange(value) end
@@ -1448,11 +1482,18 @@ function LibWidgets.NewSpinBox(parent, spec)
 		paint()
 	end
 
-	-- Resyncs from external state without echoing through onChange. Falls back to
-	-- min on a non-number for the same reason NewSlider's setValue does: a field
-	-- can predate the value a caller reads for it, and one stale entry must not
-	-- take down the panel it sits on.
+	-- Resyncs from external state without echoing through onChange. nil is the
+	-- blank display state, not a stale entry to repair; a non-number non-nil
+	-- still falls back to min for the same reason NewSlider's setValue does --
+	-- a field can predate the value a caller reads for it, and one stale entry
+	-- must not take down the panel it sits on.
 	function f.setValue(v)
+		if v == nil then
+			blank = true
+			value = spec.min or 0
+			paint()
+			return
+		end
 		setValue(tonumber(v) or (spec.min or 0), false)
 	end
 	function f.getValue() return value end
