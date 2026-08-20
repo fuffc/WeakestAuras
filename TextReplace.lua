@@ -75,14 +75,21 @@ WA.dynamic_texts = {
 		end,
 		func = function(v) return v end,
 	},
-	-- Always empty. Upstream renders the icon inline as a |T...|t escape, which
-	-- this client's FontString lays out as literal *text* -- so emitting one puts
-	-- "Interface\Icons\..." on screen rather than an icon (design/client/
-	-- gotchas.md). The symbol stays, resolving to nothing, because an imported
-	-- upstream aura that uses it must not spew a texture path.
+	-- The state's icon, as an inline texture escape. Empty on a client whose
+	-- FontString lays the escape out as literal text, since putting
+	-- "Interface\Icons\..." on screen is worse than showing nothing -- and an
+	-- imported upstream aura using %i must not spew a texture path.
+	--
+	-- :0:0 sizes the icon to the line's own font height rather than upstream's
+	-- fixed :12:12, so a 24px subtext gets a 24px icon with nothing to plumb.
+	-- The 64:64:4:60:4:60 tail is upstream's crop, trimming the standard icon
+	-- border.
 	i = {
 		get = function(state) return state.icon end,
-		func = function() return "" end,
+		func = function(v)
+			if not v or v == "" or not WA.hasInlineText then return "" end
+			return "|T" .. v .. ":0:0:0:0:64:64:4:60:4:60|t"
+		end,
 	},
 	s = {
 		get = function(state)
@@ -332,12 +339,32 @@ end
 -- Money
 -- ---------------------------------------------------------------------------
 
--- Letters, not upstream's three coin textures: this client's FontString does not
--- honour an inline |T...|t escape and prints the texture path as text instead
--- (/wa textprobe measures it). The same absence is why %i renders a path.
-local COIN_GOLD = "g"
-local COIN_SILVER = "s"
-local COIN_COPPER = "c"
+-- Coin art, with g/s/c letters standing in on a client that renders no inline
+-- escape.
+--
+-- NOT upstream's UI-GoldIcon/UI-SilverIcon/UI-CopperIcon: those are a
+-- later-expansion split and no such file exists here. Vanilla ships one 64x16
+-- sheet of four 16px cells, which the escape addresses as a 4x1 grid by cell
+-- index -- byte-identical to what ClassicAPI's own GetCoinTextureString emits.
+--
+-- Two details that look like omissions. There is no pen offset, because the
+-- renderer already pads around an icon symmetrically and a nudge here would
+-- double the gap. And for the same reason the markup form joins its
+-- denominations with nothing while the letter form needs a space.
+local COIN_SHEET = "Interface\\MoneyFrame\\UI-MoneyIcons"
+local COIN_LETTERS = { gold = "g", silver = "s", copper = "c" }
+local COIN_CELLS = { gold = "0:1", silver = "1:2", copper = "2:3" }
+
+-- Resolved per call rather than at load: the flag is drivable from a test.
+local function coin(which)
+	if not WA.hasInlineText then return COIN_LETTERS[which] end
+	return "|T" .. COIN_SHEET .. ":0:0:0:0:4:1:" .. COIN_CELLS[which] .. ":0:1|t"
+end
+local function coinGap()
+	if WA.hasInlineText then return "" end
+	return " "
+end
+
 local COIN_PRECISIONS = { 1, 2, 3 }
 local COIN_PRECISION_LABELS = { [1] = "Gold", [2] = "Gold, Silver", [3] = "Gold, Silver, Copper" }
 
@@ -499,12 +526,13 @@ WA.format_types = {
 				local silver = math.floor(math.mod(math.floor(n / 100), 100))
 				local copper = math.floor(math.mod(n, 100))
 				if precision == 1 then
-					return separateNumber(gold) .. COIN_GOLD
+					return separateNumber(gold) .. coin("gold")
 				elseif precision == 2 then
-					return separateNumber(gold) .. COIN_GOLD .. " " .. silver .. COIN_SILVER
+					return separateNumber(gold) .. coin("gold") .. coinGap()
+						.. silver .. coin("silver")
 				end
-				return separateNumber(gold) .. COIN_GOLD .. " " .. silver .. COIN_SILVER
-					.. " " .. copper .. COIN_COPPER
+				return separateNumber(gold) .. coin("gold") .. coinGap()
+					.. silver .. coin("silver") .. coinGap() .. copper .. coin("copper")
 			end
 		end,
 		summary = function(symbol, get)
@@ -721,13 +749,53 @@ local function walk(text, onLiteral, onSymbol)
 	end
 end
 
+-- Raid target markers, {rt1}..{rt8}. One direction only: the reverse, a
+-- localized marker name back to {rtN}, needs ICON_TAG_LIST, which is nil here.
+--
+-- Upstream names UI-RaidTargetingIcon_1.._8. Those per-index files are a
+-- later-expansion split and none of them exists on this client -- only the
+-- 256x256 sheet they were cut from, a 4x2 grid of 64px cells in marker order.
+-- So the escape addresses a cell, exactly as the coin art does.
+local RAID_MARKER_SHEET = "Interface\\TargetingFrame\\UI-RaidTargetingIcons"
+local RAID_SHEET_SIZE = 256
+local RAID_CELL = 64
+
+-- The crop is expressed in PIXELS against the sheet's real dimensions, not as a
+-- grid of cell indices the way the coin art is. The escape normalises
+-- left/texW, so both forms are arithmetically equivalent only when the cells
+-- tile the whole sheet -- and here they do not: the eight markers are 64px
+-- cells in a 256x256 sheet, so they fill four columns but only the TOP HALF of
+-- the rows. A "4x2 grid" reads each row as 128px, which stacks two markers into
+-- every icon and samples empty sheet for 5..8.
+local function raidMarkerArt(n)
+	local left = math.mod(n - 1, 4) * RAID_CELL
+	local top = math.floor((n - 1) / 4) * RAID_CELL
+	return "|T" .. RAID_MARKER_SHEET .. ":0:0:0:0:"
+		.. RAID_SHEET_SIZE .. ":" .. RAID_SHEET_SIZE .. ":"
+		.. left .. ":" .. (left + RAID_CELL) .. ":"
+		.. top .. ":" .. (top + RAID_CELL) .. "|t"
+end
+
+-- Applied to the ASSEMBLED string, not to the literal runs. Several upstream
+-- prototypes resolve a unit's mark to the *string* "{rtN}", so a substitution
+-- that only saw what the user typed would leave every imported aura's mark
+-- showing as text. The find() is the fast path: almost no text carries one.
+local function replaceRaidMarkers(text)
+	if not WA.hasInlineText then return text end
+	if not string.find(text, "{rt", 1, true) then return text end
+	for n = 1, 8 do
+		text = string.gsub(text, "{rt" .. n .. "}", raidMarkerArt(n))
+	end
+	return text
+end
+
 function WA.ReplacePlaceHolders(text, region, formatters, customValues)
 	if not text or text == "" then return "" end
 	local out = {}
 	walk(text,
 		function(lit) table.insert(out, lit) end,
 		function(sym) table.insert(out, valueForSymbol(sym, region, formatters, customValues)) end)
-	local s = table.concat(out)
+	local s = replaceRaidMarkers(table.concat(out))
 	return (string.gsub(s, "\\n", "\n"))
 end
 
@@ -735,9 +803,14 @@ end
 -- an array of them -- a region whose text a condition can replace has to build
 -- formatters for every string it might end up showing, not just the typed one.
 -- The `seen` set spans the whole array, so a symbol shared by two of them is
--- visited once. %i is skipped throughout: it renders a |T...|t texture escape,
--- which no number format can do anything but break (upstream skips it in the
--- same two places).
+-- visited once.
+--
+-- %i is skipped deliberately, and the skip is a GUARD rather than an oversight:
+-- it resolves to a |T...|t escape, and every format would corrupt it. A
+-- `string` format's abbreviate cuts through WA.Utf8Sub and would land inside
+-- the markup, leaving a truncated escape that renders as raw text; pad counts
+-- bytes, so it would treat a 40-byte escape as 40 glyphs and pad to nothing.
+-- Never build a format for it. Upstream skips it in the same two places.
 local function eachFormattableSymbol(text, fn)
 	if not text or text == "" then return end
 	local seen = {}
@@ -862,6 +935,14 @@ function WA.FormatSummary(text, get, data)
 	end)
 	if table.getn(parts) == 0 then return nil end
 	return table.concat(parts, ", ")
+end
+
+-- A text field's label, listing the symbols it accepts. %i is offered only on a
+-- client that renders inline textures: advertising a code that resolves to
+-- nothing is worse than not advertising it.
+function WA.TextSymbolLabel(name)
+	if WA.hasInlineText then return name .. " (%p %t %n %i %s %c)" end
+	return name .. " (%p %t %n %s %c)"
 end
 
 -- Whether `text` references the custom text function at all (§9

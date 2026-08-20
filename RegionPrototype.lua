@@ -487,6 +487,7 @@ function proto.modifyFinish(region, data)
 	end
 	region.subRegions = region.subRegions or {}
 	region.subRegionPool = region.subRegionPool or {}
+	region.baseFrameLevel = region.baseFrameLevel or region:GetFrameLevel()
 	local list = data.subRegions or {}
 	local n = table.getn(list)
 	for i = 1, n do
@@ -534,6 +535,11 @@ function proto.modifyFinish(region, data)
 		end
 	end
 	region.subRegionHigh = n
+
+	-- After the sub-region pass, not inside the region type's own modify: a
+	-- subbackground row moves the region's level, and its internals have to
+	-- follow it or the icon comes out from under its own swipe.
+	if region.ApplyInternalFrameLevels then region:ApplyInternalFrameLevels() end
 
 	proto.RefreshFrameTick(region)
 end
@@ -633,43 +639,282 @@ function proto.UpdateProgress(region)
 	end
 end
 
--- Native cooldown swipe (the radial spiral). The one place the client-specific
--- construction and the scale compensation live, so region types just call these
--- three. On this client the swipe is a 3D Model inheriting CooldownFrameTemplate
--- -- CreateFrame("Cooldown", ...) throws "Unknown frame type" here (Debug.lua's
--- /wa cdtest), the vanilla technique CooldownTracker also uses. pcall-guarded: a
--- client missing the template gets a nil swipe and every helper below no-ops, so
--- callers never branch on availability.
+-- Cooldown swipe (the radial spiral). The one place the client-specific
+-- construction lives, so region types just talk to the returned object:
+--   swipe:Arm(expirationTime, duration, reverse) -- run a countdown
+--   swipe:Hold(fraction, reverse)                -- freeze at remaining/duration
+--   swipe:Clear()                                -- off
+--   swipe:SetSwipe(enabled)                      -- draw the dark wedge
+--   swipe:SetEdge(enabled)                       -- draw the bright leading line
+--   swipe:SetSwipeColor(r, g, b, a)              -- the dark wedge's fill
+--   swipe:SetEdgeColor(r, g, b, a)               -- the leading line's tint
+-- The two draw flags are independent, as upstream's SetDrawSwipeOrg and
+-- SetDrawEdge are: an armed swipe with the wedge off still runs, for the edge.
+-- `reverse` false is the classic drain -- the dark wedge is the REMAINING
+-- time, its edge sweeping clockwise from twelve o'clock as the dark shrinks;
+-- true grows the dark wedge instead.
 --
--- It's a square 3D asset -- confirmed in-game that neither non-uniform
--- stretching (Frame:SetScale has never taken separate x/y factors on any WoW
--- client) nor a ScrollFrame-clipped oversized-and-centered version reads
--- right, so this sticks to what's actually confirmed working: always a
--- SQUARE swipe, sized to the SMALLER of width/height (never overflows) and
--- centered in the region. For a non-square icon this leaves a gap on the
--- longer axis rather than covering it -- an accepted tradeoff, not solved.
+-- Preferred backend: a spinner of three solid dark wedge textures
+-- (WA.Spinner -- Spinner.lua) on a child frame that drives itself per-frame
+-- while armed. Covers the region exactly at any aspect ratio, holds a paused
+-- fraction, and fills either direction.
+--
+-- Fallback (a client patch without texture corner transforms): the 3D Model
+-- inheriting CooldownFrameTemplate, the vanilla CooldownTracker technique --
+-- CreateFrame("Cooldown", ...) throws "Unknown frame type" here (Debug.lua's
+-- /wa cdtest). Fire-and-forget only: Hold degrades to Clear and `reverse` is
+-- ignored. It is a square 3D asset (neither non-uniform stretching nor a
+-- ScrollFrame clip reads right, confirmed in-game), so SizeSwipe centers a
+-- min(width,height) square and a non-square icon keeps a gap on the longer
+-- axis. SetEdge and SetSwipeColor are no-ops there, as `reverse` is -- the
+-- asset carries its own art. Region types ask SwipeSupportsLooks before
+-- offering either, so neither becomes a control that silently does nothing.
+-- Both constructors are guarded: a client with neither gets a nil swipe and
+-- callers already no-op on nil.
+
+local SWIPE_R, SWIPE_G, SWIPE_B, SWIPE_A = 0, 0, 0, 0.8
+
+-- Our own art (tools/mkedgetex.py), authored for exactly this stretch: a
+-- spindle tapering to nothing at both ends, short at the border so the line
+-- still looks like it reaches the icon, long toward the centre. Borrowing
+-- Blizzard's UI-CastingBar-Spark did not survive either way round -- its glow
+-- stops short of its own texture's ends, so stretching it whole left
+-- transparent stubs and cropping to its middle threw the soft ends away with
+-- them. Flat white, so the tint is entirely the vertex colour's.
+local SWIPE_EDGE_TEXTURE = "Interface\\AddOns\\WeakestAuras\\textures\\cooldown_edge.tga"
+local SWIPE_EDGE_R, SWIPE_EDGE_G, SWIPE_EDGE_B, SWIPE_EDGE_A = 1, 0.82, 0.35, 1
+local SWIPE_EDGE_K = 0.10
+local SWIPE_EDGE_MIN = 3
+
+-- The bright line along the wedge's moving edge (upstream's cooldownEdge,
+-- which there is just Cooldown:SetDrawEdge). Drawn as one texture standing on
+-- the region center and spun about it: anchoring its BOTTOM to the frame's
+-- CENTER puts the pivot at the bottom edge whatever the length, and the
+-- normalized (0.5, 0) pivot is that point. ClassicAPI's SetRotation is
+-- counter-clockwise-positive on screen while these angles run clockwise from
+-- twelve o'clock, hence the negated radians.
+--
+-- Both the length AND the direction come from the perimeter point the wedge's
+-- own moving corner sits on -- the same angleToCoord the spinner uses. A wedge
+-- is an affine stretch of a circular sweep, so on a non-square region the
+-- corner's direction on screen is NOT the angle that produced it: at 45 degrees
+-- of a 96x48 icon it points at 63, the true bearing of that rectangle's corner.
+-- Rotating the edge by the angle instead made it lag the wedge through half of
+-- each quadrant and overtake it through the other half. Taking the screen
+-- vector's own bearing is exact for any aspect ratio and collapses to the angle
+-- on a square, where the two agree.
+local function swipePlaceEdge(swipe, angle)
+	local edge = swipe.edge
+	if not edge then return end
+	if not swipe.edgeEnabled then edge:Hide(); return end
+	local width, height = swipe.swipeWidth or 0, swipe.swipeHeight or 0
+	if width <= 0 or height <= 0 then edge:Hide(); return end
+	local x, y = WA.TextureCoords.AngleToCoord(angle)
+	-- Texcoord y grows downward and screen y upward, hence the flipped term.
+	local dx, dy = (x - 0.5) * width, (0.5 - y) * height
+	local thickness = SWIPE_EDGE_K * math.min(width, height)
+	if thickness < SWIPE_EDGE_MIN then thickness = SWIPE_EDGE_MIN end
+	edge:SetWidth(thickness)
+	edge:SetHeight(math.sqrt(dx * dx + dy * dy))
+	-- atan2(x, y), not the usual (y, x): these bearings are measured clockwise
+	-- from twelve o'clock, so the vertical axis is the zero. Negated because
+	-- ClassicAPI's rotation is counter-clockwise-positive on screen.
+	edge:SetRotation(-math.atan2(dx, dy), 0.5, 0)
+	edge:Show()
+end
+
+local function swipeSetWedge(swipe, elapsed, reverse)
+	if elapsed < 0 then elapsed = 0 elseif elapsed > 1 then elapsed = 1 end
+	swipe.swipeElapsed = elapsed
+	swipe.swipeReverse = reverse and true or false
+	if swipe.wedgesEnabled then
+		if reverse then
+			swipe.spinner:SetProgress(0, elapsed * 360)
+		else
+			swipe.spinner:SetProgress(elapsed * 360, 360)
+		end
+	end
+	-- The moving edge is at elapsed*360 either way round: it is angle1 of the
+	-- draining wedge and angle2 of the growing one.
+	swipePlaceEdge(swipe, elapsed * 360)
+end
+
+-- Upstream's SetDrawSwipeOrg / SetDrawEdge are two independent flags on one
+-- Cooldown frame: an edge draws with the dark wedge turned off. Ours is two
+-- draw states on one running swipe object, so the timer keeps going for the
+-- edge either way.
+local function spinnerSwipeShowWedges(swipe)
+	if swipe.wedgesEnabled then swipe.spinner:Show() else swipe.spinner:Hide() end
+end
+
+-- Re-draw a running swipe after a draw flag moved: neither flag leaves nothing
+-- to run for, so the swipe goes off rather than sitting shown and empty, and
+-- turning one back on has no frame of its own coming to place it.
+local function spinnerSwipeRefresh(swipe)
+	if not swipe:IsShown() then return end
+	if not (swipe.wedgesEnabled or swipe.edgeEnabled) then swipe:Clear(); return end
+	spinnerSwipeShowWedges(swipe)
+	if swipe.swipeElapsed then swipeSetWedge(swipe, swipe.swipeElapsed, swipe.swipeReverse) end
+end
+
+local function spinnerSwipeSetSwipe(swipe, enabled)
+	swipe.wedgesEnabled = enabled and true or false
+	spinnerSwipeRefresh(swipe)
+end
+
+local function swipeOnUpdate()
+	local swipe = this
+	local duration = swipe.swipeDuration
+	if not duration or duration <= 0 then swipe:Clear(); return end
+	local elapsed = 1 - ((swipe.swipeExpiration or 0) - GetTime()) / duration
+	if elapsed >= 1 then swipe:Clear(); return end
+	swipeSetWedge(swipe, elapsed, swipe.swipeReverse)
+end
+
+local function spinnerSwipeArm(swipe, expirationTime, duration, reverse)
+	if not duration or duration <= 0 then swipe:Clear(); return end
+	swipe.swipeExpiration = expirationTime or 0
+	swipe.swipeDuration = duration
+	swipe.swipeReverse = reverse and true or false
+	spinnerSwipeShowWedges(swipe)
+	swipe:Show()
+	swipe:SetScript("OnUpdate", swipeOnUpdate)
+end
+
+local function spinnerSwipeHold(swipe, fraction, reverse)
+	swipe:SetScript("OnUpdate", nil)
+	spinnerSwipeShowWedges(swipe)
+	swipe:Show()
+	swipeSetWedge(swipe, 1 - (fraction or 0), reverse)
+end
+
+local function spinnerSwipeClear(swipe)
+	swipe:SetScript("OnUpdate", nil)
+	swipe.spinner:Hide()
+	if swipe.edge then swipe.edge:Hide() end
+	swipe:Hide()
+end
+
+local function spinnerSwipeSetEdge(swipe, enabled)
+	swipe.edgeEnabled = enabled and true or false
+	if not swipe.edgeEnabled then
+		if swipe.edge then swipe.edge:Hide() end
+		spinnerSwipeRefresh(swipe)
+		return
+	end
+	if not swipe.edge then
+		local edge = swipe:CreateTexture(nil, "OVERLAY")
+		edge:SetPoint("BOTTOM", swipe, "CENTER", 0, 0)
+		edge:SetTexture(WA.DrawableTexture(SWIPE_EDGE_TEXTURE) or SWIPE_EDGE_TEXTURE)
+		edge:SetBlendMode("ADD")
+		swipe.edge = edge
+		-- Through the setter, which fills the default for anything never set --
+		-- the aura's colour reaches the swipe before the edge it tints exists.
+		swipe:SetEdgeColor(swipe.edgeR, swipe.edgeG, swipe.edgeB, swipe.edgeA)
+	end
+	if swipe.swipeElapsed then swipePlaceEdge(swipe, swipe.swipeElapsed * 360) end
+end
+
+local function spinnerSwipeSetEdgeColor(swipe, r, g, b, a)
+	if r == nil then r = SWIPE_EDGE_R end
+	if g == nil then g = SWIPE_EDGE_G end
+	if b == nil then b = SWIPE_EDGE_B end
+	if a == nil then a = SWIPE_EDGE_A end
+	swipe.edgeR, swipe.edgeG, swipe.edgeB, swipe.edgeA = r, g, b, a
+	if swipe.edge then swipe.edge:SetVertexColor(r, g, b, a) end
+end
+
+local function spinnerSwipeSetColor(swipe, r, g, b, a)
+	if r == nil then r = SWIPE_R end
+	if g == nil then g = SWIPE_G end
+	if b == nil then b = SWIPE_B end
+	if a == nil then a = SWIPE_A end
+	swipe.spinner:SetSolidColor(r, g, b, a)
+end
+
+-- The asset IS the wedge, so an edge-only request has nothing to draw here and
+-- the icon region does not have to know which backend it holds.
+local function modelSwipeArm(swipe, expirationTime, duration)
+	if swipe.wedgesEnabled == false then
+		CooldownFrame_SetTimer(swipe, 0, 0, 0)
+		swipe:Hide()
+		return
+	end
+	if duration and duration > 0 then
+		swipe:Show()
+		-- CooldownFrame_SetTimer wants the *start* time, so back it out.
+		CooldownFrame_SetTimer(swipe, (expirationTime or 0) - duration, duration, 1)
+	else
+		CooldownFrame_SetTimer(swipe, 0, 0, 0)
+		swipe:Hide()
+	end
+end
+
+local function modelSwipeClear(swipe)
+	CooldownFrame_SetTimer(swipe, 0, 0, 0)
+	swipe:Hide()
+end
+
+local function modelSwipeSetEdge() end
+local function modelSwipeSetColor() end
+local function modelSwipeSetEdgeColor() end
+
+local function modelSwipeSetSwipe(swipe, enabled)
+	swipe.wedgesEnabled = enabled and true or false
+	if not swipe.wedgesEnabled then modelSwipeClear(swipe) end
+end
+
+-- Which backend CreateSwipe would pick. Region types ask before offering the
+-- swipe looks only the spinner can draw.
+function proto.SwipeSupportsLooks()
+	return (WA.hasTextureTransforms and WA.Spinner) and true or false
+end
+
 function proto.CreateSwipe(parent)
+	if WA.hasTextureTransforms and WA.Spinner then
+		local swipe = CreateFrame("Frame", nil, parent)
+		swipe:SetAllPoints(parent)
+		swipe:SetFrameLevel(parent:GetFrameLevel() + 1)
+		local spinner = WA.Spinner.Create(swipe, "ARTWORK")
+		if spinner then
+			spinner:SetSolidColor(SWIPE_R, SWIPE_G, SWIPE_B, SWIPE_A)
+			swipe.spinner = spinner
+			swipe.Arm = spinnerSwipeArm
+			swipe.Hold = spinnerSwipeHold
+			swipe.Clear = spinnerSwipeClear
+			swipe.SetEdge = spinnerSwipeSetEdge
+			swipe.SetSwipe = spinnerSwipeSetSwipe
+			swipe.SetSwipeColor = spinnerSwipeSetColor
+			swipe.SetEdgeColor = spinnerSwipeSetEdgeColor
+			swipe.wedgesEnabled = true
+			swipe:Hide()
+			return swipe
+		end
+	end
 	local ok, swipe = pcall(CreateFrame, "Model", nil, parent, "CooldownFrameTemplate")
 	if not ok or not swipe then return nil end
+	swipe.Arm = modelSwipeArm
+	swipe.Hold = modelSwipeClear
+	swipe.Clear = modelSwipeClear
+	swipe.SetEdge = modelSwipeSetEdge
+	swipe.SetSwipe = modelSwipeSetSwipe
+	swipe.SetSwipeColor = modelSwipeSetColor
+	swipe.SetEdgeColor = modelSwipeSetEdgeColor
+	swipe.wedgesEnabled = true
 	swipe:Hide()
 	return swipe
 end
 
--- The Model is authored for a 36-unit frame (confirmed against pfUI's own
--- working Model+CooldownFrameTemplate swipe, modules/cooldown.lua's
--- SetCooldown -- size/32 left a visible sliver of the icon at the edges), so
--- it underfills and sits bottom-left unless its frame is scaled size/36. The
--- two-corner anchor is the centered-square placement (dw/dh account for a
--- non-square parent) plus the empirical alignment nudge (this Model's
--- rendered content sits very slightly left/down of its scaled frame bounds)
--- both expressed at once. Tunable live via Debug.lua's /wa swipenudge (no
--- /reload needed -- plain table fields, re-read by SizeSwipe on every call).
--- swipeNudgeK is a proportional coefficient (nudge = swipeNudgeK * size);
--- swipeYFlat is a flat additional vertical offset that empirically does NOT
--- scale with size the same way. Values below tuned in-game across
--- 16/32/64/128px via /wa swipetest -- clean at 32-128px; 16px still shows a
--- hairline gap and wasn't worth chasing further (tabled, not fixed -- revisit
--- with /wa swipetest 16 if a future icon skin actually ships that small).
+-- Spinner backend: the child frame tracks the region through SetAllPoints;
+-- only the wedge magnitudes need the numbers. Model backend: the asset is
+-- authored for a 36-unit frame (confirmed against pfUI's own working
+-- Model+CooldownFrameTemplate swipe -- size/32 left a visible sliver at the
+-- edges), so it underfills and sits bottom-left unless scaled size/36; the
+-- two-corner anchor is the centered-square placement (dw/dh for a non-square
+-- parent) plus the empirical alignment nudge, tunable live via Debug.lua's
+-- /wa swipenudge (plain table fields, re-read on every call). Nudge values
+-- tuned in-game across 16/32/64/128px via /wa swipetest; 16px keeps a
+-- hairline gap (tabled, not fixed).
 proto.swipeNudgeK = 0.0625
 proto.swipeYFlat = -0.25
 
@@ -677,6 +922,14 @@ function proto.SizeSwipe(swipe, width, height)
 	if not swipe then return end
 	width = width or 32
 	height = height or width
+	swipe.swipeWidth, swipe.swipeHeight = width, height
+	if swipe.spinner then
+		swipe.spinner:SetWidth(width)
+		swipe.spinner:SetHeight(height)
+		swipe.spinner:UpdateTextures()
+		if swipe.swipeElapsed then swipePlaceEdge(swipe, swipe.swipeElapsed * 360) end
+		return
+	end
 	local size = math.min(width, height)
 	swipe:SetScale(size / 36)
 	swipe:ClearAllPoints()
@@ -687,38 +940,66 @@ function proto.SizeSwipe(swipe, width, height)
 	swipe:SetPoint("BOTTOMRIGHT", swipe:GetParent(), "BOTTOMRIGHT", -dw + nudge, dh + testY)
 end
 
--- Arm the swipe from a timed state, or clear+hide it when duration <= 0.
--- CooldownFrame_SetTimer wants the *start* time, so back it out of expiration.
+-- Compatibility shim over the verbs for callers armed with only a timed state
+-- (Debug.lua's swipe rigs).
 function proto.ArmSwipe(swipe, expirationTime, duration)
 	if not swipe then return end
 	if duration and duration > 0 then
-		swipe:Show()
-		CooldownFrame_SetTimer(swipe, (expirationTime or 0) - duration, duration, 1)
+		swipe:Arm(expirationTime, duration)
 	else
-		CooldownFrame_SetTimer(swipe, 0, 0, 0)
-		swipe:Hide()
+		swipe:Clear()
 	end
 end
 
--- Frame levels inside a region, relative to the region's own. A child frame's
--- draw layers all sit above its parent's, so anything a region type builds as a
--- child (a progress bar, the icon's cooldown swipe) would otherwise cover text
--- or a border created on the region. Region types keep their internals below
--- SUB_LEVEL; subregions sit at or above it, ordered among themselves.
+-- Where the subregion band starts, relative to a region's held base. A child
+-- frame's draw layers all sit above its parent's, so anything a region type
+-- builds as a child (a progress bar, the icon's cooldown swipe) would otherwise
+-- cover text or a border created on the region -- the gap between the base and
+-- here is what those internals get.
+--
+-- The region's own art holds a slot in the band too -- its subbackground row --
+-- and its internals then sit inside that slot rather than down here. The gap is
+-- what a region carrying no such row still needs: a group, or any region
+-- modified with data that never reached MergeDefaults.
 proto.SUB_LEVEL = 5
 
--- Levels reserved per subregion, so a type needing two frames of its own has one
--- to spare without landing on its neighbour's. subglow is the reason: its
--- backdrop and its art must be ordered against each other, and at a step of 1
--- the art would tie with whatever sits one slot higher in the list, leaving the
--- winner to creation order rather than to what the user arranged.
-proto.SUB_STEP = 2
+-- Levels reserved per subregion, so a type needing more than one frame of its
+-- own has room without landing on its neighbour's. The widest occupant is what
+-- sets it: the subbackground row stands for the region's own art, and a
+-- progressbar spends three levels there (the region, its bar, its icon frame).
+-- subglow spends two, its backdrop under its art. At a narrower step the next
+-- row down the list ties with one of those, leaving the winner to creation
+-- order rather than to what the user arranged.
+proto.SUB_STEP = 3
 
 -- The draw level of the i-th entry of data.subRegions, in list order: the first
 -- effect sits lowest, the last on top. Type no longer decides -- moving a row in
 -- the Display Effects list is what restacks it.
+--
+-- Off the held base, never off the live level: the subbackground row moves the
+-- region's *own* level, so reading it back here would fold that offset into the
+-- base and stack another SUB_LEVEL onto it every repaint.
 function proto.SubRegionLevel(region, index)
-	return region:GetFrameLevel() + proto.SUB_LEVEL + (index - 1) * proto.SUB_STEP
+	return proto.BaseFrameLevel(region) + proto.SUB_LEVEL + (index - 1) * proto.SUB_STEP
+end
+
+-- The level this region would sit at carrying no subbackground row: what the
+-- client hands a fresh child of its parent. ResetFrameLevel records it; the
+-- fallback covers a region asked before one ever ran.
+function proto.BaseFrameLevel(region)
+	return region.baseFrameLevel or region:GetFrameLevel()
+end
+
+-- Puts the region back on its natural level and records it. Asserted rather
+-- than read back, because a subbackground row leaves the region raised and
+-- SetParent to the parent it already had does not undo that -- reading would
+-- take the raised value for the base and ratchet it on every pass.
+function proto.ResetFrameLevel(region)
+	local parent = region:GetParent()
+	if parent and parent.GetFrameLevel then
+		region:SetFrameLevel(parent:GetFrameLevel() + 1)
+	end
+	region.baseFrameLevel = region:GetFrameLevel()
 end
 
 -- Area-anchors a subregion frame over the whole parent region (border/glow
@@ -1417,6 +1698,10 @@ function proto.ApplyPosition(region, data)
 	local parentId = data.parent
 	local pdata = parentId and WeakestAurasDB.displays[parentId]
 	if setParent then region:SetParent(anchorFrame) else region:SetParent(UIParent) end
+	-- Immediately after the reparent, which is where the frame's level is the
+	-- client's own again; modifyFinish raises it from here if the aura carries a
+	-- subbackground row.
+	proto.ResetFrameLevel(region)
 	if pdata and WA.IsGroup(pdata) and data.anchorFrameType == "SCREEN" then
 		if pdata.regionType == "dynamicgroup" then
 			region:SetAnchor("CENTER", anchorFrame, "CENTER")

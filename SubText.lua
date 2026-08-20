@@ -57,6 +57,39 @@ local function subTexts(parentData, subData)
 	return texts
 end
 
+-- Upstream's own field values. LEFT reads bottom-to-top, RIGHT top-to-bottom.
+WA.text_rotate_types = { NONE = "None", LEFT = "Left", RIGHT = "Right" }
+WA.text_rotate_values = { "NONE", "LEFT", "RIGHT" }
+
+local ROTATE_RADIANS = { LEFT = math.pi / 2, RIGHT = -math.pi / 2 }
+
+-- Where a rotated string has to be nudged so the corner the user anchored still
+-- lands where they put it.
+--
+-- SetRotation is VISUAL ONLY: GetStringWidth, GetStringHeight and the region's
+-- rect all stay axis-aligned, so the engine goes on anchoring an unrotated w*h
+-- box while the ink occupies an h*w box about the same centre. The centre is
+-- the one point both agree on, which is why only off-centre anchors need
+-- anything -- and the correction is just half the difference between the two
+-- box dimensions, signed by which edge was anchored.
+--
+-- This is NOT upstream's getRotateOffset. Upstream rotates about the anchor
+-- point (an AnimationGroup with SetOrigin, which this client has no equivalent
+-- of); ClassicAPI rotates about the centre, so upstream's formula would correct
+-- for a displacement that never happens here.
+local function rotateOffset(fs, rotate, point)
+	if not rotate or rotate == "NONE" or not WA.hasRotateText then return 0, 0 end
+	local w = fs:GetStringWidth() or 0
+	local h = (WA.hasStringHeight and fs:GetStringHeight() or fs:GetHeight()) or 0
+	local half = (h - w) / 2
+	local xo, yo = 0, 0
+	if string.find(point, "LEFT", 1, true) then xo = half
+	elseif string.find(point, "RIGHT", 1, true) then xo = -half end
+	if string.find(point, "TOP", 1, true) then yo = half
+	elseif string.find(point, "BOTTOM", 1, true) then yo = -half end
+	return xo, yo
+end
+
 WA.RegisterSubRegionType("subtext", {
 	displayName = "Text",
 	supports = function(regionType)
@@ -72,6 +105,7 @@ WA.RegisterSubRegionType("subtext", {
 		anchorXOffset = 0,
 		anchorYOffset = 0,
 		text_visible = true,
+		rotateText = "NONE",
 	},
 	-- Icon: a %s stacks text bottom-right. Bar: %n name at the left, %p time at
 	-- the right (upstream's own new-aura defaults, §8).
@@ -108,11 +142,13 @@ WA.RegisterSubRegionType("subtext", {
 		text_visible = { display = "Visible", setter = "SetVisible", type = "bool" },
 		text_text = { display = "Text", setter = "ChangeText", type = "string" },
 		text_color = { display = "Color", setter = "SetTextColor", type = "color" },
-		text_fontSize = { display = "Font Size", setter = "SetTextHeight", type = "number", min = 6, max = 48, step = 1 },
+		text_fontSize = { display = "Font Size", setter = "SetTextHeight", type = "number", min = 6, softMax = 72, step = 1 },
 		text_anchorXOffset = { display = "X-Offset", setter = "SetXOffset", type = "number",
 			min = -500, max = 500, step = 1, dataKey = "anchorXOffset" },
 		text_anchorYOffset = { display = "Y-Offset", setter = "SetYOffset", type = "number",
 			min = -500, max = 500, step = 1, dataKey = "anchorYOffset" },
+		rotateText = { display = "Rotate Text", setter = "SetRotateText", type = "list",
+			values = "text_rotate_types" },
 	},
 	create = function(parent)
 		local region = { parent = parent }
@@ -130,6 +166,7 @@ WA.RegisterSubRegionType("subtext", {
 		function region:Update()
 			WA.textCore.SetText(self.fontString,
 				WA.ReplacePlaceHolders(self.text or "", self.parent, self.formatters))
+			self:UpdateAnchorOnTextChange()
 		end
 		function region:SetFrameLevel(level) self.frame:SetFrameLevel(level) end
 		function region:Show() if self.visible ~= false then self.fontString:Show() end end
@@ -141,9 +178,11 @@ WA.RegisterSubRegionType("subtext", {
 		function region:SetTextColor(r, g, b, a)
 			self.fontString:SetTextColor(r, g, b, a or 1)
 		end
+		-- Through textCore, not a bare SetTextHeight: a size change has to re-enter
+		-- SetFont's read-back, and textCore is what pairs the two the client's size
+		-- ceiling needs.
 		function region:SetTextHeight(size)
 			WA.textCore.Apply(self.fontString, self.subData, "text_", size, WA.textCore.SUBTEXT_KEYS)
-			self.fontString:SetTextHeight(size)
 		end
 
 		-- One stable reference per instance rather than a fresh closure per
@@ -187,10 +226,36 @@ WA.RegisterSubRegionType("subtext", {
 				if self.xOffset ~= nil then effective.anchorXOffset = self.xOffset end
 				if self.yOffset ~= nil then effective.anchorYOffset = self.yOffset end
 			end
+			local xo, yo = rotateOffset(self.fontString, self.rotateText,
+				self.anchorDefaults and self.anchorDefaults.selfPoint or "CENTER")
+			if xo ~= 0 or yo ~= 0 then
+				if effective == self.subData then
+					effective = {}
+					for k, v in pairs(self.subData) do effective[k] = v end
+				end
+				effective.anchorXOffset = (effective.anchorXOffset or 0) + xo
+				effective.anchorYOffset = (effective.anchorYOffset or 0) + yo
+			end
 			proto.AnchorSubRegion(self.fontString, self.parent, effective, self.anchorDefaults)
 		end
 		function region:SetXOffset(v) self.xOffset = v; self:ApplyAnchor() end
 		function region:SetYOffset(v) self.yOffset = v; self:ApplyAnchor() end
+
+		-- The offset depends on the string's own measured box, so a rotated
+		-- sub-region has to re-anchor whenever its text changes -- upstream wires
+		-- the same call as UpdateAnchorOnTextChange. Unrotated, the offset is
+		-- always 0,0 and re-anchoring would be pure cost, so it is skipped.
+		function region:UpdateAnchorOnTextChange()
+			if self.rotateText and self.rotateText ~= "NONE" then self:ApplyAnchor() end
+		end
+
+		function region:SetRotateText(v)
+			self.rotateText = v or "NONE"
+			if WA.hasRotateText then
+				self.fontString:SetRotation(ROTATE_RADIANS[self.rotateText] or 0)
+			end
+			self:ApplyAnchor()
+		end
 
 		return region
 	end,
@@ -213,7 +278,7 @@ WA.RegisterSubRegionType("subtext", {
 			selfPoint = subData.anchor_point or "CENTER",
 			x = subData.anchorXOffset or 0, y = subData.anchorYOffset or 0,
 		}
-		region:ApplyAnchor()
+		region:SetRotateText(subData.rotateText)
 
 		if region.visible then fs:Show() else fs:Hide() end
 
@@ -232,9 +297,7 @@ WA.RegisterSubRegionType("subtext", {
 	options = function(parentData, subData, index)
 		local fields = {
 			{
-				-- %i is absent from the label deliberately: it resolves to nothing
-				-- here, this client's FontString having no inline texture escape.
-				type = "input", name = "Text (%p %t %n %s %c)", key = "text_text",
+				type = "input", name = WA.TextSymbolLabel("Text"), key = "text_text",
 				get = function() return subData.text_text end,
 				-- Re-renders the tab: Format Options below is one row per symbol
 				-- in this string, so editing it changes which rows exist.
@@ -248,7 +311,7 @@ WA.RegisterSubRegionType("subtext", {
 				end,
 			},
 			{
-				type = "range", name = "Size", key = "text_fontSize", min = 6, max = 48, step = 1, half = true,
+				type = "range", name = "Size", key = "text_fontSize", min = 6, softMax = 72, step = 1, half = true,
 				get = function() return subData.text_fontSize end,
 				set = function(v) subData.text_fontSize = v; WA.Add(parentData, true) end,
 			},
@@ -258,6 +321,17 @@ WA.RegisterSubRegionType("subtext", {
 				set = function(v) subData.text_color = v; WA.Add(parentData, true) end,
 			},
 		}
+		-- Offered only where the client can turn text: the option would otherwise
+		-- store a setting nothing acts on. Rotation rides WA.hasInlineText, so
+		-- this disappears on the same client that loses inline icons.
+		if WA.hasRotateText then
+			table.insert(fields, {
+				type = "select", name = "Rotate Text", key = "rotateText", half = true,
+				values = WA.text_rotate_values, labels = WA.text_rotate_types,
+				get = function() return subData.rotateText or "NONE" end,
+				set = function(v) subData.rotateText = v; WA.Add(parentData, true) end,
+			})
+		end
 		local anchorFields = WA.regionPrototype.SubRegionAnchorFields(parentData, subData, {
 			mode = subData.anchor_mode or "point", target = parentData.regionType == "progressbar" and "bar" or "region",
 			anchorPoint = subData.anchor_point or "CENTER",

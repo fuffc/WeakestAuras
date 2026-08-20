@@ -10,7 +10,7 @@
 --     key = "...",         -- stable field id, see below; omitted for header/button
 --     get = function() end, set = function(value) end,   -- color: get/set a {r,g,b,a}
 --     half = true,         -- pack two-per-row (any non-header type); default full row
---     min, max, step,      -- range only
+--     min, max, step, softMax,   -- range only
 --     values, labels,      -- select only: ordered values + optional value->label
 --     swatches,            -- select only: value -> texture path; each entry (and
 --                          -- the button face) previews it as a filled bar
@@ -29,7 +29,10 @@
 -- `summary` -- appended to `name` in grey, so the folded state still says what
 -- the hidden rows hold.
 -- A `range` is a spin box (LibWidgets.NewSpinBox), not a bare slider: `min`/
--- `max`/`step` drive the track, and the value is typeable inside it.
+-- `max`/`step` drive the track, and the value is typeable inside it. A `softMax`
+-- caps the track without capping the field: dragging and stepping stop there,
+-- typing carries on up to `max` if there is one and without limit if there is
+-- not (WeakAuras2's own softMax, which its spin box treats the same way).
 -- `code` is a `multiline` for user-authored Lua: syntax-coloured per keystroke
 -- unless WeakestAurasDB.codeEditorLive is turned off (/wa codelive), in which
 -- case colouring waits for blur. With
@@ -102,18 +105,22 @@ end
 --
 -- `mutators.delete = false` drops the delete action entirely, for a header that
 -- already carries its own `onDelete`: that one is the arming two-click button,
--- which a plain action icon is not.
+-- which a plain action icon is not. `mutators.duplicate = false` drops that one
+-- the same way, for a row a second copy of would be meaningless (the enforced
+-- sub-region standing for the region's own art).
 function W.ListActions(list, index, onChanged, mutators)
 	mutators = mutators or {}
 	local actions = {}
-	table.insert(actions, { icon = W.DUPLICATE_TEXTURE, tooltip = "Duplicate", onClick = function()
-		if mutators.duplicate then
-			mutators.duplicate(list, index)
-		else
-			table.insert(list, index + 1, WA.DeepCopy(list[index]))
-		end
-		onChanged()
-	end })
+	if mutators.duplicate ~= false then
+		table.insert(actions, { icon = W.DUPLICATE_TEXTURE, tooltip = "Duplicate", onClick = function()
+			if mutators.duplicate then
+				mutators.duplicate(list, index)
+			else
+				table.insert(list, index + 1, WA.DeepCopy(list[index]))
+			end
+			onChanged()
+		end })
+	end
 	table.insert(actions, { icon = W.LIBWIDGETS_TEXTURES .. "up", tooltip = "Move Up", onClick = function()
 		if index > 1 then
 			if mutators.moveUp then
@@ -1317,6 +1324,7 @@ local function placeField(page, f, x, y, w)
 		s.edit:ClearFocus()
 		s.bind.label, s.bind.fmt, s.bind.decimals = f.name, f.fmt, f.decimals
 		s.bind.min, s.bind.max, s.bind.step = f.min, f.max, f.step
+		s.bind.softMax = f.softMax
 		s.setWidth(w)
 		s.setValue(f.get())
 		s.bind.set = f.set

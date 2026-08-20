@@ -182,6 +182,14 @@
 -- range. spec:
 --   label         -- caption above the track
 --   min, max, step, width (default 150)
+--   softMax       -- optional: the top of the *track*, where that is lower than
+--                    the highest value the field accepts. Dragging and stepping
+--                    stay within min..softMax; a typed number may go past it, up
+--                    to `max` where one is given and without limit where it is
+--                    not. A value already above the track keeps the fill pinned
+--                    full and the up-step disabled, and a move may not raise it
+--                    further. Without a softMax the track spans min..max, so a
+--                    field that wants a hard ceiling simply omits it.
 --   textureDir    -- absolute path to this library's textures\ (see the
 --                    no-self-path note below); the two step buttons are the
 --                    shared `up` arrow given a quarter turn each
@@ -196,7 +204,8 @@
 --   get()         -- optional: seeds the initial value through `.setValue`
 -- Typing commits on Enter and on focus loss, reverts on Escape, and snaps and
 -- clamps to min/max/step -- so the box can never hold a value the slider half of
--- the control could not have produced. Returns the frame with `.setValue(v)`
+-- the control could not have produced, `softMax` above being the one deliberate
+-- exception to that. Returns the frame with `.setValue(v)`
 -- (resync without firing onChange), `.getValue()`, `.setWidth(w)` (the whole
 -- control, buttons included -- the track takes what is left), `.edit` (the edit
 -- box, for a pooling consumer that must clear focus before rebinding), `.label`
@@ -1246,28 +1255,42 @@ function LibWidgets.NewSpinBox(parent, spec)
 	-- one instance across fields rebinds by assigning to the spec table it passed
 	-- in (the same contract NewSlider's onChange/format follow).
 	local function bounds()
-		local lo, hi = spec.min or 0, spec.max or 1
+		local lo, hi = spec.min or 0, spec.softMax or spec.max or 1
 		if hi < lo then hi = lo end
 		return lo, hi, spec.step or 1
 	end
 
-	-- To the nearest step within [min, max]. Everything that can set the value --
+	-- To the nearest step, then into range. Everything that can set the value --
 	-- drag, step, typed entry, the external resync -- goes through this, so the
-	-- box can never show a number a drag could not have produced.
-	local function snap(v)
+	-- box can never show a number off the step grid.
+	--
+	-- `cap` is the ceiling this particular move may reach, and is what makes a
+	-- `softMax` field work: the track's top for a drag or a step, `spec.max` for
+	-- a typed value or a resync -- which is nil on a field that names only a
+	-- softMax, and nil here means no ceiling at all.
+	local function snap(v, cap)
 		v = tonumber(v)
 		if v == nil then return value end
-		local lo, hi, step = bounds()
+		local lo, _, step = bounds()
 		if step and step > 0 then v = lo + math.floor((v - lo) / step + 0.5) * step end
-		if v < lo then v = lo elseif v > hi then v = hi end
+		if v < lo then v = lo elseif cap and v > cap then v = cap end
 		return v
+	end
+
+	-- The ceiling for a move starting at `from`. A value sitting above the track
+	-- keeps its own, so the first pixel of a drag doesn't yank a typed 96 back
+	-- down to the track's 72 -- it can only be dragged or stepped downwards.
+	local function trackCeiling(from)
+		local _, hi = bounds()
+		if from > hi then return from end
+		return hi
 	end
 
 	local paint, setValue
 
 	local function nudge(dir)
 		local _, _, step = bounds()
-		setValue(value + dir * (step or 1), true)
+		setValue(value + dir * (step or 1), true, trackCeiling(value))
 	end
 
 	local arrow = (spec.textureDir or "") .. "up"
@@ -1350,8 +1373,9 @@ function LibWidgets.NewSpinBox(parent, spec)
 
 	-- onChange fires only on a real move, which is what lets Enter commit through
 	-- the focus-lost path as well without reporting the same edit twice.
-	setValue = function(v, fire)
-		v = snap(v)
+	setValue = function(v, fire, cap)
+		if cap == nil then cap = spec.max end
+		v = snap(v, cap)
 		local changed = (v ~= value)
 		value = v
 		paint()
@@ -1394,7 +1418,8 @@ function LibWidgets.NewSpinBox(parent, spec)
 		local span = f.trackSpan or 0
 		if span <= 0 then return end
 		local x = GetCursorPosition() / handle:GetEffectiveScale()
-		setValue(dragStartValue + ((x - dragStartX) / span) * (hi - lo), true)
+		setValue(dragStartValue + ((x - dragStartX) / span) * (hi - lo), true,
+			trackCeiling(dragStartValue))
 	end
 
 	handle:SetScript("OnMouseDown", function()

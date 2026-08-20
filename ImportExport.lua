@@ -187,21 +187,22 @@ function WA.ImportPreview(str)
 		if not payload then return nil, importReport("not a WeakestAuras export string") end
 		local pending, why = localPending(payload)
 		if not pending then return nil, importReport(why) end
-		-- A payload whose schema outruns this install is refused outright, as
-		-- WA2 refuses (its Update frame hides the import button behind a red
-		-- warning): the migrations here have never seen that shape, so what
-		-- installs would be data no code path understands. A newer *release*
-		-- at the same schema still imports, with the summary's soft warning.
+		-- A payload whose schema outruns this install imports anyway, warned
+		-- about in the summary rather than refused. The migrations here have
+		-- never seen that shape, so a field the newer schema renamed or added
+		-- reads as absent and MergeDefaults fills it with a default: settings
+		-- are lost, nothing is corrupted. Refusing instead strands everyone
+		-- whose aura came from someone running ahead of them, which is the
+		-- normal case for a string passed between two players. The stamp
+		-- travels untouched, so upgrading later does not re-run migrations the
+		-- author's build already applied.
 		local schema = pending.root.internalVersion or 0
 		for i = 1, table.getn(pending.children) do
 			local v = pending.children[i].internalVersion or 0
 			if v > schema then schema = v end
 		end
-		if schema > WA.SCHEMA_VERSION then
-			return nil, importReport(
-				"this aura was made with a newer WeakestAuras -- update the addon to import it")
-		end
 		local report = importReport(nil)
+		if schema > WA.SCHEMA_VERSION then report.schemaAhead = schema end
 		WA.CollectImportCode(pending.root, report, tostring(pending.root.id or "?") .. " - ")
 		for i = 1, table.getn(pending.children) do
 			local child = pending.children[i]

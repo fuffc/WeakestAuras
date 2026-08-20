@@ -61,7 +61,7 @@ function WA.GetProperties(data)
 	if rt and rt.properties then
 		for key, spec in pairs(rt.properties) do
 			out[key] = { display = spec.display or key, setter = spec.setter, action = spec.action, type = spec.type,
-				min = spec.min, max = spec.max, step = spec.step, values = spec.values,
+				min = spec.min, max = spec.max, softMax = spec.softMax, step = spec.step, values = spec.values,
 				base = spec.base, baseIndex = spec.baseIndex, dataKey = spec.dataKey or key }
 		end
 	end
@@ -79,7 +79,7 @@ function WA.GetProperties(data)
 			for key, pspec in pairs(sspec.properties) do
 				out["sub." .. i .. "." .. key] = { display = label .. (pspec.display or key),
 					setter = pspec.setter, action = pspec.action, type = pspec.type, min = pspec.min, max = pspec.max,
-					step = pspec.step, values = pspec.values, base = pspec.base, baseIndex = pspec.baseIndex,
+					softMax = pspec.softMax, step = pspec.step, values = pspec.values, base = pspec.base, baseIndex = pspec.baseIndex,
 					isSub = true, subIndex = i, subKey = pspec.dataKey or key }
 			end
 		end

@@ -524,7 +524,7 @@ WA.RegisterSubRegionType("subglow", {
 			overlay = overlay or self.overlay
 			if not overlay then return end
 			local level = self.frameLevel
-				or (self.parent:GetFrameLevel() + proto.SUB_LEVEL)
+				or (proto.BaseFrameLevel(self.parent) + proto.SUB_LEVEL)
 			overlay.bgFrame:SetFrameLevel(level)
 			overlay:SetFrameLevel(level + 1)
 		end

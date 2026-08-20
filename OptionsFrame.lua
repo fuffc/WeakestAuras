@@ -740,6 +740,37 @@ function S.getInfoOptions(data)
 		-- (upstream never surfaces it in the Information tab either).
 	}
 	S.addSourceFields(fields, data)
+	-- Upstream's Information-tab compatibility block, narrowed to the one flag
+	-- with a local effect. The preview runs a trigger's own code under a synthetic
+	-- event, and code written to read a live payload can throw there; only custom
+	-- triggers can, since generated prototype code compares its arguments and
+	-- never calls them.
+	local hasCustomTrigger
+	local triggers = data.triggers or {}
+	for i = 1, table.getn(triggers) do
+		local t = WA.GetTrigger(data, i)
+		if t and t.type == "custom" then hasCustomTrigger = true; break end
+	end
+	if hasCustomTrigger then
+		table.insert(fields, { type = "header", name = "Compatibility Options" })
+		table.insert(fields, {
+			type = "toggle", name = "Custom Trigger: ignore Lua errors while previewing",
+			get = function()
+				return (data.information and data.information.ignoreOptionsEventErrors) and true or false
+			end,
+			-- Recompiled rather than just stored: the preview reads the flag off
+			-- `data` when it runs, so nothing here needs the ti rebuilt -- but
+			-- WA.Add is what clears the report the previous preview already filed
+			-- and re-derives the preview under the new answer, so ticking the box
+			-- takes the error away instead of leaving it on the row until the next
+			-- unrelated edit.
+			set = function(v)
+				data.information = data.information or {}
+				data.information.ignoreOptionsEventErrors = v or nil
+				WA.Add(data)
+			end,
+		})
+	end
 	table.insert(fields, { type = "button", name = "Export",
 		onClick = function() S.openExport(data.id) end })
 	-- Every warning this aura has, titled by the worst severity -- the block the
@@ -918,24 +949,31 @@ function S.appendDisplayEffectsOptions(fields, data)
 		local spec = WA.subRegionTypes[sub.type]
 		perType[sub.type] = (perType[sub.type] or 0) + 1
 		if spec and spec.options then
-			local label = (spec.displayName or sub.type) .. " " .. perType[sub.type]
+			-- An enforced row is the region's own art standing in the draw-order
+			-- list: exactly one exists, so it takes no count, and it offers only
+			-- the arrows -- nothing to fold, nothing to delete, nothing a copy
+			-- would mean.
+			local enforced = spec.enforced and true or false
+			local label = spec.displayName or sub.type
+			if not enforced then label = label .. " " .. perType[sub.type] end
 			local key = "sub:" .. idx
 			-- Unfolded by default. Upstream folds subregions instead
 			-- (DisplayOptions.lua's __collapsed = true), but it can afford to:
 			-- its Display tab is long enough that an effect's fields are clearly
 			-- more content below, whereas here they're most of the tab, and a
 			-- column of collapsed headers reads as an empty page.
-			local collapsed = S.isCollapsed(data, key, false)
+			local collapsed
+			if not enforced then collapsed = S.isCollapsed(data, key, false) end
 			table.insert(fields, {
 				type = "header", name = label, collapsed = collapsed,
-				onToggle = function()
+				onToggle = not enforced and function()
 					S.setCollapsed(data, key, not collapsed)
 					S.refreshTabContent()
-				end,
+				end or nil,
 				-- Delete stays the header's own arming two-click button rather
 				-- than joining the actions row, where it would be a plain icon
 				-- that removes a configured effect on one click.
-				onDelete = function()
+				onDelete = not enforced and function()
 					local map = { [idx] = false }
 					for i = idx + 1, table.getn(data.subRegions) do map[i] = i - 1 end
 					table.remove(data.subRegions, idx)
@@ -943,7 +981,7 @@ function S.appendDisplayEffectsOptions(fields, data)
 					S.remapCollapsed(data, "sub:", map)
 					WA.Add(data)
 					S.refreshTabContent()
-				end,
+				end or nil,
 				-- Every structural edit renumbers, so every one of them maps.
 				-- data.subRegions is positional, a condition addresses an effect
 				-- as `sub.<n>.<key>`, and the index is the only thing tying the
@@ -957,7 +995,7 @@ function S.appendDisplayEffectsOptions(fields, data)
 					S.refreshTabContent()
 				end, {
 					delete = false,
-					duplicate = function(list, i)
+					duplicate = not enforced and function(list, i)
 						local map = {}
 						for j = table.getn(list), i + 1, -1 do map[j] = j + 1 end
 						table.insert(list, i + 1, WA.DeepCopy(list[i]))
@@ -970,7 +1008,7 @@ function S.appendDisplayEffectsOptions(fields, data)
 						-- targets an effect is a separate judgement call.
 						S.setCollapsed(data, "sub:" .. (i + 1),
 							S.isCollapsed(data, "sub:" .. i, false))
-					end,
+					end or false,
 					moveUp = function(list, i)
 						list[i - 1], list[i] = list[i], list[i - 1]
 						local map = { [i] = i - 1, [i - 1] = i }
@@ -999,7 +1037,8 @@ function S.appendDisplayEffectsOptions(fields, data)
 	-- identical "+ Add X" buttons that grows with each new subregion type.
 	local addable, addLabels = {}, {}
 	for name, spec in pairs(WA.subRegionTypes) do
-		if spec.options and (not spec.supports or spec.supports(data.regionType)) then
+		if spec.options and not spec.enforced
+			and (not spec.supports or spec.supports(data.regionType)) then
 			table.insert(addable, name)
 			addLabels[name] = spec.displayName or name
 		end
@@ -1171,9 +1210,12 @@ local function appendChangeValue(fields, data, change, pentry)
 			get = function() return change.value end,
 			set = function(v) change.value = v; WA.Add(data) end,
 		})
-	elseif ptype == "number" and pentry.min and pentry.max then
+	-- A property naming only a `softMax` is still a track-and-box field, not the
+	-- plain input box below: the ceiling it omits is the hard one.
+	elseif ptype == "number" and pentry.min and (pentry.max or pentry.softMax) then
 		table.insert(fields, {
-			type = "range", name = "Value", half = true, min = pentry.min, max = pentry.max, step = pentry.step or 1,
+			type = "range", name = "Value", half = true, min = pentry.min, max = pentry.max,
+			softMax = pentry.softMax, step = pentry.step or 1,
 			get = function() return change.value end,
 			set = function(v) change.value = v; WA.Add(data) end,
 		})
@@ -1393,49 +1435,25 @@ function S.appendLoadOptions(fields, data)
 		local arg = proto[i]
 		local useKey = "use_" .. arg.name
 
-		if arg.widget == "classtier" then
-			-- Not a plain on/off gate: "off"/"single"/"multi" picks between a
-			-- one-class dropdown and a multi-class checkbox list, matching WA2's
-			-- multiselect single/multi tiering (see Load.lua's comment on this
-			-- entry). `use_class` holds the mode string itself.
-			table.insert(fields, {
-				type = "select", name = arg.display, key = useKey,
-				values = { "off", "single", "multi" },
-				labels = { off = "Ignored", single = "Single Class", multi = "Multiple Classes" },
-				get = function() return L[useKey] or "off" end,
-				set = function(v)
-					-- Branched, not `(v == "off") and nil or v` -- that idiom
-					-- yields "off" for the very case it means to store nil, and a
-					-- truthy use_class is an *enabled* constraint.
-					if v == "off" then L[useKey] = nil else L[useKey] = v end
-					if v == "single" and not L.class then
-						local _, cls = UnitClass("player")
-						L.class = cls
-					elseif v == "multi" then
-						L.classes = L.classes or {}
-					end
-					WA.Add(data); S.refreshTabContent()
+		if arg.widget == "multiselect" then
+			-- Not a plain on/off gate: the tier picks between one value and a set
+			-- of them. The rows, the mode keys and the "several values" reading
+			-- are WeakestAuras.lua's, shared with the generic trigger args.
+			-- The player's own class is the useful starting point, where every
+			-- other constraint's declared default is as good as any.
+			local seed = arg.default
+			if arg.name == "class" then
+				local _, playerClass = UnitClass("player")
+				seed = playerClass or seed
+			end
+			WA.MultiSelectFields(fields, {
+				config = L, name = arg.name, display = arg.display,
+				values = arg.values, labels = arg.labels, default = seed,
+				onChange = function(repaint)
+					WA.Add(data)
+					if repaint then S.refreshTabContent() end
 				end,
 			})
-			if L[useKey] == "single" then
-				table.insert(fields, {
-					type = "select", name = "Class", key = "class",
-					values = WA.CLASS_TOKENS, labels = WA.CLASS_COLOR_LABELS,
-					get = function() return L.class or WA.CLASS_TOKENS[1] end,
-					set = function(v) L.class = v; WA.Add(data) end,
-				})
-			elseif L[useKey] == "multi" then
-				L.classes = L.classes or {}
-				local tokens = WA.CLASS_TOKENS
-				for i2 = 1, table.getn(tokens) do
-					local token = tokens[i2]
-					table.insert(fields, {
-						type = "toggle", name = WA.CLASS_COLOR_LABELS[token] or token, key = "classes." .. token, half = true,
-						get = function() return L.classes[token] and true or false end,
-						set = function(v) L.classes[token] = v and true or nil; WA.Add(data) end,
-					})
-				end
-			end
 		else
 			table.insert(fields, {
 				type = "toggle", name = arg.display, key = useKey,
@@ -2668,7 +2686,11 @@ function S.stageImport(f, requestedMode)
 	end
 	local reserve = 24 + f.loadBtn:GetWidth()
 	if f.updateBtn:IsShown() then reserve = reserve + 8 + f.updateBtn:GetWidth() end
-	f.status:SetText("Review the summary, then confirm.")
+	if report and report.schemaAhead then
+		f.status:SetText("Made with a newer WeakestAuras -- read the summary, then confirm.")
+	else
+		f.status:SetText("Review the summary, then confirm.")
+	end
 	f.status:SetTextColor(1, 0.82, 0)
 	f.status:SetPoint("RIGHT", f, "RIGHT", -reserve, 0)
 	return pending, report
@@ -2874,10 +2896,34 @@ function S.footerModsTooltip()
 			1, 0.35, 0.35, true)
 	end
 	tooltipDegraded("Nampower")
+	GameTooltip:AddLine(" ")
+	GameTooltip:AddLine("Click for copyable download links.", 0.8, 0.8, 0.8)
 end
 
 -- The client cannot open a browser, so every "link" in the addon -- the footer's
 -- site button and an aura's imported-from stamp alike -- is this copyable box.
+--
+-- `url` is one string, or an array of { label, url } for a dialog offering
+-- several. Rows are pooled and hidden up front, so a two-row dialog opened
+-- after a three-row one cannot leave the third on screen.
+local URL_ROW_H = 40
+
+local function urlDialogRow(f, index)
+	local rows = f.rows
+	if rows[index] then return rows[index] end
+	local label = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+	label:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -(34 + (index - 1) * URL_ROW_H))
+	label:SetJustifyH("LEFT")
+	local box = LibWidgets.NewTextBox(f, { width = 332, text = "" })
+	box:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -(48 + (index - 1) * URL_ROW_H))
+	box:SetScript("OnEscapePressed", function()
+		this:ClearFocus()
+		f:Hide()
+	end)
+	rows[index] = { label = label, box = box }
+	return rows[index]
+end
+
 function S.openURLDialog(title, url)
 	if not S.urlDialog then
 		local f = CreateFrame("Frame", "WeakestAurasURLDialog", UIParent)
@@ -2899,30 +2945,54 @@ function S.openURLDialog(title, url)
 		close:SetPoint("TOPRIGHT", -4, -4)
 		close:SetScript("OnClick", function() f:Hide() end)
 
-		local box = LibWidgets.NewTextBox(f, { width = 332, text = "" })
-		box:SetPoint("TOP", 0, -40)
-		box:SetScript("OnEscapePressed", function()
-			this:ClearFocus()
-			f:Hide()
-		end)
-		f.box = box
+		f.rows = {}
 
 		local hint = f:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-		hint:SetPoint("TOP", box, "BOTTOM", 0, -6)
+		hint:SetPoint("BOTTOM", 0, 10)
 		hint:SetText("Ctrl-C to copy, Escape to close.")
 
 		S.urlDialog = f
 	end
 	local f = S.urlDialog
-	f:Show()
+	local entries = type(url) == "table" and url or { { url = url } }
+	local count = table.getn(entries)
+
+	for i = 1, table.getn(f.rows) do
+		f.rows[i].label:Hide()
+		f.rows[i].box:Hide()
+	end
+	for i = 1, count do
+		local row = urlDialogRow(f, i)
+		if entries[i].label then
+			row.label:SetText(entries[i].label)
+			row.label:Show()
+		end
+		row.box:SetText(entries[i].url)
+		row.box:Show()
+	end
+
+	-- Kept for the single-URL callers, and for the driver that reads it back.
+	f.box = f.rows[1].box
+	f:SetHeight(48 + count * URL_ROW_H + 26)
 	f.heading:SetText(title)
-	f.box:SetText(url)
+	f:Show()
 	f.box:SetFocus()
 	f.box:HighlightText()
 end
 
 function S.openWebsite()
 	S.openURLDialog("Companion Website", WA.WEBSITE)
+end
+
+-- Where to get the three client mods WeakestAuras runs on.
+function S.openModSources()
+	local entries = {}
+	for i = 1, table.getn(WA.MOD_SOURCES) do
+		table.insert(entries, {
+			label = WA.MOD_SOURCES[i].mod, url = WA.MOD_SOURCES[i].url,
+		})
+	end
+	S.openURLDialog("Client mod downloads", entries)
 end
 
 function S.buildFooter(panel)
@@ -2966,7 +3036,7 @@ function S.buildFooter(panel)
 		GameTooltip:Hide()
 	end)
 
-	local mods = CreateFrame("Frame", nil, footer)
+	local mods = CreateFrame("Button", nil, footer)
 	mods:SetHeight(16)
 	mods:SetPoint("RIGHT", footer, "RIGHT", 0, 0)
 	mods:EnableMouse(true)
@@ -2979,6 +3049,7 @@ function S.buildFooter(panel)
 		GameTooltip:Show()
 	end)
 	mods:SetScript("OnLeave", function() GameTooltip:Hide() end)
+	mods:SetScript("OnClick", function() S.openModSources() end)
 
 	-- Refreshed on every open, not just at build: the degraded list grows as
 	-- gated features first run.
@@ -4003,6 +4074,12 @@ initFrame:SetScript("OnEvent", function()
 	if event == "ADDON_LOADED" then
 		if arg1 ~= "WeakestAuras" then return end
 		initFrame:UnregisterEvent("ADDON_LOADED")
+		-- The same SavedVariables load this waits for is also what can take the
+		-- table away again -- it assigns the global outright, and a file saved
+		-- by a session that never built one assigns nil. Repairing it here, at
+		-- the first point after that file has run, is what keeps every later
+		-- WeakestAurasDB.displays read from erroring.
+		WeakestAuras.EnsureDB()
 		WeakestAuras.NormalizeAll()
 		WeakestAuras.AddAllDisplays()
 		didInit = true

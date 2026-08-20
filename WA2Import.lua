@@ -104,6 +104,7 @@ local GROUP_KEYS = {
 local GROW_TYPES = {
 	UP = true, DOWN = true, LEFT = true, RIGHT = true,
 	HORIZONTAL = true, VERTICAL = true, GRID = true,
+	CIRCLE = true, COUNTERCIRCLE = true,
 }
 
 -- Group fields with no local counterpart at all, each changing how the group
@@ -198,11 +199,11 @@ local SUBTEXT_KEYS = {
 	"text_text", "text_color", "text_fontSize", "text_font", "text_fontType",
 	"text_visible", "text_justify", "text_justifyV", "text_spacing",
 	"text_shadowColor", "text_shadowXOffset", "text_shadowYOffset",
-	"anchor_point", "anchorXOffset", "anchorYOffset",
+	"anchor_point", "anchorXOffset", "anchorYOffset", "rotateText",
 }
 
 local SUBTEXT_DROP_KEYS = {
-	"rotateText", "text_automaticWidth", "text_fixedWidth", "text_wordWrap",
+	"text_automaticWidth", "text_fixedWidth", "text_wordWrap",
 }
 
 local SUBBORDER_KEYS = {
@@ -224,6 +225,7 @@ local SUBTICK_KEYS = {
 
 local SUBREGION_TYPES = {
 	subtext = true, subborder = true, subglow = true, subtick = true,
+	subbackground = true,
 }
 
 local DROPPED_FORMATS = { Unit = true, GUID = true, GCDTime = true }
@@ -384,10 +386,16 @@ end
 -- families are refused rather than collapsed onto one unit -- only three
 -- prototypes fan a family out, and importing a raid-wide aura as a single-unit
 -- one is the failure that looks right and behaves wrong.
-local function isSupportedUnit(unit)
+-- `family` widens the accepted tokens to the multi-unit dropdown, and is only
+-- ever true for a prototype that declares `statesParameter = "unit"` -- one that
+-- fans a family out into a clone per member. Without that declaration "group" is
+-- a unit token this client does not have, and a trigger given it would watch
+-- nothing at all rather than watch the group.
+local function isSupportedUnit(unit, family)
 	if unit == nil then return true end
-	for i = 1, table.getn(WA.unit_tokens or {}) do
-		if WA.unit_tokens[i] == unit then return true end
+	local tokens = (family and WA.unit_tokens_multi) or WA.unit_tokens
+	for i = 1, table.getn(tokens or {}) do
+		if tokens[i] == unit then return true end
 	end
 	return false
 end
@@ -561,32 +569,33 @@ local function selectedLoadValues(block)
 	return values
 end
 
+-- Every one of these constraints takes a set here, so upstream's shape lands
+-- whole and the local values need no collapsing. `use_<field>` false is
+-- upstream's "several values" rather than off -- the same overload the generic
+-- trigger args cross, undone by the same reading.
 local function translateLoadMultiselect(source, destination, field, report, data)
 	local use = source["use_" .. field]
 	local block = source[field]
 	if use == nil or not loadValuePresent(block) then return end
-	local selected = selectedLoadValues(block)
 	if use == true then
-		if type(block) == "table" and block.single ~= nil then
-			destination["use_" .. field] = field == "class" and "single" or true
-			destination[field] = WA.DeepCopy(block.single)
-			return
+		local single = type(block) == "table" and block.single or nil
+		if single == nil then
+			local selected = selectedLoadValues(block)
+			single = table.getn(selected) == 1 and selected[1] or nil
 		end
-		if table.getn(selected) == 1 then
-			destination["use_" .. field] = field == "class" and "single" or true
-			destination[field] = WA.DeepCopy(selected[1])
+		if single ~= nil then
+			destination["use_" .. field] = "single"
+			destination[field] = WA.DeepCopy(single)
 			return
 		end
 	else
-		if table.getn(selected) == 1 and field ~= "class" then
-			destination["use_" .. field] = true
-			destination[field] = WA.DeepCopy(selected[1])
-			return
-		end
-		if field == "class" and table.getn(selected) > 0 then
-			destination.use_class = "multi"
-			destination.classes = {}
-			for i = 1, table.getn(selected) do destination.classes[selected[i]] = true end
+		local selected = selectedLoadValues(block)
+		if table.getn(selected) > 0 then
+			destination["use_" .. field] = "multi"
+			destination[field .. "_multi"] = {}
+			for i = 1, table.getn(selected) do
+				destination[field .. "_multi"][selected[i]] = true
+			end
 			return
 		end
 	end
@@ -819,6 +828,15 @@ local GENERIC_ARG_NAMES = {
 	-- A combo trigger arrives as a Power trigger (see COMBO_POINT_POWER_TYPE),
 	-- so its threshold is upstream's `power` and its operator `power_operator`.
 	combopoints = { comboPoints = "power" },
+	conditions = { groupType = "ingroup" },
+}
+
+-- Where a mapped arg's *values* diverge as well as its name, ours -> theirs.
+-- Only one does: upstream's group_types calls a party "group", and the local
+-- name is the one `WA.ConditionGroupType` reports and a saved condition on the
+-- stored variable already compares against.
+local GENERIC_ARG_VALUES = {
+	conditions = { groupType = { solo = "solo", party = "group", raid = "raid" } },
 }
 
 -- WeakAuras2 has no combo-point trigger. On every client it builds against,
@@ -867,11 +885,16 @@ local GENERIC_UNSUPPORTED = {
 	cast = { spell = "refuse", spellNames = "refuse", spellId = "refuse",
 		castType = "drop", interruptible = "drop", sourceUnit = "drop", destUnit = "drop" },
 	castsucceeded = { spellNames = "refuse", spellId = "refuse" },
+	-- Upstream splits an instance by raid size and by difficulty, neither of
+	-- which this client reports; its instance *type* list is the same split, so
+	-- landing it would widen "25 man" into every raid. All three widen, so all
+	-- three are reported rather than silently ignored.
+	conditions = { instance_type = "drop", instance_size = "drop",
+		instance_difficulty = "drop" },
 	crowdcontrol = { controlType = "drop", interruptSchool = "drop", spellName = "drop" },
 	equipslotcooldown = { testForCooldown = "drop" },
 	itemequipped = { itemSlot = "drop" },
 	itemset = { equipped = "drop" },
-	itemtypeequipped = { itemTypeName = "refuse" },
 	location = { zoneIds = "drop", instanceId = "drop", instanceSize = "drop",
 		instanceDifficulty = "drop" },
 	power = { requirePowerType = "drop", showCost = "drop",
@@ -886,12 +909,6 @@ local GENERIC_UNSUPPORTED = {
 	combopoints = { requirePowerType = "drop", showCost = "drop",
 		percentpower = "drop", deficit = "drop" },
 	reputation = { factionID = "refuse", watched = "refuse" },
-	-- Upstream stores the shapeshift *bar position*; this client's trigger
-	-- matches the form's DBC id (GetShapeshiftFormID), and the two numberings
-	-- have nothing to do with each other. Nothing here can translate one into
-	-- the other -- the bar's order is class- and spellbook-dependent -- so the
-	-- filter is refused rather than imported as a different form.
-	stance = { form = "refuse" },
 	talentknown = { talent = "refuse", spec = "refuse" },
 	totem = { totemName = "refuse", totemNamePattern = "refuse", clones = "refuse" },
 	unitcharacteristics = { class = "drop", hostility = "drop", character = "drop",
@@ -926,13 +943,14 @@ local function upstreamSetting(source, key)
 end
 
 -- The keys a prototype's editor writes, from the defaults its own args build.
--- `use_<name>`, `<name>_operator` and the `<name>2` pair qualify a base key
--- rather than being keys in their own right, and are taken with it.
+-- `use_<name>`, `<name>_operator`, `<name>_multi` and the `<name>2` pair qualify
+-- a base key rather than being keys in their own right, and are taken with it.
 local function genericBaseKeys(defaults)
 	local bases = {}
 	for key in pairs(defaults) do
 		local companion = string.sub(key, 1, 4) == "use_"
 			or string.find(key, "_operator$") ~= nil
+			or string.find(key, "_multi$") ~= nil
 		if not companion then
 			local _, _, stem = string.find(key, "^(.+)2$")
 			companion = stem ~= nil and defaults[stem] ~= nil
@@ -940,6 +958,52 @@ local function genericBaseKeys(defaults)
 		if not companion then table.insert(bases, key) end
 	end
 	return bases
+end
+
+-- Upstream's multiselect shape onto a local one. The mode is carried by
+-- `use_<name>`, which upstream overloads: true is "one value" and *false* is
+-- "several", the state a plain boolean gate would read as off. Ours spells the
+-- three states out, so this is where the overload is undone.
+-- `wantNumber` follows the local default's type -- a set's keys are strings once
+-- they have been through a serialiser, whatever the domain is.
+-- `incoming` maps upstream's values onto ours where the two vocabularies differ;
+-- a value missing from it has no local counterpart and is skipped rather than
+-- stored, since a filter carrying a value this client never reports would match
+-- nothing while looking configured. The caller reports what was skipped.
+local function landMultiSelect(trigger, base, value, use, wantNumber, incoming, skipped)
+	local function coerce(v)
+		if incoming then
+			local mapped = incoming[v]
+			if mapped == nil then table.insert(skipped, tostring(v)) end
+			return mapped
+		end
+		if not wantNumber then return v end
+		return tonumber(v) or v
+	end
+	if use == false then
+		local set = {}
+		for key, selected in pairs((type(value) == "table" and value.multi) or {}) do
+			if selected then
+				local mapped = coerce(key)
+				if mapped ~= nil then set[mapped] = true end
+			end
+		end
+		trigger["use_" .. base] = "multi"
+		trigger[base .. "_multi"] = set
+	elseif use then
+		local single = type(value) == "table" and value.single or value
+		local mapped = single ~= nil and coerce(single) or nil
+		if mapped == nil then
+			-- Nothing left to match on; an empty single filter would be a filter
+			-- that can never pass, where off is what the author would recognise.
+			trigger["use_" .. base] = false
+		else
+			trigger["use_" .. base] = "single"
+			trigger[base] = mapped
+		end
+	else
+		trigger["use_" .. base] = false
+	end
 end
 
 -- One value out of upstream's multiselect shape, or nil when it names several:
@@ -955,6 +1019,54 @@ local function singleSelectValue(value, use)
 	end
 	if found == nil then return value.single end
 	return found
+end
+
+-- Upstream keys Item Type Equipped's one multiselect on
+-- `classID * 256 + subclassID`, where the class is its own select here and the
+-- subclasses a set inside it. Two fields cannot hold a selection spanning two
+-- item classes (a shield beside a list of weapons), so that one is refused
+-- rather than imported as whichever class the walk happened to see first.
+local ITEM_TYPE_CLASS_STRIDE = 256
+
+local function translateItemTypeEquipped(trigger, source, label, report)
+	-- Upstream's slot filter is a plain select, so its `use_` key is a real
+	-- on/off gate; ours is always-on with an "Any Slot" entry, which is what an
+	-- ungated upstream trigger means.
+	if not upstreamSetting(source, "itemSlot") then trigger.itemSlot = 0 end
+
+	if not upstreamSetting(source, "itemTypeName") then return true end
+	local value = source.itemTypeName
+	local ids = {}
+	if type(value) == "table" then
+		if source.use_itemTypeName == false then
+			for key, selected in pairs(value.multi or {}) do
+				if selected then table.insert(ids, tonumber(key)) end
+			end
+		elseif value.single ~= nil then
+			table.insert(ids, tonumber(value.single))
+		end
+	elseif value ~= nil then
+		table.insert(ids, tonumber(value))
+	end
+
+	local classID, subclasses = nil, {}
+	for i = 1, table.getn(ids) do
+		local combined = ids[i]
+		if combined then
+			local class = math.floor(combined / ITEM_TYPE_CLASS_STRIDE)
+			if classID ~= nil and classID ~= class then
+				report.refused = label .. " selects item types from more than one item class"
+				return false
+			end
+			classID = class
+			subclasses[math.mod(combined, ITEM_TYPE_CLASS_STRIDE)] = true
+		end
+	end
+	if classID == nil then return true end
+	trigger.itemClassID = classID
+	trigger.use_itemSubclassID = "multi"
+	trigger.itemSubclassID_multi = subclasses
+	return true
 end
 
 local function translateGenericTrigger(source, triggernum, report)
@@ -1018,60 +1130,83 @@ local function translateGenericTrigger(source, triggernum, report)
 		local base = bases[i]
 		local srcKey = names[base] or base
 		local wantNumber = type(defaults[base]) == "number"
-		local value, second = source[srcKey], nil
-		local operator, operator2 = source[srcKey .. "_operator"], nil
-		if type(value) == "table" and (value.single ~= nil or value.multi ~= nil) then
-			value = singleSelectValue(value, source["use_" .. srcKey])
-			if value == nil then
+		-- A multiselect owns its own gate key, so it lands whole and skips the
+		-- gate/operator/second-bound handling the scalar filters share.
+		if defaults[base .. "_multi"] ~= nil then
+			local ours = (GENERIC_ARG_VALUES[protoKey] or {})[base]
+			local incoming, skipped
+			if ours then
+				incoming, skipped = {}, {}
+				for localValue, upstreamValue in pairs(ours) do incoming[upstreamValue] = localValue end
+			end
+			landMultiSelect(trigger, base, source[srcKey], source["use_" .. srcKey],
+				wantNumber, incoming, skipped)
+			for i = 1, table.getn(skipped or {}) do
 				reportDrop(report, "unsupported trigger filter",
-					label .. ": " .. base .. " selects a set this trigger cannot express")
+					label .. ": " .. base .. " value " .. skipped[i])
 			end
-		elseif type(value) == "table" then
-			value, second = value[1], value[2]
-		end
-		if type(operator) == "table" then operator, operator2 = operator[1], operator[2] end
-		if wantNumber then
-			value, second = tonumber(value), tonumber(second)
-		end
-
-		if defaults["use_" .. base] ~= nil then
-			local use = source["use_" .. srcKey]
-			if use ~= nil then trigger["use_" .. base] = use and true or false end
-			if value ~= nil then trigger[base] = WA.DeepCopy(value) end
-			if operator ~= nil then
-				local mapped = GENERIC_OPERATORS[operator]
-				if mapped then
-					trigger[base .. "_operator"] = mapped
-				else
-					trigger["use_" .. base] = false
+		else
+			local value, second = source[srcKey], nil
+			local operator, operator2 = source[srcKey .. "_operator"], nil
+			if type(value) == "table" and (value.single ~= nil or value.multi ~= nil) then
+				value = singleSelectValue(value, source["use_" .. srcKey])
+				if value == nil then
 					reportDrop(report, "unsupported trigger filter",
-						label .. ": " .. base .. " " .. tostring(operator))
+						label .. ": " .. base .. " selects a set this trigger cannot express")
 				end
+			elseif type(value) == "table" then
+				value, second = value[1], value[2]
 			end
-			if second ~= nil then
-				if defaults[base .. "2"] ~= nil then
-					trigger["use_" .. base .. "2"] = true
-					trigger[base .. "2"] = WA.DeepCopy(second)
-					if GENERIC_OPERATORS[operator2] then
-						trigger[base .. "2_operator"] = GENERIC_OPERATORS[operator2]
+			if type(operator) == "table" then operator, operator2 = operator[1], operator[2] end
+			if wantNumber then
+				value, second = tonumber(value), tonumber(second)
+			end
+
+			if defaults["use_" .. base] ~= nil then
+				local use = source["use_" .. srcKey]
+				if use ~= nil then trigger["use_" .. base] = use and true or false end
+				if value ~= nil then trigger[base] = WA.DeepCopy(value) end
+				if operator ~= nil then
+					local mapped = GENERIC_OPERATORS[operator]
+					if mapped then
+						trigger[base .. "_operator"] = mapped
+					else
+						trigger["use_" .. base] = false
+						reportDrop(report, "unsupported trigger filter",
+							label .. ": " .. base .. " " .. tostring(operator))
 					end
-				else
-					reportDrop(report, "unsupported trigger filter", label .. ": second " .. base .. " bound")
 				end
+				if second ~= nil then
+					if defaults[base .. "2"] ~= nil then
+						trigger["use_" .. base .. "2"] = true
+						trigger[base .. "2"] = WA.DeepCopy(second)
+						if GENERIC_OPERATORS[operator2] then
+							trigger[base .. "2_operator"] = GENERIC_OPERATORS[operator2]
+						end
+					else
+						reportDrop(report, "unsupported trigger filter", label .. ": second " .. base .. " bound")
+					end
+				end
+			elseif type(defaults[base]) == "boolean" then
+				-- A plain flag: upstream keeps it under `use_<name>` and leaves the
+				-- name itself for whatever the flag qualifies, where a toggle here is
+				-- the bare key and nothing else.
+				local flag = source["use_" .. srcKey]
+				if flag == nil then flag = value end
+				if flag ~= nil then trigger[base] = flag and true or false end
+			elseif value ~= nil then
+				trigger[base] = WA.DeepCopy(value)
 			end
-		elseif type(defaults[base]) == "boolean" then
-			-- A plain flag: upstream keeps it under `use_<name>` and leaves the
-			-- name itself for whatever the flag qualifies, where a toggle here is
-			-- the bare key and nothing else.
-			local flag = source["use_" .. srcKey]
-			if flag == nil then flag = value end
-			if flag ~= nil then trigger[base] = flag and true or false end
-		elseif value ~= nil then
-			trigger[base] = WA.DeepCopy(value)
 		end
 	end
 
-	if defaults.unit ~= nil and not isSupportedUnit(trigger.unit) then
+	if protoKey == "itemtypeequipped"
+		and not translateItemTypeEquipped(trigger, source, label, report) then
+		return nil
+	end
+
+	local fansOut = (WA.triggerTypes[protoKey] or {}).statesParameter == "unit"
+	if defaults.unit ~= nil and not isSupportedUnit(trigger.unit, fansOut) then
 		report.refused = label .. " uses unsupported unit " .. tostring(trigger.unit)
 		return nil
 	end
@@ -1397,6 +1532,11 @@ local function translateSubRegion(source, index, parentType, data, report)
 	if kind == "subtext" then return translateSubtext(source, index, data, report) end
 	if kind == "subborder" then return translateSubborder(source, index, report) end
 	if kind == "subglow" then return translateSubglow(source, index, report) end
+	-- The placeholder standing for the region's own art carries no fields at
+	-- all, upstream included. Its position is the whole content: dropping it
+	-- would pull every later effect down a slot, which is exactly the draw order
+	-- the aura's author arranged.
+	if kind == "subbackground" then return { type = "subbackground" } end
 	return translateSubtick(source, index, report)
 end
 
@@ -1864,9 +2004,10 @@ local function translateGroup(data, source, report)
 	if source.alpha ~= nil and source.alpha ~= 1 then
 		reportDrop(report, "group alpha", label .. ": " .. tostring(source.alpha))
 	end
-	-- CIRCLE/COUNTERCIRCLE and CUSTOM name no axis to keep, so they fall back to
-	-- the region default rather than to a direction. GRID is not among them: its
-	-- geometry fields are ours by the same names, so `take` carries them.
+	-- CUSTOM names no layout to keep, so it falls back to the region default
+	-- rather than to a direction. The grid and the two circles are not among
+	-- them: their geometry fields are ours by the same names, so `take` carries
+	-- them.
 	if data.grow ~= nil and not GROW_TYPES[data.grow] then
 		reportDrop(report, "unsupported grow direction", label .. ": " .. tostring(data.grow))
 		data.grow = nil
@@ -1911,7 +2052,10 @@ local function translateDisplay(source, report)
 	if sourceType == "model" or sourceType == "stopmotion" then
 		reportDrop(report, "unsupported region type", sourceType)
 	elseif sourceType == "progresstexture"
-		and (source.orientation == "CLOCKWISE" or source.orientation == "ANTICLOCKWISE") then
+		and (source.orientation == "CLOCKWISE" or source.orientation == "ANTICLOCKWISE")
+		and not WA.hasTextureTransforms then
+		-- Circular fills need the client's corner transforms; with them the
+		-- orientation imports like any other.
 		reportDrop(report, "unsupported progress texture orientation", source.orientation)
 	end
 
@@ -2182,6 +2326,14 @@ function WA.ImportSummary(pending, report)
 		header = header .. " and " .. childCount .. " auras inside it"
 	end
 	local lines = { header }
+	-- Above the rest of the summary, not down with the version block: this is
+	-- the one warning that says settings are being dropped right now.
+	if report and report.schemaAhead then
+		table.insert(lines, "")
+		table.insert(lines, "Made with a newer WeakestAuras (data version "
+			.. tostring(report.schemaAhead) .. "; this one reads " .. tostring(WA.SCHEMA_VERSION)
+			.. "). It will import, but anything that version added may come in at defaults.")
+	end
 	if table.getn(report and report.code or {}) > 0 then
 		table.insert(lines, "")
 		table.insert(lines, "Runs this author's Lua:")

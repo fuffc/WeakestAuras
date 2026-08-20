@@ -119,7 +119,7 @@ end
 --
 -- The flag string is dropped before the face because it is the likelier half to
 -- be refused: MONOCHROME and the two combos are not confirmed on this client.
-local function setFont(fs, path, size, flags)
+local function setFontFace(fs, path, size, flags)
 	local ok = fs:SetFont(path, size, flags)
 	if ok and fs:GetFont() then return true end
 	ok = fs:SetFont(path, size, "")
@@ -128,6 +128,75 @@ local function setFont(fs, path, size, flags)
 	if ok and fs:GetFont() then return true end
 	fs:SetFontObject(GameFontHighlight)
 	return fs:GetFont() ~= nil
+end
+
+-- Where this client stops honouring SetFont's size. Nothing announces it: past
+-- the ceiling SetFont returns normally, GetFont reads back the size that was
+-- asked for, and the glyphs are rasterised at the ceiling regardless -- so a
+-- 40pt aura draws the same height as a 20pt one.
+--
+-- It has to be MEASURED, and by width, because a clamped size lays out exactly
+-- like the ceiling's: the sweep looks for where the string stops widening. A
+-- sweep that widens the whole way (or that measures nothing at all, which is
+-- what the headless harness does) latches `false` and turns the scaling below
+-- off entirely, so a client without a ceiling pays nothing for this.
+--
+-- One measurement serves every face: the ceiling belongs to the rasteriser, not
+-- to the file.
+local sizeCeiling
+local CEILING_SWEEP_TOP = 80
+local function fontSizeCeiling()
+	if sizeCeiling ~= nil then return sizeCeiling end
+	sizeCeiling = false
+	local host = CreateFrame("Frame", nil, UIParent)
+	host:Hide()
+	local probe = host:CreateFontString(nil, "BACKGROUND")
+	local grew, last = nil, nil
+	for size = 8, CEILING_SWEEP_TOP do
+		probe:SetFont(DEFAULTS.font, size, "")
+		probe:SetText("HHHHHH")
+		local w = probe:GetStringWidth() or 0
+		if w <= 0 then return sizeCeiling end
+		if last and w > last + 0.5 then grew = size end
+		last = w
+	end
+	if grew and grew < CEILING_SWEEP_TOP then sizeCeiling = grew end
+	return sizeCeiling
+end
+
+-- The measurement itself, for /wa textprobe to report.
+textCore.SizeCeiling = fontSizeCeiling
+
+-- SetTextHeight scales what SetFont rasterised, and is the only way to draw
+-- above the ceiling -- softer edges up there, which is the whole price. Two
+-- things about it are load-bearing, and the fix does not work without either:
+--
+-- The two sizes must DIFFER. SetTextHeight does nothing when it would not change
+-- the size SetFont was given, and above the ceiling that size is the one the
+-- user asked for -- SetFont was told 40 and reports 40, it merely drew 20. So
+-- the face is deliberately rasterised at the ceiling and scaled from there;
+-- asking for 40 twice changes nothing. MikScrollingBattleText reaches the same
+-- shape from the other side, rasterising one point below whatever it wants.
+--
+-- And it is re-asserted after the string, which is why the size is kept on the
+-- FontString for SetText below. This pair applied at SetFont time alone drew at
+-- the ceiling on screen even though it measures correctly on a bare FontString,
+-- so something between the two puts the height back -- the colour/justify/
+-- spacing/shadow calls in Apply, or the SetParent round trip Auto-mode measuring
+-- makes. Which one is unidentified; the re-assert costs one call per string and
+-- only on a string that is actually scaled.
+local function setFont(fs, path, size, flags)
+	local ceiling = fontSizeCeiling()
+	local raster = size
+	if ceiling and size > ceiling then raster = ceiling end
+	if not setFontFace(fs, path, raster, flags) then return false end
+	if raster ~= size then
+		fs.waTextHeight = size
+		fs:SetTextHeight(size)
+	else
+		fs.waTextHeight = nil
+	end
+	return true
 end
 
 local function keyName(aliases, key)
@@ -170,6 +239,9 @@ end
 function textCore.SetText(fs, str)
 	if not fs:GetFont() then return false end
 	fs:SetText(str)
+	-- Only a string scaled past the size ceiling carries one, and only that string
+	-- pays for the second call.
+	if fs.waTextHeight then fs:SetTextHeight(fs.waTextHeight) end
 	return true
 end
 

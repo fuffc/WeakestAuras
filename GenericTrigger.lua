@@ -17,6 +17,14 @@
 -- nameFunc/iconFunc do. loadstring is confirmed on this client (StateMachine's
 -- customTriggerLogic, Conditions' deferred custom). /wa gen <id> dumps the
 -- generated source, making source-assembly errors readable.
+--
+-- Watcher sections sit inside a bare `do ... end`. Lua 5.0 allows 200 locals
+-- live at once in a function, and this file's chunk is one function; a block
+-- returns its slots at `end`, so each self-contained watcher costs the chunk
+-- nothing. Closures still capture what they need -- an upvalue survives the
+-- block that declared it -- and the sections reach the rest of the file the
+-- way they already did, through WA.* and PROTOTYPES. Deleting one of those
+-- `do`/`end` pairs re-spends its slots and puts the file back at the ceiling.
 
 if WeakestAuras.disabled then return end
 
@@ -285,6 +293,31 @@ local STRING_OPS = { "==", "~=", "find", "notfind" }
 local STRING_OP_LABELS = { ["=="] = "Is", ["~="] = "Is Not",
 	find = "Contains", notfind = "Doesn't Contain" }
 
+-- The compiled half of a `multiselect` filter (the convention itself lives in
+-- WeakestAuras.lua): the comparison it expands into, or nil when it is off.
+-- Set keys survive a round trip through a serialiser as strings, so a numeric
+-- domain coerces per key rather than trusting the key's type.
+--
+-- Callable from a prototype's `init` as well as from the arg walk below, so a
+-- prototype needing the match as a named local (one an inverse toggle can
+-- negate) builds it from the same source the plain filter would.
+local function multiSelectSource(trigger, name, var)
+	local mode = WA.MultiSelectMode(trigger, name)
+	if mode == "multi" then
+		local set, terms = trigger[name .. "_multi"], {}
+		for value, selected in pairs(set or {}) do
+			if selected then
+				table.insert(terms, string.format("%s == %s", var, fmt(tonumber(value) or value)))
+			end
+		end
+		if table.getn(terms) == 0 then return "false" end
+		return table.concat(terms, " or ")
+	elseif mode == "single" then
+		return string.format("%s == %s", var, fmt(trigger[name]))
+	end
+	return nil
+end
+
 -- The test source for one arg, or nil if it contributes none. A `test` win:
 -- either a format string with a single %s for the user value, or a function
 -- (trigger) -> source-string for config-branching tests (e.g. genericShowOn's
@@ -316,6 +349,9 @@ local function constructArgTest(arg, trigger)
 	elseif arg.type == "select" then
 		if not arg.required and not trigger["use_" .. arg.name] then return nil end
 		return string.format("(%s == %s)", arg.name, fmt(trigger[arg.name]))
+	elseif arg.type == "multiselect" then
+		local src = multiSelectSource(trigger, arg.name, arg.name)
+		return src and ("(" .. src .. ")") or nil
 	elseif arg.type == "string" then
 		if not arg.required and not trigger["use_" .. arg.name] then return nil end
 		local op = trigger[arg.name .. "_operator"] or "=="
@@ -453,16 +489,25 @@ local function trueFunction() return true end
 -- anything (yet). Numeric input is trusted as-is and never round-tripped
 -- through a lookup: the legacy GetSpellInfo(spellID) works for *any* spell
 -- ID, known or not (ref ClassicAPI docs §Spell), so a raw ID the player
--- hasn't learned still resolves. A name only resolves through C_Spell's name
--- resolver (FUN_RESOLVE_SPELL_NAME_TO_BOOK_ID, the same chain
--- CastSpellByName uses) -- unlike the numeric path, that's bounded to the
--- player's own known spellbook, so a name for a spell they don't have (wrong
--- spelling, wrong class, not yet learned) legitimately has no numeric ID to
--- resolve to and this returns nil.
+-- hasn't learned still resolves. A name resolves against the player's own
+-- spellbook only, so a name for a spell they don't have (wrong spelling, wrong
+-- class, not yet learned) legitimately has no numeric ID to resolve to and this
+-- returns nil.
+--
+-- Two name lookups, in this order. The book-name one has to come first: the
+-- engine resolver behind C_Spell (FUN_RESOLVE_SPELL_NAME_TO_BOOK_ID, the same
+-- chain CastSpellByName uses) reaches its lookup through the macro parser's
+-- rank splitter, which reads a trailing parenthesised suffix as a "(Rank N)"
+-- and strips it -- so a spell whose real name ends in parentheses, "Faerie Fire
+-- (Feral)", never arrives intact and either misses or lands on the unsuffixed
+-- spell of the same stem. C_Spell still has the last word for the "(Rank N)"
+-- forms and the pet book, neither of which the player-book index carries.
 function WA.ResolveSpellID(input)
 	if input == nil or input == "" then return nil end
 	local id = tonumber(input)
 	if id then return id end
+	local bookId = WA.SpellIDByBookName(input)
+	if bookId then return bookId end
 	if C_Spell and C_Spell.GetSpellInfo then
 		local info = C_Spell.GetSpellInfo(input)
 		if info and info.spellID then return info.spellID end
@@ -485,6 +530,9 @@ end
 -- ascending slots, so the last write wins and the index holds the highest rank
 -- (the same rank walk DoiteAuras does before its own GetSpellCooldown calls).
 -- ---------------------------------------------------------------------------
+
+do -- scoped; see the local-ceiling note in the file header
+
 local spellSlotByName, spellSlotById
 
 local function buildSpellSlotIndex()
@@ -520,6 +568,17 @@ function WA.SpellSlotByName(name)
 	return spellSlotByName[name]
 end
 
+-- spellID for a name that appears verbatim in the player's book, or nil. The
+-- index holds the highest known rank, which is both the rank a bare name means
+-- everywhere else and the one that carries the cooldown.
+function WA.SpellIDByBookName(name)
+	local slot = WA.SpellSlotByName(name)
+	if not slot or not GetSpellInfo then return nil end
+	local ok, _, _, _, _, _, _, _, _, _, id = pcall(GetSpellInfo, slot, BOOKTYPE_SPELL or "spell")
+	if not ok then return nil end
+	return id
+end
+
 -- Slot for a spellID, via its name -- so a specific rank's ID still lands on the
 -- book's highest rank, which is what actually goes on cooldown.
 function WA.SpellSlotByID(spellId)
@@ -545,6 +604,8 @@ function WA.SpellSlotCooldown(slot)
 	return start, duration
 end
 
+end -- spellbook index
+
 -- itemID for a name the user typed, found by walking the player's own
 -- containers. Nothing on this client resolves a name: C_Item.GetItemCount and
 -- C_Item.GetItemInfo both take an id, an "item:N" string or a link, and say so
@@ -552,6 +613,9 @@ end
 -- finding one you hold. A hit is memoized for good (an id never stops belonging
 -- to a name); a miss is only rate-limited, since the item may simply not be
 -- carried yet and looting one must start working without a reload.
+
+do -- scoped; see the local-ceiling note in the file header
+
 local itemIdByName = {}
 local itemNameMissAt = {}
 local ITEM_NAME_RESCAN = 0.5
@@ -627,6 +691,8 @@ itemNameRetryFrame:SetScript("OnEvent", function()
 	if resolved and WA.AddAllDisplays then WA.AddAllDisplays() end
 end)
 
+end -- item-name cache
+
 function WA.ResolveItemID(input)
 	if input == nil or input == "" then return nil end
 	local id = tonumber(input)
@@ -649,7 +715,10 @@ end
 -- Inspect the player's equipment and return the first matching item's details.
 -- GetItemInfoInstant is cache-only: an ID can be present while its class data
 -- is unavailable, so an uncached item is equipped but cannot match a type.
-function WA.ItemTypeEquipped(wantedClassID, wantedSubclassID, selectedSlot)
+-- `wantedSubclasses` is a set of subclass ids, or nil for any subclass of the
+-- class -- one weapon *type* is rarely what a user means, where "a one-hander"
+-- is several of them.
+function WA.ItemTypeEquipped(wantedClassID, wantedSubclasses, selectedSlot)
 	local firstSeen
 	local firstID, firstName, firstIcon, firstClass, firstSubclass
 	local firstClassID, firstSubclassID, firstKnown
@@ -681,7 +750,8 @@ function WA.ItemTypeEquipped(wantedClassID, wantedSubclassID, selectedSlot)
 					firstClass, firstSubclass = itemClass, itemSubclass
 					firstClassID, firstSubclassID, firstKnown = classID, subclassID, true
 				end
-				if not matchingID and classID == tonumber(wantedClassID) and subclassID == tonumber(wantedSubclassID) then
+				local subclassMatches = wantedSubclasses == nil or wantedSubclasses[subclassID]
+				if not matchingID and classID == tonumber(wantedClassID) and subclassMatches then
 					matchingID, matchingName, matchingIcon = itemID, itemName, itemIcon
 					matchingClass, matchingSubclass = itemClass, itemSubclass
 					matchingClassID, matchingSubclassID = classID, subclassID
@@ -845,6 +915,8 @@ end
 -- this set.
 -- ---------------------------------------------------------------------------
 
+do -- scoped; see the local-ceiling note in the file header
+
 -- Tokens whose occupancy the client announces. `player` is here because it
 -- never moves at all. Everything else -- the derived-target tokens, and
 -- whatever `specific` names -- is polled: UNIT_TARGET exists on no ClassicAPI
@@ -965,6 +1037,8 @@ function WA.RegisterUnitWatchCallback(fn)
 	table.insert(watchCallbacks, fn)
 	ensureUnitWatchFrame()
 end
+
+end -- unit-token watcher
 
 -- Shared 0.1s heartbeat for status prototypes tracking a fast-moving value
 -- (range to a unit), and the carrier for the polled tokens above. Started
@@ -1180,6 +1254,8 @@ function WA.PetBehavior()
 	return nil, nil
 end
 
+do -- scoped; see the local-ceiling note in the file header
+
 local TALENT_TAB_VALUES = { 0, 1, 2, 3 }
 local TALENT_TAB_LABELS = { [0] = "Any Tab", [1] = "Tab 1", [2] = "Tab 2", [3] = "Tab 3" }
 
@@ -1240,6 +1316,10 @@ PROTOTYPES["talentknown"] = {
 		{ name = "icon", type = "hidden", init = "talentIconValue", store = true },
 	},
 }
+
+end -- talent prototype
+
+do -- scoped; see the local-ceiling note in the file header
 
 local CONDITION_STATUS_LABELS = { ignore = "Ignore", ["true"] = "Yes", ["false"] = "No" }
 local CONDITION_STATUS_VALUES = { "ignore", "true", "false" }
@@ -1311,20 +1391,21 @@ local function conditionStatusArg(name, display, init)
 		test = conditionStatusTest(name) }
 end
 
+-- No "ignore" entry, and no "any": the mode tier owns being off, and "any group"
+-- is the two-entry set { party, raid } rather than a third spelling of it.
 local CONDITION_VALUE_LABELS = {
-	groupType = { ignore = "Ignore", any = "Any Group (Party/Raid)", solo = "Solo", party = "Party", raid = "Raid" },
-	instanceType = { ignore = "Ignore", none = "Outside Instance", dungeon = "Dungeon",
+	groupType = { solo = "Solo", party = "Party", raid = "Raid" },
+	instanceType = { none = "Outside Instance", dungeon = "Dungeon",
 		raid = "Raid", pvp = "Battleground", arena = "Arena" },
 }
 
 local function conditionValueTest(name)
 	return function(trigger)
-		local value = trigger[name] or "ignore"
-		if value == "ignore" then return nil end
-		if name == "groupType" and value == "any" then return "groupType ~= \"solo\"" end
-		return string.format("%s == %q", name, value)
+		local src = multiSelectSource(trigger, name, name)
+		return src and ("(" .. src .. ")") or nil
 	end
 end
+
 
 function WA.ConditionGroupType()
 	if GetNumRaidMembers and (GetNumRaidMembers() or 0) > 0 then return "raid" end
@@ -1341,8 +1422,8 @@ function WA.ConditionInstanceType()
 end
 
 local function conditionValueArg(name, display, values, labels, init)
-	return { name = name, type = "select", required = true, display = display,
-		valueList = values, valueLabels = labels, default = "ignore", init = init,
+	return { name = name, type = "multiselect", display = display,
+		valueList = values, valueLabels = labels, default = values[1], init = init,
 		test = conditionValueTest(name), store = true, conditionType = "string" }
 end
 
@@ -1355,6 +1436,26 @@ PROTOTYPES["conditions"] = {
 	force_events = true,
 	loadFunc = function(trigger)
 		if trigger.isMoving ~= "ignore" then WA.EnsureFastTick() end
+	end,
+	migrate = function(trigger)
+		-- The two shapes these filters were saved in before they took a set:
+		-- "ignore" inside the value list meant off, and "any" meant the
+		-- party-or-raid pair the set now spells out.
+		local function migrateValue(name)
+			if trigger[name] == "ignore" then
+				trigger[name] = nil
+				trigger["use_" .. name] = false
+			elseif name == "groupType" and trigger[name] == "any" then
+				trigger[name] = nil
+				trigger.use_groupType = "multi"
+				trigger.groupType_multi = { party = true, raid = true }
+			elseif trigger[name] ~= nil and trigger["use_" .. name] == nil then
+				trigger["use_" .. name] = "single"
+			end
+			WA.MultiSelectMigrateGate(trigger, name)
+		end
+		migrateValue("groupType")
+		migrateValue("instanceType")
 	end,
 	icon = "Interface\\Icons\\Spell_Holy_PowerInfusion",
 	iconFunc = function() return "Interface\\Icons\\Spell_Holy_PowerInfusion" end,
@@ -1371,13 +1472,20 @@ PROTOTYPES["conditions"] = {
 		conditionStatusArg("isMoving", "Is Moving", "((GetUnitSpeed and GetUnitSpeed(\"player\")) or 0) > 0"),
 		conditionStatusArg("afk", "AFK", "(UnitIsAFK and UnitIsAFK(\"player\")) and true or false"),
 		conditionStatusArg("pvpFlagged", "PvP Flagged", "((UnitIsPVP and UnitIsPVP(\"player\")) or (UnitIsPVPFreeForAll and UnitIsPVPFreeForAll(\"player\"))) and true or false"),
-		conditionValueArg("groupType", "Group Type", { "ignore", "any", "solo", "party", "raid" }, CONDITION_VALUE_LABELS.groupType, "WeakestAuras.ConditionGroupType()"),
-		conditionValueArg("instanceType", "Instance Type", { "ignore", "none", "dungeon", "raid", "pvp", "arena" }, CONDITION_VALUE_LABELS.instanceType, "WeakestAuras.ConditionInstanceType()"),
+		conditionValueArg("groupType", "Group Type", { "solo", "party", "raid" }, CONDITION_VALUE_LABELS.groupType, "WeakestAuras.ConditionGroupType()"),
+		conditionValueArg("instanceType", "Instance Type", { "none", "dungeon", "raid", "pvp", "arena" }, CONDITION_VALUE_LABELS.instanceType, "WeakestAuras.ConditionInstanceType()"),
 	},
 }
 
-local LOCATION_INSTANCE_VALUES = { "ignore", "none", "party", "raid", "pvp", "arena" }
-local LOCATION_INSTANCE_LABELS = { ignore = "Ignore", none = "Outside Instance", party = "Dungeon", raid = "Raid", pvp = "Battleground", arena = "Arena" }
+end -- conditions prototype
+
+-- GetInstanceInfo's own instanceType strings. No "ignore" entry: the filter's
+-- mode tier owns being off, where a sentinel inside the value list would be a
+-- second way to say the same thing.
+do -- scoped; see the local-ceiling note in the file header
+
+local LOCATION_INSTANCE_VALUES = { "none", "party", "raid", "pvp", "arena" }
+local LOCATION_INSTANCE_LABELS = { none = "Outside Instance", party = "Dungeon", raid = "Raid", pvp = "Battleground", arena = "Arena" }
 
 PROTOTYPES["location"] = {
 	displayName = "Location",
@@ -1389,6 +1497,16 @@ PROTOTYPES["location"] = {
 	icon = "Interface\\Icons\\INV_Misc_Map_01",
 	iconFunc = function() return "Interface\\Icons\\INV_Misc_Map_01" end,
 	nameFunc = function() return "Location" end,
+	migrate = function(trigger)
+		-- The instance filter was one gated value with an "ignore" sentinel in
+		-- its own list before it became a set; the sentinel is now the tier's
+		-- off mode, and it is the value that has to move rather than the gate.
+		if trigger.instanceTypeFilter == "ignore" then
+			trigger.instanceTypeFilter = nil
+			trigger.use_instanceTypeFilter = false
+		end
+		WA.MultiSelectMigrateGate(trigger, "instanceTypeFilter")
+	end,
 	init = function()
 		return "local zoneValue = (GetRealZoneText and GetRealZoneText()) or (GetZoneText and GetZoneText()) or \"\"\n"
 			.. "local subzoneValue = (GetSubZoneText and GetSubZoneText()) or \"\"\n"
@@ -1414,13 +1532,16 @@ PROTOTYPES["location"] = {
 			return "string.lower(instanceNameValue) == string.lower(" .. fmt(trigger.instanceNameFilter) .. ")"
 		end },
 		{ name = "instanceType", type = "hidden", init = "instanceTypeValue", store = true, conditionType = "string", display = "Instance Type" },
-		{ name = "instanceTypeFilter", type = "select", display = "Instance Type", valueList = LOCATION_INSTANCE_VALUES, valueLabels = LOCATION_INSTANCE_LABELS,
-			default = "ignore", test = function(trigger)
-				if not trigger.use_instanceTypeFilter or trigger.instanceTypeFilter == "ignore" then return nil end
-				return "instanceTypeValue == " .. fmt(trigger.instanceTypeFilter)
+		{ name = "instanceTypeFilter", type = "multiselect", display = "Instance Type",
+			valueList = LOCATION_INSTANCE_VALUES, valueLabels = LOCATION_INSTANCE_LABELS,
+			default = "none", test = function(trigger)
+				local src = multiSelectSource(trigger, "instanceTypeFilter", "instanceTypeValue")
+				return src and ("(" .. src .. ")") or nil
 			end },
 	},
 }
+
+end -- location prototype
 
 PROTOTYPES["money"] = {
 	displayName = "Money",
@@ -1449,6 +1570,8 @@ PROTOTYPES["money"] = {
 			store = true, conditionType = "number", display = "Copper" },
 	},
 }
+
+do -- scoped; see the local-ceiling note in the file header
 
 local PET_BEHAVIOR_VALUES = { "aggressive", "assist", "defensive", "passive" }
 local PET_BEHAVIOR_LABELS = { aggressive = "Aggressive", assist = "Assist", defensive = "Defensive", passive = "Passive" }
@@ -1481,6 +1604,8 @@ PROTOTYPES["petbehavior"] = {
 		{ name = "icon", type = "hidden", init = "petIconValue", store = true },
 	},
 }
+
+end -- pet behavior prototype
 
 PROTOTYPES["queuedaction"] = {
 	displayName = "Queued Action",
@@ -1539,13 +1664,14 @@ PROTOTYPES["combat"] = {
 
 -- A `statesParameter = "unit"` prototype offers WA.multi_unit_tokens beside the
 -- single tokens: one clone per member, keyed by GUID rather than by upstream's
--- positional token (§4.3).
-local multiUnitFamily = WA.MultiUnitFamily
+-- positional token (§4.3). WA.MultiUnitFamily is called through the table rather
+-- than aliased to a local: this chunk sits on Lua 5.0's 200-local ceiling, and a
+-- shorthand is not worth a slot.
 
 -- Membership churn for a family, appended to whatever unit events the prototype
 -- reads: those say a member changed, these say which members there are.
 local function appendMultiUnitEvents(trigger, out)
-	local family = multiUnitFamily(trigger)
+	local family = WA.MultiUnitFamily(trigger)
 	if not family then return out end
 	if family == "nameplate" then
 		table.insert(out, "NAME_PLATE_UNIT_ADDED")
@@ -1560,7 +1686,7 @@ end
 
 -- The single token this trigger reads, or nil for a multi-unit family.
 local function singleUnitToken(trigger, fallback)
-	if multiUnitFamily(trigger) then return nil end
+	if WA.MultiUnitFamily(trigger) then return nil end
 	return WA.TriggerUnit(trigger, fallback)
 end
 
@@ -1579,12 +1705,12 @@ end
 -- Multi-unit init: the runner hands the member's live token in as arg1, so the
 -- generated source reads it instead of a compile-time constant.
 local function multiUnitInit(trigger, fallback)
-	if multiUnitFamily(trigger) then return "local unit = arg1" end
+	if WA.MultiUnitFamily(trigger) then return "local unit = arg1" end
 	return "local unit = " .. fmt(WA.TriggerUnit(trigger, fallback))
 end
 
 local function multiUnitName(trigger, fallback)
-	local family = multiUnitFamily(trigger)
+	local family = WA.MultiUnitFamily(trigger)
 	if family then return WA.multi_unit_labels[family] end
 	local unit = WA.TriggerUnit(trigger, fallback)
 	return UnitName(unit) or unit
@@ -1685,19 +1811,12 @@ PROTOTYPES["power"] = {
 }
 
 -- "Is a real cooldown running", shared by the three cooldown prototypes. The
--- global cooldown passes over every spell and item, so unless `showgcd` asks to
--- keep it, a window no longer than the GCD is not a cooldown of this spell's
--- own. The comparison is against the *measured* GCD (WA.IsGcdCooldown).
-local function onCooldownExpr(showgcd)
-	local notGcd = showgcd and "" or "not WeakestAuras.IsGcdCooldown(duration) and "
-	return "(duration ~= nil and duration > 0 and " .. notGcd .. "expirationTime > GetTime())"
-end
+-- global cooldown is already gone from `duration` by the time this runs -- the
+-- watcher's Info excludes it unless the trigger's `showgcd` asked for it -- so
+-- this tests nothing but the window it was handed.
+do -- scoped; see the local-ceiling note in the file header
 
--- An excluded GCD is ready to timed progress regions as well as to the show test.
-local function cooldownGcdProgressFilter(trigger)
-	if trigger.showgcd then return "" end
-	return "if duration ~= nil and duration > 0 and WeakestAuras.IsGcdCooldown(duration) then startTime = 0 duration = 0 end\n"
-end
+local ON_COOLDOWN_EXPR = "(duration ~= nil and duration > 0 and expirationTime > GetTime())"
 
 -- Spell cooldown, timed progress. Fed by the central cooldown watcher (below):
 -- its init reads the watcher's cache rather than polling GetSpellCooldown
@@ -1755,11 +1874,10 @@ PROTOTYPES["spellcooldown"] = {
 	end,
 	init = function(trigger)
 		return "local spellId = " .. fmt(WA.ResolveSpellID(trigger.spellName) or 0) .. "\n"
-			.. "local startTime, duration = WeakestAuras.SpellCdInfo(spellId)\n"
-			.. cooldownGcdProgressFilter(trigger)
+			.. "local startTime, duration = WeakestAuras.SpellCdInfo(spellId, " .. (trigger.showgcd and "true" or "false") .. ")\n"
 			.. "local expirationTime = (startTime and duration and (startTime + duration)) or 0\n"
 			.. "local remaining = (expirationTime > 0 and (expirationTime - GetTime())) or 0\n"
-			.. "local onCooldown = " .. onCooldownExpr(trigger.showgcd) .. " and true or false\n"
+			.. "local onCooldown = " .. ON_COOLDOWN_EXPR .. " and true or false\n"
 			.. "local name, _, icon = GetSpellInfo(spellId)\n"
 			.. "local spellUsable, insufficientResources = false, false\n"
 			.. "if IsUsableSpell then local _u, _m = IsUsableSpell(spellId) spellUsable = _u and true or false insufficientResources = _m and true or false end\n"
@@ -1772,7 +1890,7 @@ PROTOTYPES["spellcooldown"] = {
 			valueLabels = { showOnCooldown = "On Cooldown", showOnReady = "Ready", showAlways = "Always" },
 			default = "showOnCooldown", reloadOptions = true,
 			test = function(trigger)
-				local onCd = onCooldownExpr(trigger.showgcd)
+				local onCd = ON_COOLDOWN_EXPR
 				local mode = trigger.genericShowOn or "showOnCooldown"
 				if mode == "showOnReady" then return "not " .. onCd
 				elseif mode == "showAlways" then return "true"
@@ -1821,11 +1939,10 @@ PROTOTYPES["itemcooldown"] = {
 	end,
 	init = function(trigger)
 		return "local itemId = " .. fmt(WA.ResolveItemID(trigger.itemName) or 0) .. "\n"
-			.. "local startTime, duration = WeakestAuras.ItemCdInfo(itemId)\n"
-			.. cooldownGcdProgressFilter(trigger)
+			.. "local startTime, duration = WeakestAuras.ItemCdInfo(itemId, " .. (trigger.showgcd and "true" or "false") .. ")\n"
 			.. "local expirationTime = (startTime and duration and (startTime + duration)) or 0\n"
 			.. "local remaining = (expirationTime > 0 and (expirationTime - GetTime())) or 0\n"
-			.. "local onCooldown = " .. onCooldownExpr() .. " and true or false"
+			.. "local onCooldown = " .. ON_COOLDOWN_EXPR .. " and true or false"
 	end,
 	args = {
 		{ name = "itemName", type = "item", display = "Item" },
@@ -1834,12 +1951,13 @@ PROTOTYPES["itemcooldown"] = {
 			valueLabels = { showOnCooldown = "On Cooldown", showOnReady = "Ready", showAlways = "Always" },
 			default = "showOnCooldown", reloadOptions = true,
 			test = function(trigger)
-				local onCd = onCooldownExpr()
+				local onCd = ON_COOLDOWN_EXPR
 				local mode = trigger.genericShowOn or "showOnCooldown"
 				if mode == "showOnReady" then return "not " .. onCd
 				elseif mode == "showAlways" then return "true"
 				else return onCd end
 			end },
+		{ name = "showgcd", type = "toggle", display = "Show Global Cooldown", default = false },
 		cooldownRemainingArg(),
 		{ name = "duration", type = "hidden", store = true, conditionType = "number", display = "Duration" },
 		{ name = "expirationTime", type = "hidden", store = true, conditionType = "timer", display = "Remaining Time" },
@@ -1893,11 +2011,10 @@ PROTOTYPES["equipslotcooldown"] = {
 	end,
 	init = function(trigger)
 		return "local itemSlot = " .. fmt(trigger.itemSlot or 0) .. "\n"
-			.. "local startTime, duration = WeakestAuras.EquipSlotCdInfo(itemSlot)\n"
-			.. cooldownGcdProgressFilter(trigger)
+			.. "local startTime, duration = WeakestAuras.EquipSlotCdInfo(itemSlot, " .. (trigger.showgcd and "true" or "false") .. ")\n"
 			.. "local expirationTime = (startTime and duration and (startTime + duration)) or 0\n"
 			.. "local remaining = (expirationTime > 0 and (expirationTime - GetTime())) or 0\n"
-			.. "local onCooldown = " .. onCooldownExpr() .. " and true or false"
+			.. "local onCooldown = " .. ON_COOLDOWN_EXPR .. " and true or false"
 	end,
 	args = {
 		{ name = "itemSlot", type = "select", required = true, display = "Slot",
@@ -1908,12 +2025,13 @@ PROTOTYPES["equipslotcooldown"] = {
 			valueLabels = { showOnCooldown = "On Cooldown", showOnReady = "Ready", showAlways = "Always" },
 			default = "showOnCooldown", reloadOptions = true,
 			test = function(trigger)
-				local onCd = onCooldownExpr()
+				local onCd = ON_COOLDOWN_EXPR
 				local mode = trigger.genericShowOn or "showOnCooldown"
 				if mode == "showOnReady" then return "not " .. onCd
 				elseif mode == "showAlways" then return "true"
 				else return onCd end
 			end },
+		{ name = "showgcd", type = "toggle", display = "Show Global Cooldown", default = false },
 		cooldownRemainingArg(),
 		{ name = "duration", type = "hidden", store = true, conditionType = "number", display = "Duration" },
 		{ name = "expirationTime", type = "hidden", store = true, conditionType = "timer", display = "Remaining Time" },
@@ -1953,13 +2071,16 @@ PROTOTYPES["globalcooldown"] = {
 	},
 }
 
--- "Ready" is the absence of a cooldown of the thing's own: an expired window, no
--- window, or a window that is only the global cooldown passing over it.
+-- "Ready" is the absence of a cooldown of the thing's own: an expired window or
+-- no window. A window that is only the global cooldown passing over the key is
+-- already no window here -- the read excludes it -- which is also what keeps the
+-- progress these prototypes publish from counting the GCD they are ready
+-- through. There is no `showgcd` opt-out: a GCD is not what "ready" asks about.
 local function cooldownReadyInit(infoFunc, keySource, knownSource)
 	return "local cooldownKey = " .. keySource .. "\n"
-		.. "local startTime, duration = " .. infoFunc .. "(cooldownKey)\n"
+		.. "local startTime, duration = " .. infoFunc .. "(cooldownKey, false)\n"
 		.. "local expirationTime = (startTime and duration and (startTime + duration)) or 0\n"
-		.. "local ready = (" .. knownSource .. ") and (duration == nil or WeakestAuras.IsGcdCooldown(duration) or duration <= 0 or expirationTime <= GetTime())"
+		.. "local ready = (" .. knownSource .. ") and (duration == nil or duration <= 0 or expirationTime <= GetTime())"
 end
 
 -- Whether an item is the on-use kind a cooldown can belong to at all. Gear with
@@ -2073,12 +2194,12 @@ PROTOTYPES["equipslotcooldownready"] = {
 	nameFunc = function(trigger) return EQUIP_SLOT_LABELS[trigger.itemSlot] or "Cooldown Ready" end,
 	init = function(trigger)
 		return "local cooldownKey = " .. fmt(trigger.itemSlot or 0) .. "\n"
-			.. "local startTime, duration = WeakestAuras.EquipSlotCdInfo(cooldownKey)\n"
+			.. "local startTime, duration = WeakestAuras.EquipSlotCdInfo(cooldownKey, false)\n"
 			.. "local expirationTime = (startTime and duration and (startTime + duration)) or 0\n"
 			.. "local itemSlot = cooldownKey\n"
 			.. "local item = GetInventoryItemID and GetInventoryItemID(\"player\", cooldownKey)\n"
 			.. "local hasUseSpell = WeakestAuras.ItemHasUseSpell(item)\n"
-			.. "local ready = (cooldownKey ~= 0 and hasUseSpell) and (duration == nil or WeakestAuras.IsGcdCooldown(duration) or duration <= 0 or expirationTime <= GetTime())\n"
+			.. "local ready = (cooldownKey ~= 0 and hasUseSpell) and (duration == nil or duration <= 0 or expirationTime <= GetTime())\n"
 			.. "local name, _, _, _, _, _, _, _, _, icon = item and C_Item.GetItemInfo(item) or nil"
 	end,
 	args = cooldownReadyArgs("Equipment", {
@@ -2086,6 +2207,8 @@ PROTOTYPES["equipslotcooldownready"] = {
 		valueList = EQUIP_SLOT_IDS, valueLabels = EQUIP_SLOT_LABELS, default = EQUIP_SLOT_IDS[1],
 	}),
 }
+
+end -- cooldown prototypes
 
 PROTOTYPES["actionusable"] = {
 	displayName = "Action Usable",
@@ -2111,8 +2234,9 @@ PROTOTYPES["actionusable"] = {
 		return "local spellId = " .. fmt(id) .. "\n"
 			.. "local usable, insufficientResources = false, false\n"
 			.. "if IsUsableSpell then local _u, _m = IsUsableSpell(spellId) usable = _u and true or false insufficientResources = _m and true or false end\n"
-			.. "local startTime, duration = WeakestAuras.SpellCdInfo(spellId)\n"
-			.. "local ready = (duration == nil or WeakestAuras.IsGcdCooldown(duration) or duration <= 0 or not startTime or startTime == 0 or (startTime + duration) <= GetTime())\n"
+			.. "local startTime, duration = WeakestAuras.SpellCdInfo(spellId, false)\n"
+			.. "local expirationTime = (startTime and duration and (startTime + duration)) or 0\n"
+			.. "local ready = (duration == nil or duration <= 0 or not startTime or startTime == 0 or expirationTime <= GetTime())\n"
 			.. "local active = usable and ready\n"
 			.. "local spellInRange = WeakestAuras.SpellInRange(spellId)"
 	end,
@@ -2168,7 +2292,7 @@ PROTOTYPES["cast"] = {
 	statesParameter = "unit",
 	icon = "Interface\\Icons\\Spell_Nature_WispSplode",
 	iconFunc = function() return "Interface\\Icons\\Spell_Nature_WispSplode" end,
-	nameFunc = function(trigger) return "Cast (" .. (multiUnitFamily(trigger) or WA.TriggerUnit(trigger, "player")) .. ")" end,
+	nameFunc = function(trigger) return "Cast (" .. (WA.MultiUnitFamily(trigger) or WA.TriggerUnit(trigger, "player")) .. ")" end,
 	init = function(trigger)
 		return multiUnitInit(trigger, "player") .. "\n"
 			.. "local castName, castIcon, startMs, endMs, notInterruptible, castingSpellID\n"
@@ -2348,26 +2472,68 @@ PROTOTYPES["spellknown"] = {
 	},
 }
 
--- Status: current shapeshift/stance form. Vanilla SpellShapeshiftForm.dbc IDs
--- don't match modern WoW's numbering and vary per class -- exposed as a raw
--- number (0 = no form) rather than a hardcoded per-class select, so this
--- doesn't ship a wrong ID table; a user determines their own class's IDs
--- in-game and filters on them directly.
+-- The stance bar's occupied slots, and the form sitting in each. Positions, not
+-- DBC ids: the bar's order is what a class's spellbook produced, so slot 2 is
+-- Defensive Stance on a warrior and Aquatic Form on a druid. Both calls are live
+-- here (pfUI reads GetShapeshiftFormInfo's third return and calls
+-- GetNumShapeshiftForms; ../pfUI/modules/actionbar.lua:484,1208).
+-- The occupied slot, or 0 for no form. Derived from each slot's `active` return
+-- rather than from GetShapeshiftForm(), which no addon on this client is known
+-- to call.
+function WA.ShapeshiftBarIndex()
+	if not (GetShapeshiftFormInfo and GetNumShapeshiftForms) then return 0 end
+	for i = 1, GetNumShapeshiftForms() do
+		local _, _, active = GetShapeshiftFormInfo(i)
+		if active then return i end
+	end
+	return 0
+end
+
+-- The bar's slots and their captions, both from one walk.
+function WA.ShapeshiftForms()
+	local values, labels = { 0 }, { [0] = "0 - No Form" }
+	for i = 1, ((GetNumShapeshiftForms and GetNumShapeshiftForms()) or 0) do
+		table.insert(values, i)
+		local _, name = GetShapeshiftFormInfo(i)
+		labels[i] = i .. " - " .. (name or "Form " .. i)
+	end
+	return values, labels
+end
+
+-- Status: current shapeshift/stance form, offered on both numberings. `form` is
+-- the bar position and is what an upstream import carries; `formId` is the
+-- SpellShapeshiftForm.dbc id, which vanilla numbers differently from modern WoW
+-- and differently per class -- a raw number rather than a hardcoded per-class
+-- select, so this doesn't ship a wrong ID table.
 PROTOTYPES["stance"] = {
 	displayName = "Stance/Form",
 	wa2Event = "Stance/Form/Aura",
 	category = "unit",
 	progressType = "none",
-	events = function() return { "UPDATE_SHAPESHIFT_FORM" } end,
+	-- The plural event fires when the bar's *contents* change (a form learned),
+	-- which renumbers every position above it.
+	events = function() return { "UPDATE_SHAPESHIFT_FORM", "UPDATE_SHAPESHIFT_FORMS" } end,
 	force_events = true,
 	icon = "Interface\\Icons\\Ability_Druid_CatForm",
 	iconFunc = function() return "Interface\\Icons\\Ability_Druid_CatForm" end,
 	nameFunc = function() return "Stance/Form" end,
-	init = function()
+	init = function(trigger)
+		-- The bar-position match is a named local so `inverse` can negate it as
+		-- one term. With no form filter set it is `true`, so an inverted trigger
+		-- with nothing selected shows never -- upstream's reading of the pair.
+		local match = multiSelectSource(trigger, "form", "form") or "true"
 		return "local formId = (GetShapeshiftFormID and GetShapeshiftFormID()) or 0\n"
-			.. "local inForm = formId ~= 0"
+			.. "local inForm = formId ~= 0\n"
+			.. "local form = WeakestAuras.ShapeshiftBarIndex()\n"
+			.. "local formMatch = (" .. match .. ")"
 	end,
 	args = {
+		{ name = "form", type = "multiselect", display = "Form",
+			valueList = function() return (WA.ShapeshiftForms()) end,
+			valueLabels = function() local _, labels = WA.ShapeshiftForms(); return labels end,
+			default = 0, store = true, conditionType = "number",
+			test = function(trigger) return trigger.inverse and "not formMatch" or "formMatch" end },
+		{ name = "inverse", type = "toggle", display = "Inverse Form Match" },
 		{ name = "formId", type = "number", display = "Form ID", operator = "==",
 			store = true, conditionType = "number" },
 		{ name = "inForm", type = "hidden", store = true, conditionType = "bool", display = "In Any Form" },
@@ -2440,6 +2606,13 @@ PROTOTYPES["itemequipped"] = {
 	},
 }
 
+-- Declared out here, and only assigned inside the block below, because
+-- buildOptions reaches for it when a class change invalidates the subclass
+-- selection. Everything else the itemtypeequipped prototype needs stays scoped.
+local itemSubclassValues
+
+do -- scoped; see the local-ceiling note in the file header
+
 local ITEM_EQUIP_SLOTS = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19 }
 local ITEM_EQUIP_SLOT_LABELS = {
 	[0] = "Any Slot", [1] = "Head", [2] = "Neck", [3] = "Shoulder", [4] = "Shirt",
@@ -2477,7 +2650,7 @@ for classID = 0, 15 do
 	end
 end
 
-local function itemSubclassValues(classID)
+function itemSubclassValues(classID)
 	local ids = ITEM_SUBCLASS_IDS[tonumber(classID) or -1]
 	local labels = ITEM_SUBCLASS_LABELS[tonumber(classID) or -1]
 	if ids and table.getn(ids) > 0 then return ids, labels end
@@ -2497,19 +2670,43 @@ PROTOTYPES["itemtypeequipped"] = {
 	migrate = function(trigger)
 		if trigger.itemClassID ~= nil then trigger.itemClassID = tonumber(trigger.itemClassID) or trigger.itemClassID end
 		if trigger.itemSubclassID ~= nil then trigger.itemSubclassID = tonumber(trigger.itemSubclassID) or trigger.itemSubclassID end
+		-- The subclass filter was one always-on value before it became a set. A
+		-- saved trigger carrying the value and no mode meant exactly that value,
+		-- where a trigger with neither is fresh and takes the defaults.
+		if trigger.itemSubclassID ~= nil and trigger.use_itemSubclassID == nil then
+			trigger.use_itemSubclassID = "single"
+		end
 	end,
 	init = function(trigger)
+		-- The subclass set as source. "nil" means any subclass of the chosen
+		-- class; an empty literal means none, which is what a set nothing was
+		-- ticked in has to mean for unticking to narrow the match.
+		local function subclassSetSource()
+			local mode = trigger.use_itemSubclassID
+			if mode ~= "single" and mode ~= "multi" then return "nil" end
+			local parts = {}
+			if mode == "single" then
+				local id = tonumber(trigger.itemSubclassID)
+				if id then table.insert(parts, "[" .. id .. "] = true") end
+			else
+				for value, selected in pairs(trigger.itemSubclassID_multi or {}) do
+					local id = tonumber(value)
+					if selected and id then table.insert(parts, "[" .. id .. "] = true") end
+				end
+			end
+			return "{ " .. table.concat(parts, ", ") .. " }"
+		end
 		return "local wantedClassID = tonumber(" .. fmt(trigger.itemClassID or "") .. ") or -1\n"
-			.. "local wantedSubclassID = tonumber(" .. fmt(trigger.itemSubclassID or "") .. ") or -1\n"
+			.. "local wantedSubclasses = " .. subclassSetSource() .. "\n"
 			.. "local selectedSlot = " .. fmt(tonumber(trigger.itemSlot) or 0) .. "\n"
 			.. "local inverse = " .. fmt(trigger.inverse and true or false) .. "\n"
-			.. "local itemIDValue, itemNameValue, itemIconValue, itemClassValue, itemSubclassValue, itemClassIDValue, itemSubclassIDValue, equippedValue, matchingValue, itemKnownValue = WeakestAuras.ItemTypeEquipped(wantedClassID, wantedSubclassID, selectedSlot)"
+			.. "local itemIDValue, itemNameValue, itemIconValue, itemClassValue, itemSubclassValue, itemClassIDValue, itemSubclassIDValue, equippedValue, matchingValue, itemKnownValue = WeakestAuras.ItemTypeEquipped(wantedClassID, wantedSubclasses, selectedSlot)"
 	end,
 	args = {
 		{ name = "itemClassID", type = "select", display = "Item Class", required = true,
 			valueList = ITEM_CLASS_IDS, valueLabels = ITEM_CLASS_LABELS, default = 2,
 			test = function() return nil end, reloadOptions = true },
-		{ name = "itemSubclassID", type = "select", display = "Item Subclass", required = true,
+		{ name = "itemSubclassID", type = "multiselect", display = "Item Subclass",
 			valueList = function(trigger) return itemSubclassValues(trigger.itemClassID) end,
 			valueLabels = function(trigger) return ITEM_SUBCLASS_LABELS[tonumber(trigger.itemClassID) or -1] end,
 			default = 0, test = function() return nil end },
@@ -2530,6 +2727,8 @@ PROTOTYPES["itemtypeequipped"] = {
 		{ name = "itemKnown", type = "hidden", init = "itemKnownValue", store = true, storeAlways = true, conditionType = "bool", display = "Item Metadata Available" },
 	},
 }
+
+end -- item type/class prototype
 
 PROTOTYPES["itemset"] = {
 	displayName = "Item Set Equipped",
@@ -2613,17 +2812,16 @@ PROTOTYPES["unitcharacteristics"] = {
 	progressType = "none",
 	events = function(trigger)
 		return appendUnitChangeEvents(trigger,
-			{ "UNIT_LEVEL", "PLAYER_ENTERING_WORLD" }, "target")
+			appendMultiUnitEvents(trigger, { "UNIT_LEVEL", "PLAYER_ENTERING_WORLD" }), "target")
 	end,
 	force_events = true,
+	statesParameter = "unit",
 	icon = "Interface\\Icons\\INV_Misc_QuestionMark",
 	iconFunc = function() return "Interface\\Icons\\INV_Misc_QuestionMark" end,
-	nameFunc = function(trigger)
-		local unit = WA.TriggerUnit(trigger, "target")
-		return UnitName(unit) or unit
-	end,
+	nameFunc = function(trigger) return multiUnitName(trigger, "target") end,
+	migrate = function(trigger) WA.MultiSelectMigrateGate(trigger, "classification") end,
 	init = function(trigger)
-		return "local unit = " .. fmt(WA.TriggerUnit(trigger, "target")) .. "\n"
+		return multiUnitInit(trigger, "target") .. "\n"
 			.. "local unitName = UnitName(unit)\n"
 			.. "local level = UnitLevel(unit) or 0\n"
 			.. "local classFile, classId\n"
@@ -2634,15 +2832,18 @@ PROTOTYPES["unitcharacteristics"] = {
 	end,
 	args = {
 		{ name = "unit", type = "unit", display = "Unit", default = "target",
+			valueList = WA.unit_tokens_multi, valueLabels = WA.unit_labels_multi,
 			store = true, conditionType = "string" },
 		{ name = "exists", type = "hidden", required = true, test = "UnitExists(unit)" },
 		{ name = "unitName", type = "string", store = true, conditionType = "string", display = "Name" },
 		{ name = "level", type = "number", display = "Level", operator = ">=", store = true, conditionType = "number" },
 		{ name = "classFile", type = "hidden", store = true, conditionType = "string", display = "Class" },
 		{ name = "creatureType", type = "hidden", store = true, conditionType = "string", display = "Creature Type" },
-		{ name = "classification", type = "select", display = "Classification",
+		{ name = "classification", type = "multiselect", display = "Classification",
 			valueList = { "normal", "elite", "rareelite", "rare", "worldboss" },
-			store = true, conditionType = "string" },
+			valueLabels = { normal = "Normal", elite = "Elite", rareelite = "Rare Elite",
+				rare = "Rare", worldboss = "World Boss" },
+			default = "elite", store = true, conditionType = "string" },
 		{ name = "isPlayer", type = "hidden", store = true, conditionType = "bool", display = "Is Player" },
 	},
 }
@@ -3071,6 +3272,8 @@ PROTOTYPES["threat"] = {
 -- stores and win via activateEvent. Early-destroyed totems (killed, or the slot
 -- overwritten) aren't detected mid-life beyond WA_SLOW_TICK expiry +
 -- PLAYER_DEAD clear -- same limitation as the pfUI/CallOfElements refs.
+do -- scoped; see the local-ceiling note in the file header
+
 local TOTEM_SLOT_LABELS = { [1] = "Fire", [2] = "Earth", [3] = "Water", [4] = "Air" }
 local TOTEM_SLOT_ICONS = {
 	[1] = "Interface\\Icons\\Spell_Fire_SearingTotem",
@@ -3111,6 +3314,8 @@ PROTOTYPES["totem"] = {
 		{ name = "expirationTime", type = "hidden", store = true, conditionType = "timer", display = "Remaining Time" },
 	},
 }
+
+end -- totem prototype
 
 -- Swing timer, timed progress per weapon hand. Full port of pfUI's
 -- modules/swingtimer.lua: the watcher (below) maintains each hand's swing
@@ -3217,6 +3422,9 @@ PROTOTYPES["powertick"] = {
 -- so no trigger ever evaluates a stale window, and comparing a poll against
 -- `cache` would then let a read that happened to land between two polls swallow
 -- the change event every *other* aura on that key is owed.
+
+do -- scoped; see the local-ceiling note in the file header
+
 local function newCooldownWatcher(spec)
 	local w = { keys = {}, tick = {}, cache = {}, announced = {}, frame = nil, ticker = nil }
 
@@ -3320,8 +3528,19 @@ local function newCooldownWatcher(spec)
 	-- first is what makes it answer for a key nothing has registered yet -- a
 	-- force_events pass runs before loadFunc -- and keeps a read that arrives
 	-- between two polls current.
-	local function info(key)
+	--
+	-- The global cooldown passes over every spell and item, so a window no longer
+	-- than the GCD is not a cooldown of this key's own and is reported as no
+	-- cooldown at all unless `showgcd` asks for it. That test belongs here rather
+	-- than in each prototype's generated code: every value a trigger derives --
+	-- duration, expirationTime, remaining, onCooldown, ready, usable -- comes off
+	-- this one read, and filtering per prototype is how they came to disagree.
+	-- Excluding is the default so a caller that omits the flag cannot leak.
+	-- pollKey reads w.cache directly and stays raw on purpose: it has to tell a
+	-- GCD window apart from an absent one to skip arming a ready timer for it.
+	local function info(key, showgcd)
 		local c = refresh(key)
+		if not showgcd and WA.IsGcdCooldown(c.duration) then return 0, 0, c.enabled end
 		return c.start, c.duration, c.enabled
 	end
 
@@ -3353,7 +3572,7 @@ local spellCdWatch = newCooldownWatcher({
 	extraEvents = { "SPELL_UPDATE_COOLDOWN", "SPELL_UPDATE_USABLE", "ACTIONBAR_UPDATE_COOLDOWN" },
 })
 function WA.WatchSpellCooldown(spellId, wantTick) spellCdWatch.Watch(spellId, wantTick) end
-function WA.SpellCdInfo(spellId) return spellCdWatch.Info(spellId) end
+function WA.SpellCdInfo(spellId, showgcd) return spellCdWatch.Info(spellId, showgcd) end
 
 -- Whether the client has a cooldown record for this spell at all. An id with no
 -- Spell.dbc row -- a name that resolved to nothing, a rank that does not exist,
@@ -3386,7 +3605,7 @@ local itemCdWatch = newCooldownWatcher({
 	extraEvents = { "BAG_UPDATE_COOLDOWN" },
 })
 function WA.WatchItemCooldown(itemId, wantTick) itemCdWatch.Watch(itemId, wantTick) end
-function WA.ItemCdInfo(itemId) return itemCdWatch.Info(itemId) end
+function WA.ItemCdInfo(itemId, showgcd) return itemCdWatch.Info(itemId, showgcd) end
 
 -- GetInventoryItemCooldown is a native 1.12 global (not a ClassicAPI
 -- backport), same (start, duration, enable) shape as GetItemCooldown.
@@ -3401,7 +3620,9 @@ local equipCdWatch = newCooldownWatcher({
 	extraEvents = { "BAG_UPDATE_COOLDOWN", "PLAYER_EQUIPMENT_CHANGED" },
 })
 function WA.WatchEquipSlotCooldown(slot, wantTick) equipCdWatch.Watch(slot, wantTick) end
-function WA.EquipSlotCdInfo(slot) return equipCdWatch.Info(slot) end
+function WA.EquipSlotCdInfo(slot, showgcd) return equipCdWatch.Info(slot, showgcd) end
+
+end -- cooldown watchers
 
 -- Threat watcher: parses the packet Turtle's server-side threat query answers
 -- into a cached table describing every player in it, re-emitting
@@ -3425,6 +3646,9 @@ function WA.EquipSlotCdInfo(slot) return equipCdWatch.Info(slot) end
 -- challenger reads what pullPct derives below. It is kept as-is and derived
 -- from rather than trusted: it is a percentage of *that row's* race, which is
 -- the player's only while the player is the one being raced.
+
+do -- scoped; see the local-ceiling note in the file header
+
 local threatCache = { exists = false }
 local threatFrame
 local function splitStr(s, sep)
@@ -3540,12 +3764,6 @@ function WA.ThreatInfo() return threatCache end
 -- reads the requester's own selection, so this asks about `target` and nothing
 -- else, and it answers whoever asked -- a reply is not broadcast to the channel.
 --
--- Wrapped in a block because this file's main chunk sits against Lua's ceiling
--- of 200 simultaneously-active locals. Three more at file scope tip it over,
--- and the failure is not symmetric: Lua 5.0.3 still compiles the file, so
--- `luac50 -p` passes it and only the harness refuses to load it. Anything added
--- here scopes its locals the same way.
---
 -- The gate is most of the work here. One request feeds every consumer on the
 -- client through CHAT_MSG_ADDON, so a second sender buys nothing and costs the
 -- realm, and a request the server will refuse costs the same as one it answers.
@@ -3554,7 +3772,6 @@ function WA.ThreatInfo() return threatCache end
 -- `UnitClassification` returns untranslated tokens, so unlike `UnitCreatureType`
 -- it is safe to compare against; only `normal` is excluded, because `rare` and
 -- `rareelite` have not been shown to fail.
-do
 
 local THREAT_QUERY_PREFIX = "TWT_UDTSv4"
 -- What a display can use, not the maximum: the packet costs bytes and the rows
@@ -3719,7 +3936,7 @@ function WA.ThreatPollOnEvent(event)
 	end
 end
 
-end
+end -- threat watcher
 
 -- Shared SPELL_GO_SELF dispatch: the totem and swing watchers both consume this
 -- Nampower event (arg1 itemId, 0 for a real spell cast; arg2 spellId -- ref
@@ -3768,6 +3985,8 @@ end
 -- time re-reads as a fresh full-length window on every poll, which is a bar that
 -- restarts from full several times a second.
 -- ---------------------------------------------------------------------------
+
+do -- scoped; see the local-ceiling note in the file header
 
 -- Longest window still attributable to the global cooldown. The GCD is 1.5s and
 -- server latency lands the reported window slightly over it.
@@ -3870,7 +4089,6 @@ end
 -- been measured, which is why it is not the literal 1.5 it replaced.
 function WA.IsGcdCooldown(duration)
 	if not duration or duration <= 0 then return false end
-	local isGcd = duration <= (gcd.measured or GCD_DEFAULT) + 0.1
 	return duration <= (gcd.measured or GCD_DEFAULT) + 0.1
 end
 
@@ -3881,6 +4099,8 @@ function WA.GcdDebug()
 	return { probeSlot = gcd.probeSlot, measured = gcd.measured, start = gcd.start,
 		duration = gcd.duration, watching = gcdFrame ~= nil }
 end
+
+end -- global cooldown
 
 -- Re-emits the shared dispatch as an internal event carrying the spell id, so a
 -- trigger reads the cast off the payload instead of re-polling for it. Player
@@ -3908,6 +4128,9 @@ local function hasFlag(v, f) return math.mod(math.floor(v / f), 2) == 1 end
 -- Call clears every slot (name-matched, enUS -- we ship no ID for it and Turtle
 -- may re-ID it). No early-death detection beyond expiry + PLAYER_DEAD (no event
 -- fires when a totem is killed) -- matches the references' own limitation.
+
+do -- scoped; see the local-ceiling note in the file header
+
 local TOTEM_SPELLS = {
 	-- FIRE (slot 1)
 	[1535] = { 1, 5 }, [8498] = { 1, 5 }, [8499] = { 1, 5 }, [11314] = { 1, 5 }, [11315] = { 1, 5 },
@@ -3969,6 +4192,8 @@ function WA.TotemInfo(slot)
 	return true, t.name, t.icon, t.start, t.duration
 end
 
+end -- totem watcher
+
 -- Swing-timer watcher: a faithful port of pfUI modules/swingtimer.lua's state
 -- machine, translated from its bar+OnUpdate rendering to WeakestAuras' data
 -- model --
@@ -3980,6 +4205,9 @@ end
 -- accessor (used by pfUI + DoiteAuras, not a ClassicAPI backport) -- every call
 -- is guarded so a build lacking it simply degrades to AUTO_ATTACK_SELF-only
 -- resets (the shipped core behaviour).
+
+do -- scoped; see the local-ceiling note in the file header
+
 local HITINFO_LEFTSWING, HITINFO_NOACTION = 4, 65536
 local ATTR_ON_NEXT_SWING = 4      -- 0x04    replaces the next auto-attack swing
 local FLAG_AUTOATTACK = 8         -- 0x08    interruptFlags: cast resets the swing
@@ -4259,9 +4487,14 @@ function WA.SwingInfo(hand)
 	return true, s.start, s.duration, false, false, 0, "none"
 end
 
+end -- swing timer
+
 -- Power-tick watcher: no client event fires on the 2s energy / 5s mana regen
 -- tick itself, so it's inferred from power-value increases, the same approach
 -- pfUI's energytick module uses. Rage and focus have no regen tick.
+
+do -- scoped; see the local-ceiling note in the file header
+
 local POWER_TICK_INTERVAL = { [0] = 5, [3] = 2 }
 local pt = {
 	active = false, start = 0, duration = 0,
@@ -4338,6 +4571,8 @@ function WA.PowerTickInfo()
 	end
 	return true, pt.start, pt.duration
 end
+
+end -- power tick
 
 -- ---------------------------------------------------------------------------
 -- Event dispatch (§4.3) + the shared game-event frame
@@ -4463,8 +4698,10 @@ end
 
 -- ActivateEvent-lite (§4.3): after a passing test, normalize the state's
 -- progress/name/icon. Stores already wrote the raw matched fields; this fills
--- the display-shaped fields regions read.
-local function activateEvent(state, ti, cloneId)
+-- the display-shaped fields regions read. `optionsEvent` marks the options
+-- preview's synthetic run, which must not arm the real hide timer -- a preview
+-- that took itself down a second after being selected would be unusable.
+local function activateEvent(state, ti, cloneId, optionsEvent)
 	local proto = ti.proto
 	if not state.show then state.show = true; state.changed = true end
 
@@ -4478,7 +4715,7 @@ local function activateEvent(state, ti, cloneId)
 		setC("progressType", "timed")
 		setC("duration", ti.duration)
 		setC("expirationTime", GetTime() + ti.duration)
-		scheduleAutoHide(ti, cloneId)
+		if not optionsEvent then scheduleAutoHide(ti, cloneId) end
 	elseif ti.customDurationFunc then
 		local ok, values = WA.RunAuraFuncPacked(ti.id, ti.id .. ": duration function",
 			ti.customDurationFunc, ti.trigger)
@@ -4538,16 +4775,17 @@ end
 
 -- One member of a multi-unit family: created, refreshed, or dropped in place.
 local function runMultiUnitMember(ti, states, event, unit, cloneId)
+	local optionsEvent = event == "OPTIONS"
 	local state = states[cloneId]
 	local existed = state ~= nil
 	if not state then state = {} end
 	local ok, passed = WA.RunAuraFunc(ti.id, ti.id, ti.triggerFunc, state, event, unit)
-	if ok and passed then
+	if (ok and passed) or optionsEvent then
 		if not existed then
 			states[cloneId] = state
 			state.changed = true
 		end
-		activateEvent(state, ti, cloneId)
+		activateEvent(state, ti, cloneId, optionsEvent)
 		return state.changed and true or false
 	elseif existed then
 		states[cloneId] = nil
@@ -4676,6 +4914,12 @@ local function runTriggerFunc(ti, event, a1, a2, a3, a4, a5, a6, a7, a8, a9)
 	if ti.multiUnit then return runMultiUnitTrigger(ti, event, a1) end
 	local states = WA.GetTriggerStateForTrigger(ti.id, ti.triggernum)
 	if not states then return false end
+	-- The options preview's synthetic event (§14). A test that fails on it says
+	-- nothing -- there is no payload to read and no reason for the world to be in
+	-- the state being configured -- so the state is activated regardless and the
+	-- prototype's own name/icon/progress fill it in. That is what makes a preview
+	-- show the trigger's real fields instead of an invented set.
+	local optionsEvent = event == "OPTIONS"
 	local cloneId = ""
 	local state
 	if ti.useCloneId then
@@ -4696,13 +4940,13 @@ local function runTriggerFunc(ti, event, a1, a2, a3, a4, a5, a6, a7, a8, a9)
 		ok, passed = WA.RunAuraFunc(ti.id, ti.id, ti.triggerFunc, state, event,
 			a1, a2, a3, a4, a5, a6, a7, a8, a9)
 	end
-	if ok and passed then
+	if (ok and passed) or optionsEvent then
 		if ti.useCloneId then
 			cloneId = WA.GetUniqueCloneId(states)
 			if cloneId == nil then return false end
 			states[cloneId] = state
 		end
-		activateEvent(state, ti, cloneId)
+		activateEvent(state, ti, cloneId, optionsEvent)
 	elseif ok and ti.untriggerFunc then
 		local untriggerOk, shouldHide
 		if ti.legacyStateArgs then
@@ -4918,7 +5162,7 @@ function GenericTrigger.Add(data)
 					trigger = trigger, triggerFunc = fn, source = source, sourceKey = sourceKey,
 					eventMode = (proto.eventMode or (proto.custom and trigger.custom_type == "event")) and true or false,
 					useCloneId = (trigger.type == "chatmessage" and trigger.use_cloneId) and true or false,
-					multiUnit = proto.statesParameter == "unit" and multiUnitFamily(trigger) or nil,
+					multiUnit = proto.statesParameter == "unit" and WA.MultiUnitFamily(trigger) or nil,
 					eventList = customEvents or proto.events(trigger),
 					name = proto.nameFunc and proto.nameFunc(trigger) or nil,
 					icon = proto.iconFunc and proto.iconFunc(trigger) or proto.icon,
@@ -5117,6 +5361,95 @@ function GenericTrigger.GetNameAndIcon(data, triggernum)
 	return name, icon
 end
 
+-- How long a preview state's countdown runs before the preview ticker rolls it
+-- forward again. WA2's fake-timer window.
+local PREVIEW_WINDOW = 7
+
+-- WA2's AddFakeInformation, applied to every state the preview kept. Three
+-- things the state as produced cannot carry: a preview must not take itself down
+-- on its own deadline; a trigger whose progress is a countdown but which named no
+-- deadline needs one or the preview draws an empty bar forever; and a state that
+-- reported no name or icon of its own falls back to the prototype's, which is
+-- what the aura list row shows for the same trigger.
+local function addFakeInformation(data, triggernum, state, ti)
+	state.autoHide = false
+	local declared = ti and (ti.progressType or (ti.proto and ti.proto.progressType))
+	if declared == "timed" and state.expirationTime == nil then
+		state.progressType = "timed"
+	end
+	if state.progressType == "timed" then
+		local expirationTime = state.expirationTime
+		if not (type(expirationTime) == "number" and expirationTime ~= WA.INF
+			and expirationTime > GetTime()) then
+			state.duration = PREVIEW_WINDOW
+			state.expirationTime = GetTime() + PREVIEW_WINDOW
+		end
+	end
+	local name, icon = GenericTrigger.GetNameAndIcon(data, triggernum)
+	-- An unconfigured trigger reports "" rather than nil, and "" is truthy in Lua
+	-- -- so test for content, not just presence, or the preview shows a blank %n.
+	if state.name == nil and name and name ~= "" then state.name = name end
+	if state.icon == nil then state.icon = icon end
+end
+
+-- The options preview (§14). This system's answer is to run the *real* trigger
+-- function under a synthetic "OPTIONS" event and keep whatever states it
+-- produced, so a Trigger State Updater previews the clones its own code builds
+-- and a prototype previews its own name, icon and progress. Only a run that
+-- produced nothing falls back to the synthesised state. Mirrors WA2's
+-- GenericTrigger.CreateFakeStates.
+--
+-- Two deliberate divergences from upstream: it takes `data` rather than an id,
+-- as every other contract method here does; and it fabricates no unit token for
+-- a multi-unit trigger, because the family's own full pass already re-reads
+-- every current member, previewing one clone per member where upstream previews
+-- only the family's first token.
+function GenericTrigger.CreateFakeStates(data, triggernum)
+	local id = data.id
+	local states = WA.GetTriggerStateForTrigger(id, triggernum)
+	if not states then return end
+	-- nil for a trigger that did not compile; the fallback below is then the
+	-- whole preview, which is also what it is worth.
+	local ti = (events[id] or {})[triggernum]
+
+	if ti then
+		-- Trigger code written against a live event payload can throw when run
+		-- with none. Upstream's per-aura opt-out is a silent error handler for
+		-- exactly this pass; here the handler is not a parameter, so it is a flag
+		-- safecall reads. The nested safecall is what guarantees the flag is
+		-- cleared even if the run escapes with an error of our own.
+		local silence = (data.information and data.information.ignoreOptionsEventErrors) and true or false
+		if silence then WA.silenceErrors = true end
+		WA.safecall(id .. ": preview trigger " .. triggernum, runTriggerFunc, ti, "OPTIONS")
+		WA.silenceErrors = nil
+	end
+
+	local shown = 0
+	for _, state in pairs(states) do
+		if state.show then
+			shown = shown + 1
+			addFakeInformation(data, triggernum, state, ti)
+		end
+	end
+	if shown == 0 then
+		for cloneId in pairs(states) do states[cloneId] = nil end
+		local state = {}
+		GenericTrigger.CreateFallbackState(data, triggernum, state)
+		state.show, state.changed = true, true
+		-- Upstream's runtime fallback is always a timed one (duration 0, expiry
+		-- infinite) that AddFakeInformation then turns into the rolling window;
+		-- ours claims `timed` only when the prototype does, so the preview
+		-- supplies the progress upstream's fallback would have carried in.
+		state.progressType = state.progressType or "timed"
+		states[""] = state
+		addFakeInformation(data, triggernum, state, ti)
+	end
+	-- A TSU's state timers were started from whatever the OPTIONS run left in
+	-- `autoHide`, which addFakeInformation has since cleared -- this is what
+	-- cancels the deadline that would otherwise hide the preview a second later.
+	if ti and ti.tsu then WA.StartStopStateTimers(id, triggernum, states) end
+end
+
 -- The variables a Trigger State Updater declares, read out of its compiled
 -- customVariables chunk. That chunk is user code, so it runs through the aura
 -- environment; a chunk that errors or returns a non-table declares nothing.
@@ -5203,6 +5536,13 @@ local function buildDefaults(proto)
 			d["use_" .. arg.name] = false
 			local values = type(arg.valueList) == "function" and arg.valueList(d) or arg.valueList
 			d[arg.name] = arg.default or (values and values[1])
+		elseif arg.type == "multiselect" then
+			-- `false` rather than nil so the key exists in the defaults, which is
+			-- what tells the importer this arg takes upstream's multiselect shape.
+			d["use_" .. arg.name] = false
+			local values = type(arg.valueList) == "function" and arg.valueList(d) or arg.valueList
+			d[arg.name] = arg.default or (values and values[1])
+			d[arg.name .. "_multi"] = {}
 		elseif arg.type == "number" and not arg.required then
 			d["use_" .. arg.name] = false
 			d[arg.name .. "_operator"] = arg.operator or ">="
@@ -5494,13 +5834,19 @@ local function buildOptions(data, triggernum)
 				labels = type(arg.valueLabels) == "function" and arg.valueLabels(t) or arg.valueLabels,
 				get = function() return t[arg.name] end,
 				set = function(v)
+					-- Subclass ids are only meaningful inside their class, so a class
+					-- change drops whatever the old class's list had selected --
+					-- both the single value and the set, since either mode can be
+					-- the one on display when the class is changed.
 					if arg.name == "itemClassID" and t.type == "itemtypeequipped" then
 						local subclassValues = itemSubclassValues(v)
-						local found = false
-						for j = 1, table.getn(subclassValues) do
-							if subclassValues[j] == t.itemSubclassID then found = true; break end
+						local valid = {}
+						for j = 1, table.getn(subclassValues) do valid[subclassValues[j]] = true end
+						if not valid[t.itemSubclassID] then t.itemSubclassID = subclassValues[1] end
+						local set = t.itemSubclassID_multi
+						for value in pairs(set or {}) do
+							if not valid[value] then set[value] = nil end
 						end
-						if not found then t.itemSubclassID = subclassValues[1] end
 					end
 					t[arg.name] = v; WA.Add(data)
 					if arg.reloadOptions then WA.RefreshOptions() end
@@ -5523,6 +5869,19 @@ local function buildOptions(data, triggernum)
 					end,
 				})
 			end
+		elseif arg.type == "multiselect" then
+			WA.MultiSelectFields(fields, {
+				config = t, name = arg.name, display = arg.display or arg.name,
+				default = arg.default,
+				values = type(arg.valueList) == "function" and arg.valueList(t)
+					or (arg.valueList or arg.values),
+				labels = type(arg.valueLabels) == "function" and arg.valueLabels(t)
+					or arg.valueLabels,
+				onChange = function(repaint)
+					WA.Add(data)
+					if repaint then WA.RefreshOptions() end
+				end,
+			})
 		elseif arg.type == "number" then
 			table.insert(fields, {
 				type = "toggle", name = arg.display or arg.name, key = "use_" .. arg.name,
@@ -5590,6 +5949,10 @@ for typeName, proto in pairs(PROTOTYPES) do
 			defaults = buildDefaults(proto),
 			migrate = proto.migrate,
 			wa2Event = proto.wa2Event,
+			-- Carried so the options side and the WeakAuras2 importer can tell a
+			-- prototype that fans a unit family out into clones from one whose
+			-- unit dropdown holds single tokens only.
+			statesParameter = proto.statesParameter,
 			summary = buildSummary(proto),
 			options = buildOptions,
 		})

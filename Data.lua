@@ -6,7 +6,7 @@ if WeakestAuras.disabled then return end
 
 local WA = WeakestAuras
 
-WeakestAurasDB.displays = WeakestAurasDB.displays or {}
+WA.EnsureDB()
 
 -- Region types (Regions.lua) and trigger types (Triggers.lua) register themselves
 -- here by name; the options window looks a data's regionType/trigger.type up in
@@ -120,7 +120,12 @@ end
 -- spec = { displayName, supports = function(regionType) return bool end,
 --          default = {...}, create = function(parent) end,
 --          modify = function(parent, subRegion, parentData, subRegionData) end,
---          addDefaultsForNewAura = function(data) end, properties = {...} }
+--          addDefaultsForNewAura = function(data) end, properties = {...},
+--          enforced = bool }
+-- enforced: MergeDefaults keeps exactly one on every aura this type supports,
+-- and the options list offers no add, delete or duplicate for it. subbackground
+-- is the case -- a placeholder standing for the region's own art inside the
+-- draw-order list, which is meaningless in any count but one.
 function WA.RegisterSubRegionType(name, spec)
 	WA.subRegionTypes[name] = spec
 end
@@ -184,8 +189,12 @@ end
 function WA.RegionSpecFor(data)
 	local spec = data and WA.regionTypes[data.regionType]
 	if spec then
+		-- A circular progress texture is three warped textures, so it needs the
+		-- client's corner transforms; on a build without them the aura is honest
+		-- text instead of an empty box.
 		if data.regionType == "progresstexture"
-			and (data.orientation == "CLOCKWISE" or data.orientation == "ANTICLOCKWISE") then
+			and (data.orientation == "CLOCKWISE" or data.orientation == "ANTICLOCKWISE")
+			and not WA.hasTextureTransforms then
 			return WA.regionTypes["fallback"]
 		end
 		return spec
@@ -350,6 +359,41 @@ function WA.RemapSubRegionRefs(data, replacements)
 	end
 end
 
+-- Keeps exactly one entry of `kind` in data.subRegions: inserts one at index 1
+-- when there is none, drops the extras when there is more than one. Mirrors
+-- upstream's Private.EnforceSubregionExists, condition remap included -- both
+-- edits renumber, and a renumber no map describes silently retargets whatever
+-- conditions point past it.
+--
+-- Index 1 is what makes the insert invisible: a row standing for the region's
+-- own art, placed under everything the aura already carries, leaves every
+-- effect drawing exactly where it drew before.
+function WA.EnforceSubregionExists(data, kind)
+	local subs = data.subRegions or {}
+	data.subRegions = subs
+	local found = {}
+	for i = 1, table.getn(subs) do
+		if subs[i].type == kind then table.insert(found, i) end
+	end
+	local n = table.getn(found)
+	if n == 0 then
+		local map = {}
+		for i = 1, table.getn(subs) do map[i] = i + 1 end
+		table.insert(subs, 1, { type = kind })
+		WA.RemapSubRegionRefs(data, map)
+	elseif n > 1 then
+		-- Backwards, so each removal's index is still the one the map is built
+		-- against: taking the earliest first would renumber the rest under it.
+		for i = n, 2, -1 do
+			local at = found[i]
+			local map = { [at] = false }
+			for j = at + 1, table.getn(subs) do map[j] = j - 1 end
+			table.remove(subs, at)
+			WA.RemapSubRegionRefs(data, map)
+		end
+	end
+end
+
 -- What each sub-region type's draw level used to be a fixed constant of, before
 -- the level came off the entry's position in data.subRegions. A type owning no
 -- frame at all -- subtick, which draws on the parent's bar and takes no level --
@@ -385,6 +429,51 @@ local function migrateSchemaV5(data)
 	if not moved then return end
 	for i = 1, n do subs[i] = sorted[i] end
 	WA.RemapSubRegionRefs(data, map)
+end
+
+-- The progresstexture crop moved onto upstream's meaning: a sampling scale
+-- about the texture centre, where the sqrt(2) growth in the shared transform
+-- makes 0.41 the no-crop value, rather than a per-edge inset where 0 was. A
+-- WeakAuras2 aura's crop_x now travels here untranslated, and the two
+-- orientation families share one formula.
+--
+-- Whether the aura carried a crop of its own is decided before MergeDefaults
+-- seeds one, and passed in: afterwards a seeded default is indistinguishable
+-- from a stored value, and rescaling a seeded 0.41 would zoom a new aura's art.
+-- The value itself is read here rather than snapshotted, because schema 3's
+-- camelCase fold writes `crop_x` after that point.
+--
+-- The mapping preserves what each aura already drew -- an old inset of c
+-- sampled 1 - 2c of the art, the new scale samples sqrt(2) / (1 + crop) -- so
+-- it cannot change how anything looks, whichever convention the stored value
+-- was written under. user_x flips with it: upstream negates that key on the way
+-- to the texture, and a seeded 0 is left alone by the same arithmetic.
+local function migrateSchemaV6(data, hadCropX, hadCropY)
+	if data.regionType ~= "progresstexture" then return end
+	local function scaleFor(crop)
+		local span = 1 - 2 * (crop or 0)
+		if span < 0.01 then span = 0.01 end
+		return 1.4142 / span - 1
+	end
+	if hadCropX then data.crop_x = scaleFor(data.crop_x) end
+	if hadCropY then data.crop_y = scaleFor(data.crop_y) end
+	if data.user_x then data.user_x = -data.user_x end
+end
+
+-- The class load constraint was the only multi-select in the addon and stored
+-- its set under a name of its own (`classes`). Every multi-select now spells the
+-- set `<name>_multi`, so the one-off name folds into the convention.
+local function migrateSchemaV7(data)
+	local L = data.load
+	if type(L) ~= "table" then return end
+	if L.classes ~= nil and L.class_multi == nil then
+		L.class_multi = L.classes
+	end
+	L.classes = nil
+	-- The three constraints that gained the tier were plain on/off gates.
+	for _, name in ipairs({ "race", "faction", "ingroup" }) do
+		WA.MultiSelectMigrateGate(L, name)
+	end
 end
 
 -- A sub-region imported from upstream before the combined anchor was split
@@ -437,7 +526,7 @@ end
 -- together: a new migration adds a gate and bumps this in the same change.
 -- Data that is current-schema by construction rather than by migration
 -- (WA2Translate's output) is stamped with it directly.
-WA.SCHEMA_VERSION = 5
+WA.SCHEMA_VERSION = 7
 
 -- Fills in missing fields from the aura's regionType/trigger.type defaults, and
 -- migrates saved data through the local schema versions (upstream's `triggers`
@@ -446,6 +535,11 @@ WA.SCHEMA_VERSION = 5
 -- field the user already set.
 function WA.MergeDefaults(data)
 	local region = WA.regionTypes[data.regionType]
+	-- Asked before the merge seeds them: schema 6 rescales a stored crop, and a
+	-- seeded default is indistinguishable from one once mergeMissing has run.
+	-- Both spellings, since schema 3's camelCase fold has not run yet either.
+	local hadCropX = data.crop_x ~= nil or data.cropX ~= nil
+	local hadCropY = data.crop_y ~= nil or data.cropY ~= nil
 	mergeMissing(data, region and region.defaults)
 
 	if WA.IsGroup(data) then
@@ -492,6 +586,18 @@ function WA.MergeDefaults(data)
 	-- Always present, even on an aura that uses none, so adding one never needs
 	-- a migration pass.
 	data.subRegions = data.subRegions or {}
+	-- Upstream enforces its placeholders from each region type's `validate`;
+	-- driving it off the registry instead means a type declaring itself enforced
+	-- needs no new call site here. No internalVersion gate, and upstream has none
+	-- either: the call is idempotent, so a saved aura gains its row on the next
+	-- merge and keeps it. It runs ahead of the migrations below on purpose --
+	-- schema 5's legacy sort ranks an unknown type at the floor and breaks ties
+	-- by original index, so the row it inserts at 1 stays at 1 through that pass.
+	for kind, spec in pairs(WA.subRegionTypes) do
+		if spec.enforced and (not spec.supports or spec.supports(data.regionType)) then
+			WA.EnforceSubregionExists(data, kind)
+		end
+	end
 	data.conditions = data.conditions or {}
 	data.load = data.load or {}
 	data.authorOptions = data.authorOptions or {}
@@ -548,6 +654,16 @@ function WA.MergeDefaults(data)
 	if data.internalVersion < 5 then
 		migrateSchemaV5(data)
 		data.internalVersion = 5
+	end
+
+	if data.internalVersion < 6 then
+		migrateSchemaV6(data, hadCropX, hadCropY)
+		data.internalVersion = 6
+	end
+
+	if data.internalVersion < 7 then
+		migrateSchemaV7(data)
+		data.internalVersion = 7
 	end
 end
 

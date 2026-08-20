@@ -903,6 +903,285 @@ function D.SwipeNudge(rest)
 end
 
 -- ---------------------------------------------------------------------------
+-- /wa edgetest -- settles: which of the swipe's two draw flags, and which of
+-- its setters, is responsible when a wedge goes missing. Six rigs on one row,
+-- each naming the combination it carries: wedge alone, edge alone, both, both
+-- with a recoloured wedge, a recoloured wedge with no edge, and a wedge whose
+-- colour is set only at construction (the ordering that shipped before the
+-- colour option existed). If the wedge survives everywhere but the last two
+-- differ, the fault is the colour setter reaching an already-shaped wedge; if
+-- it dies wherever an edge exists, it is the edge texture.
+-- ---------------------------------------------------------------------------
+
+local edgeTestRigs = {}
+local edgeTestTicker
+local EDGE_TEST_DURATION = 6
+
+local function edgeTestLoop()
+	for i = 1, table.getn(edgeTestRigs) do
+		local rig = edgeTestRigs[i]
+		if rig.swipe then
+			rig.swipe:Arm(GetTime() + EDGE_TEST_DURATION, EDGE_TEST_DURATION, false)
+		end
+	end
+end
+
+function D.EdgeTest(rest)
+	for i = table.getn(edgeTestRigs), 1, -1 do
+		edgeTestRigs[i]:Hide()
+		edgeTestRigs[i] = nil
+	end
+	if edgeTestTicker then edgeTestTicker:Cancel(); edgeTestTicker = nil end
+	if rest == "0" then
+		D.Log("[edgetest] cleared")
+		return
+	end
+	if not WA.regionPrototype.SwipeSupportsLooks() then
+		D.Log("[edgetest] the Model backend draws neither flag -- nothing to compare")
+		return
+	end
+
+	-- swipe, edge, colour (nil = leave the constructor's), label
+	local cases = {
+		{ true, false, nil, "wedge" },
+		{ false, true, nil, "edge" },
+		{ true, true, nil, "both" },
+		{ true, true, { 0.1, 0.2, 0.9, 0.7 }, "both+col" },
+		{ true, false, { 0.1, 0.2, 0.9, 0.7 }, "col" },
+		{ true, false, "early", "col early" },
+	}
+
+	local _, _, testIcon = GetSpellInfo(5229)
+	testIcon = testIcon or "Interface\\Icons\\Spell_Nature_LightningShield"
+
+	local size, gap = 48, 24
+	for i = 1, table.getn(cases) do
+		local case = cases[i]
+		local rig = CreateFrame("Frame", nil, UIParent)
+		rig:SetWidth(size); rig:SetHeight(size)
+		rig:SetPoint("CENTER", UIParent, "CENTER",
+			(i - (table.getn(cases) + 1) / 2) * (size + gap), -60)
+
+		local tex = rig:CreateTexture(nil, "ARTWORK")
+		tex:SetAllPoints(rig)
+		tex:SetTexture(testIcon)
+		tex:SetTexCoord(0.07, 0.93, 0.07, 0.93)
+
+		local swipe = WA.regionPrototype.CreateSwipe(rig)
+		rig.swipe = swipe
+		if swipe then
+			-- "early" is the pre-option ordering: colour before the wedge has
+			-- ever been shaped. Everything else colours a live wedge.
+			if case[3] == "early" then
+				swipe:SetSwipeColor(0.1, 0.2, 0.9, 0.7)
+			end
+			WA.regionPrototype.SizeSwipe(swipe, size, size)
+			swipe:SetSwipe(case[1])
+			swipe:SetEdge(case[2])
+			swipe:Arm(GetTime() + EDGE_TEST_DURATION, EDGE_TEST_DURATION, false)
+			if type(case[3]) == "table" then
+				swipe:SetSwipeColor(case[3][1], case[3][2], case[3][3], case[3][4])
+			end
+		end
+
+		local label = rig:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+		label:SetPoint("TOP", rig, "BOTTOM", 0, -4)
+		label:SetText(case[4])
+
+		rig:Show()
+		table.insert(edgeTestRigs, rig)
+	end
+	edgeTestTicker = C_Timer.NewTicker(EDGE_TEST_DURATION, edgeTestLoop)
+	D.Log("[edgetest] six rigs at CENTER,*,-60 looping every " .. EDGE_TEST_DURATION ..
+		"s. /wa edgetest 0 to clear")
+	D.EdgeState()
+end
+
+-- What each rig's wedges actually are, rather than what they look like: a
+-- wedge that is shown, at a plausible angle pair, and carrying a corner offset
+-- is one the addon built correctly and the client did not draw, which is a
+-- different fault from any of the ones this addon can cause.
+function D.EdgeState()
+	if table.getn(edgeTestRigs) == 0 then
+		D.Log("[edgetest] no rigs -- /wa edgetest first")
+		return
+	end
+	for i = 1, table.getn(edgeTestRigs) do
+		local rig = edgeTestRigs[i]
+		local swipe = rig.swipe
+		if not swipe or not swipe.spinner then
+			D.Log(string.format("[edgetest] %d: no spinner-backed swipe", i))
+		else
+			local sp = swipe.spinner
+			local t1 = sp.textures[1]
+			local vx, vy = t1:GetVertexOffset(1)
+			local shown = 0
+			for k = 1, 3 do if sp.textures[k]:IsShown() then shown = shown + 1 end end
+			D.Log(string.format(
+				"[edgetest] %d: frame=%s wedgeFlag=%s spinnerVis=%s texShown=%d " ..
+				"angles=%s..%s ULoff=%.1f,%.1f fill=%s edge=%s",
+				i, tostring(swipe:IsShown()), tostring(swipe.wedgesEnabled),
+				tostring(sp.visible), shown,
+				tostring(sp.angle1 and math.floor(sp.angle1)),
+				tostring(sp.angle2 and math.floor(sp.angle2)),
+				vx or 0, vy or 0, tostring(t1:GetTexture()),
+				swipe.edge and tostring(swipe.edge:IsShown()) or "none"))
+		end
+	end
+end
+
+-- ---------------------------------------------------------------------------
+-- /wa swipestress [N] -- settles: what does an animating spinner swipe cost,
+-- in frame time, at realistic icon counts? Each one redraws three wedges every
+-- frame (4 SetVertexOffset + 1 SetTexCoord apiece, every offset re-entering
+-- ClassicAPI's ApplyFromRect), where the Model fallback spends no Lua at all
+-- per frame. With no argument it sweeps 0/10/40/100 rigs and prints the
+-- marginal cost per icon; with N it measures one count and leaves the rigs up.
+--
+-- Frames are counted from an OnUpdate over a wall-clock window rather than
+-- read from GetFramerate, which is smoothed over an unspecified span and so
+-- lags a step change like this one. The meter's own tick is in every phase
+-- including the baseline, so it cancels out of the difference.
+--
+-- The rigs arm a 600s countdown: barely any of it elapses during a sweep, so
+-- every wedge stays a >270-degree span, which is the three-texture worst case.
+-- ---------------------------------------------------------------------------
+
+local SWIPE_STRESS_SIZE = 24
+local SWIPE_STRESS_COLS = 10
+local SWIPE_STRESS_ARM = 600
+local SWIPE_STRESS_SETTLE = 1
+local SWIPE_STRESS_WINDOW = 4
+
+local swipeStressRigs = {}
+local swipeStressMeter
+local swipeStressRun
+
+local function swipeStressTick()
+	if swipeStressRun then swipeStressRun.frames = swipeStressRun.frames + 1 end
+end
+
+local function swipeStressRig(index)
+	if swipeStressRigs[index] then return swipeStressRigs[index] end
+
+	local col = math.mod(index - 1, SWIPE_STRESS_COLS)
+	local row = math.floor((index - 1) / SWIPE_STRESS_COLS)
+	local pitch = SWIPE_STRESS_SIZE + 2
+
+	local rig = CreateFrame("Frame", nil, UIParent)
+	rig:SetWidth(SWIPE_STRESS_SIZE)
+	rig:SetHeight(SWIPE_STRESS_SIZE)
+	rig:SetPoint("CENTER", UIParent, "CENTER",
+		(col - (SWIPE_STRESS_COLS - 1) / 2) * pitch, 200 - row * pitch)
+
+	local tex = rig:CreateTexture(nil, "ARTWORK")
+	tex:SetAllPoints(rig)
+	tex:SetTexture("Interface\\Icons\\Spell_Nature_LightningShield")
+	tex:SetTexCoord(0.07, 0.93, 0.07, 0.93)
+
+	rig.swipe = WA.regionPrototype.CreateSwipe(rig)
+	WA.regionPrototype.SizeSwipe(rig.swipe, SWIPE_STRESS_SIZE, SWIPE_STRESS_SIZE)
+
+	swipeStressRigs[index] = rig
+	return rig
+end
+
+local function swipeStressShow(count)
+	local existing = table.getn(swipeStressRigs)
+	local total = count > existing and count or existing
+	for i = 1, total do
+		if i <= count then
+			local rig = swipeStressRig(i)
+			if rig.swipe then
+				rig.swipe:Arm(GetTime() + SWIPE_STRESS_ARM, SWIPE_STRESS_ARM)
+			end
+			rig:Show()
+		else
+			local rig = swipeStressRigs[i]
+			if rig.swipe then rig.swipe:Clear() end
+			rig:Hide()
+		end
+	end
+end
+
+local swipeStressMeasure, swipeStressReport
+
+local function swipeStressPhase()
+	local run = swipeStressRun
+	if not run then return end
+	run.index = run.index + 1
+	local count = run.counts[run.index]
+	if not count then
+		swipeStressReport()
+		return
+	end
+	swipeStressShow(count)
+	C_Timer.After(SWIPE_STRESS_SETTLE, swipeStressMeasure)
+end
+
+function swipeStressMeasure()
+	local run = swipeStressRun
+	if not run then return end
+	run.frames = 0
+	run.started = GetTime()
+	swipeStressMeter:Show()
+	C_Timer.After(SWIPE_STRESS_WINDOW, function()
+		local r = swipeStressRun
+		if not r then return end
+		swipeStressMeter:Hide()
+		local elapsed = GetTime() - r.started
+		local fps = elapsed > 0 and r.frames / elapsed or 0
+		local ms = fps > 0 and 1000 / fps or 0
+		local count = r.counts[r.index]
+		r.ms[count] = ms
+		D.Log(string.format("[swipestress] %3d swipes: %.1f fps, %.2f ms/frame", count, fps, ms))
+		swipeStressPhase()
+	end)
+end
+
+function swipeStressReport()
+	local run = swipeStressRun
+	swipeStressRun = nil
+	local base = run.ms[0]
+	if not base then return end
+	for i = 1, table.getn(run.counts) do
+		local count = run.counts[i]
+		local ms = run.ms[count]
+		if count > 0 and ms then
+			D.Log(string.format("[swipestress] %3d swipes: %+.2f ms/frame over baseline, %.0f us per swipe",
+				count, ms - base, (ms - base) * 1000 / count))
+		end
+	end
+	D.Log("[swipestress] done -- rigs left up at the last count, /wa swipestress 0 to clear")
+end
+
+function D.SwipeStress(rest)
+	if swipeStressRun then
+		D.Log("[swipestress] a sweep is already running")
+		return
+	end
+	local count = tonumber(rest)
+	if count == 0 then
+		swipeStressShow(0)
+		D.Log("[swipestress] cleared")
+		return
+	end
+
+	if not swipeStressMeter then
+		swipeStressMeter = CreateFrame("Frame", nil, UIParent)
+		swipeStressMeter:SetScript("OnUpdate", swipeStressTick)
+		swipeStressMeter:Hide()
+	end
+
+	local counts = count and { count } or { 0, 10, 40, 100 }
+	swipeStressRun = { counts = counts, index = 0, frames = 0, ms = {} }
+	D.Log(string.format("[swipestress] %s backend, measuring %d phase(s), %.0fs each -- hold still and don't move the camera",
+		(WA.hasTextureTransforms and WA.Spinner) and "spinner" or "Model",
+		table.getn(counts), SWIPE_STRESS_SETTLE + SWIPE_STRESS_WINDOW))
+	swipeStressPhase()
+end
+
+-- ---------------------------------------------------------------------------
 -- /wa track <spellName> -- settles: is the player's own duration/
 -- expirationTime actually monotonic and does it reset cleanly on recast, or
 -- does it exhibit the same flakiness DoiteAuras had to work around?
@@ -1423,7 +1702,9 @@ function D.CdProbe(rest)
 	D.Log(string.format("  GetTime() = %.2f (uptime %.1f days -- ticks wrap signed past 24.9)",
 		GetTime(), GetTime() / 86400))
 
-	local wStart, wDuration = WA.SpellCdInfo(id)
+	-- Raw: the point of the dump is the window before the GCD filter, which the
+	-- next two lines then report the filter's verdict on.
+	local wStart, wDuration = WA.SpellCdInfo(id, true)
 	D.Log("  watcher answers: start " .. tostring(wStart) .. ", duration " .. tostring(wDuration))
 	D.Log("  IsGcdCooldown(that duration) = " .. tostring(WA.IsGcdCooldown(wDuration)))
 	D.Log("  => a Cooldown Ready trigger reads "
@@ -1982,6 +2263,64 @@ end
 -- ---------------------------------------------------------------------------
 
 local levelProbeHost
+local levelProbeVisual
+
+-- The question the arithmetic rests on and nothing headless can reach: a child
+-- frame levelled *below* its parent -- does it draw under the parent's own art,
+-- or does being a child put it on top regardless? The whole subbackground row
+-- depends on the first answer, since an effect ordered behind the region is a
+-- child of it holding a lower number.
+--
+-- Three boxes over one red parent: a child above it, a child below it, and the
+-- parent alone for reference. Whether the middle box's blue shows is the answer.
+local function levelProbeVisualFrame()
+	if levelProbeVisual then return levelProbeVisual end
+	local frame = CreateFrame("Frame", nil, UIParent)
+	frame:SetWidth(360); frame:SetHeight(210)
+	frame:SetPoint("CENTER", UIParent, "CENTER", 0, 120)
+	frame:SetBackdrop({ bgFile = "Interface\\Buttons\\WHITE8X8" })
+	frame:SetBackdropColor(0, 0, 0, 0.85)
+
+	local title = frame:CreateFontString(nil, "OVERLAY")
+	title:SetFont("Fonts\\FRIZQT__.TTF", 11, "")
+	title:SetPoint("TOP", frame, "TOP", 0, -8)
+	title:SetText("Does a child below its parent's level draw under it?")
+
+	local function pair(x, childOffset, caption)
+		local parent = CreateFrame("Frame", nil, frame)
+		parent:SetWidth(96); parent:SetHeight(96)
+		parent:SetPoint("TOPLEFT", frame, "TOPLEFT", x, -34)
+		parent:SetFrameLevel(frame:GetFrameLevel() + 10)
+		local red = parent:CreateTexture(nil, "ARTWORK")
+		red:SetAllPoints(parent)
+		red:SetTexture(0.8, 0.1, 0.1, 1)
+
+		if childOffset then
+			local child = CreateFrame("Frame", nil, parent)
+			child:SetWidth(60); child:SetHeight(60)
+			child:SetPoint("CENTER", parent, "CENTER")
+			child:SetFrameLevel(parent:GetFrameLevel() + childOffset)
+			local blue = child:CreateTexture(nil, "ARTWORK")
+			blue:SetAllPoints(child)
+			blue:SetTexture(0.1, 0.3, 0.9, 1)
+		end
+
+		local label = frame:CreateFontString(nil, "OVERLAY")
+		label:SetFont("Fonts\\FRIZQT__.TTF", 10, "")
+		label:SetJustifyH("CENTER")
+		label:SetPoint("TOP", parent, "BOTTOM", 0, -4)
+		label:SetText(caption)
+		return parent
+	end
+
+	pair(20, 2, "child ABOVE\n(blue must show)")
+	local under = pair(132, -2, "child BELOW\n(blue must be hidden)")
+	pair(244, nil, "parent alone\n(reference)")
+
+	levelProbeVisual = frame
+	levelProbeVisual.under = under
+	return levelProbeVisual
+end
 
 function D.LevelProbe()
 	local proto = WA.regionPrototype
@@ -2030,6 +2369,14 @@ function D.LevelProbe()
 	D.Log(string.format("deepest live region base: %d (%s)", deepest, tostring(deepestId)))
 	D.Log(string.format("  ten effects on it reach %d (SUB_LEVEL %d, SUB_STEP %d)",
 		deepest + proto.SUB_LEVEL + proto.SUB_STEP * 9, proto.SUB_LEVEL, proto.SUB_STEP))
+
+	local visual = levelProbeVisualFrame()
+	visual:Show()
+	local under = visual.under
+	D.Log(string.format("child-below-parent: parent at %d, its child asked for %d",
+		under:GetFrameLevel(), under:GetFrameLevel() - 2))
+	D.Log("  middle box blue hidden -> a child below its parent draws under it (subbackground works)")
+	D.Log("  middle box blue showing -> being a child wins over the level, and it does not")
 	D.Log("--- end levelprobe ---")
 end
 
@@ -2093,7 +2440,7 @@ function D.TexProbe()
 
 	if not texProbeFrame then
 		texProbeFrame = CreateFrame("Frame", nil, UIParent)
-		texProbeFrame:SetWidth(620); texProbeFrame:SetHeight(300)
+		texProbeFrame:SetWidth(620); texProbeFrame:SetHeight(580)
 		texProbeFrame:SetPoint("CENTER", UIParent, "CENTER", 0, 80)
 		texProbeFrame:SetBackdrop({ bgFile = "Interface\\Buttons\\WHITE8X8" })
 		texProbeFrame:SetBackdropColor(0, 0, 0, 0.8)
@@ -2135,6 +2482,129 @@ function D.TexProbe()
 		local desatOK, desatReturn = texProbeCall(desaturatedTexture, "SetDesaturated", true)
 		texProbeLabel(texProbeFrame, "SetDesaturated(true)", "TOP", desaturated, "BOTTOM", 0, -4)
 
+		-- Texture corner-transform canaries. Each box has one exact expected
+		-- look (its label says it); any box going wrong after a ClassicAPI
+		-- update names its regression directly -- offset magnitude (rulers,
+		-- at two effective scales), rotation chirality (the bar), the wedge
+		-- geometry and its multi-texture split (the spinners), and the
+		-- assembled cooldown swipe at both aspect ratios. Solid fills, so the
+		-- drawn quads are read directly. The diagnostic series that
+		-- established the client's corner contract lives in git history.
+		if WA.Spinner and WA.hasTextureTransforms then
+			local UL_V = UPPER_LEFT_VERTEX or 1
+
+			local function solidBox(x, y, label)
+				local box = texProbeBox(texProbeFrame, x, y)
+				local tex = box:CreateTexture(nil, "ARTWORK")
+				tex:SetAllPoints(box)
+				tex:SetTexture(1, 1, 1, 0.9)
+				texProbeLabel(texProbeFrame, label, "TOP", box, "BOTTOM", 0, -4)
+				return tex, box
+			end
+
+			local TICKS = { 12, 24, 48, 96 }
+			local TICK_COLORS = {
+				{ 1, 1, 0 }, { 0, 1, 0 }, { 1, 0.4, 0 }, { 1, 0, 0 },
+			}
+			local function addTicks(box, vertical)
+				for i = 1, 4 do
+					local tick = box:CreateTexture(nil, "OVERLAY")
+					tick:SetTexture(TICK_COLORS[i][1], TICK_COLORS[i][2], TICK_COLORS[i][3], 1)
+					if vertical then
+						tick:SetWidth(1); tick:SetHeight(20)
+						tick:SetPoint("TOPLEFT", box, "TOPLEFT", TICKS[i], 0)
+					else
+						tick:SetWidth(20); tick:SetHeight(1)
+						tick:SetPoint("TOPLEFT", box, "TOPLEFT", 0, -TICKS[i])
+					end
+				end
+			end
+
+			local rotTex = solidBox(18, -314, "rot 30\n(clean square?)")
+			rotTex:SetRotation(math.rad(30))
+			texProbeFrame._rotTex = rotTex
+
+			local xTex, xBox = solidBox(18 + 110, -314, "UL right 24px\nticks 12|24|48|96")
+			xTex:SetVertexOffset(UL_V, 24, 0)
+			addTicks(xBox, true)
+			texProbeFrame._pullTexture = xTex
+
+			-- Per-texture colors, so a wedge's texture split reads off its
+			-- color: t1 RED, t2 GREEN, t3 BLUE.
+			local function wedgeBox(x, y, a1, a2, label)
+				local box = texProbeBox(texProbeFrame, x, y)
+				local spinner = WA.Spinner.Create(box, "ARTWORK")
+				spinner.textures[1]:SetTexture(1, 0.2, 0.2, 0.9)
+				spinner.textures[2]:SetTexture(0.2, 1, 0.2, 0.9)
+				spinner.textures[3]:SetTexture(0.2, 0.4, 1, 0.9)
+				spinner:SetWidth(96); spinner:SetHeight(96)
+				spinner:SetProgress(a1, a2)
+				texProbeLabel(texProbeFrame, label, "TOP", box, "BOTTOM", 0, -4)
+				return spinner
+			end
+
+			local wedgeControl = wedgeBox(18 + 4 * 110, -314, 0, 45, "wedge 0-45\n(red top slice)")
+			texProbeFrame._wedgeTex = wedgeControl.textures[1]
+			wedgeBox(18, -454, 10, 350, "wedge 10-350\n(red+green+blue)")
+
+			-- The ruler at a second effective scale (a half-scaled child
+			-- frame): the fold landing on the GREEN tick again proves the
+			-- offset conversion reads the live per-region scale chain.
+			local scaledBox = texProbeBox(texProbeFrame, 18 + 2 * 110, -314)
+			local scaledHolder = CreateFrame("Frame", nil, scaledBox)
+			scaledHolder:SetScale(0.5)
+			scaledHolder:SetWidth(96); scaledHolder:SetHeight(96)
+			scaledHolder:SetPoint("BOTTOMLEFT", scaledBox, "BOTTOMLEFT", 0, 0)
+			local scaledTex = scaledHolder:CreateTexture(nil, "ARTWORK")
+			scaledTex:SetAllPoints(scaledHolder)
+			scaledTex:SetTexture(1, 1, 1, 0.9)
+			scaledTex:SetVertexOffset(UL_V, 24, 0)
+			for i = 1, 4 do
+				local tick = scaledHolder:CreateTexture(nil, "OVERLAY")
+				tick:SetTexture(TICK_COLORS[i][1], TICK_COLORS[i][2], TICK_COLORS[i][3], 1)
+				tick:SetWidth(2); tick:SetHeight(20)
+				tick:SetPoint("TOPLEFT", scaledHolder, "TOPLEFT", TICKS[i], 0)
+			end
+			texProbeFrame._scaledTex = scaledTex
+			texProbeLabel(texProbeFrame, "ruler in 0.5x frame\nfold at green?", "TOP", scaledBox, "BOTTOM", 0, -4)
+
+			-- Rotation chirality on a shape that cannot be misread: a long thin
+			-- bar rotated +30 degrees. Counter-clockwise (the retail contract)
+			-- lifts the bar's RIGHT end; clockwise drops it. The white bar is
+			-- the unrotated reference, the yellow one carries the rotation.
+			local barBox = texProbeBox(texProbeFrame, 18 + 3 * 110, -314)
+			local barRef = barBox:CreateTexture(nil, "ARTWORK")
+			barRef:SetWidth(80); barRef:SetHeight(8)
+			barRef:SetPoint("CENTER", barBox, "CENTER", 0, 28)
+			barRef:SetTexture(1, 1, 1, 0.9)
+			local barRot = barBox:CreateTexture(nil, "ARTWORK")
+			barRot:SetWidth(80); barRot:SetHeight(8)
+			barRot:SetPoint("CENTER", barBox, "CENTER", 0, -14)
+			barRot:SetTexture(1, 0.9, 0.2, 0.9)
+			barRot:SetRotation(math.rad(30))
+			texProbeFrame._arrowRot = barRot
+			texProbeLabel(texProbeFrame, "bar rot 30\n(right end UP = CCW ok)", "TOP", barBox, "BOTTOM", 0, -4)
+
+			-- The assembled swipe object at both aspect ratios (the wide one is
+			-- what the Model backend structurally could not cover). Held at a
+			-- quarter elapsed: dark except the bright 12-to-3-o'clock wedge.
+			local function swipeCanary(x, y, w, h, label)
+				local box = texProbeBox(texProbeFrame, x, y)
+				local holder = CreateFrame("Frame", nil, box)
+				holder:SetWidth(w); holder:SetHeight(h)
+				holder:SetPoint("CENTER", box, "CENTER", 0, 0)
+				local icon = holder:CreateTexture(nil, "BACKGROUND")
+				icon:SetAllPoints(holder)
+				icon:SetTexture(TEXPROBE_COLOR_ART)
+				local swipe = WA.regionPrototype.CreateSwipe(holder)
+				WA.regionPrototype.SizeSwipe(swipe, w, h)
+				if swipe then swipe:Hold(0.75, false) end
+				texProbeLabel(texProbeFrame, label, "TOP", box, "BOTTOM", 0, -4)
+			end
+			swipeCanary(18 + 110, -454, 96, 96, "swipe hold 75%\n(bright 12 to 3)")
+			swipeCanary(18 + 2 * 110, -454, 96, 48, "swipe 96x48\n(covers fully)")
+		end
+
 		texProbeFrame._texProbe = {
 			regular = regular, desatOK = desatOK, desatReturn = desatReturn,
 		}
@@ -2155,13 +2625,275 @@ function D.TexProbe()
 	D.Log("  SetTexCoordModifiesRect calls: on=" .. tostring(setOnOK) .. " off=" .. tostring(setOffOK)
 		.. " -- compare the ON/OFF sample box widths")
 
-	local vertexOK, vertexReturn = texProbeCall(scratch, "SetVertexOffset", 0, 0)
-	D.Log("  SetVertexOffset: " .. (vertexOK and ("PRESENT (return " .. tostring(vertexReturn) .. ")") or "ABSENT"))
+	-- Vertex index 1 = UPPER_LEFT_VERTEX; an invalid index (or too few args) is
+	-- a Lua error in ClassicAPI's backport, which would read as ABSENT here.
+	-- Zero offsets leave the scratch texture untouched.
+	local vertexOK, vertexReturn = texProbeCall(scratch, "SetVertexOffset", 1, 0, 0)
+	D.Log("  SetVertexOffset: " .. (vertexOK and ("PRESENT (return " .. tostring(vertexReturn) .. ")") or ((scratch.SetVertexOffset and "present but errored: " .. tostring(vertexReturn)) or "ABSENT")))
 	D.Log("  SetRotation: " .. ((scratch.SetRotation and "PRESENT") or "ABSENT"))
 	D.Log("  SetDesaturated(true): " .. (p.desatOK and "call accepted" or "ABSENT/FAILED")
 		.. " (return " .. tostring(p.desatReturn) .. ") -- compare normal and desaturated samples")
+	if WA.hasTextureTransforms then
+		D.Log("  effective scale: " .. tostring(texProbeFrame:GetEffectiveScale()))
+		local function dumpCorners(name, tex)
+			if not (tex and tex.GetCorners) then
+				D.Log("  " .. name .. ": GetCorners absent (older DLL build)")
+				return
+			end
+			local ok, blx, bly, tlx, tly, brx, bry, trx, try2, rt, rl, rb, rr = pcall(tex.GetCorners, tex)
+			if not ok or type(blx) ~= "number" then
+				D.Log("  " .. name .. " corners: unavailable (" .. tostring(blx) .. ")")
+				return
+			end
+			D.Log(string.format("  %s BL(%.5f,%.5f) TL(%.5f,%.5f) BR(%.5f,%.5f) TR(%.5f,%.5f)",
+				name, blx, bly, tlx, tly, brx, bry, trx, try2))
+			D.Log(string.format("    rect t=%.5f l=%.5f b=%.5f r=%.5f", rt, rl, rb, rr))
+		end
+		-- The corner array populates on layout resolve; on the call that CREATES
+		-- the frame these can read zeros. Run /wa texprobe a second time for
+		-- resolved values.
+		dumpCorners("ULright24", texProbeFrame._pullTexture)
+		dumpCorners("wedge0-45 tex1", texProbeFrame._wedgeTex)
+		D.Log("  every canary box's label states its expected look; a wrong box names its regression")
+		D.Log("  rulers: which tick does the white quad's pulled corner reach (yellow 12, green 24, orange 48, red 96)?")
+		D.Log("  corner dumps read zeros on the call that creates the frame; run texprobe twice for numbers")
+	else
+		D.Log("  wedge fixtures skipped: texture transforms absent (SetVertexOffset/SetRotation)")
+	end
 	D.Log("  visual answers: rotate 30 degrees; margin behavior; whether ON changes the half-width box; whether art greys")
 	D.Log("--- end texprobe ---")
+end
+
+-- ---------------------------------------------------------------------------
+-- /wa texprobe corners -- what the 8-argument SetTexCoord corner form does to
+-- sampling and to geometry, and whether the two can be separated.
+--
+-- Spinner.lua writes vertex offsets only, because on this client texcoords and
+-- vertex offsets both resolve into the one drawn-corner array: the engine
+-- shrinks a region's drawn rect by its texcoord span before storing the
+-- corners, so a partial-span corner texcoord moves the very geometry the
+-- offsets are measured against. A textured circular progress needs the
+-- sampling half without the geometry half, which is what these fixtures
+-- measure -- per-corner sampling against bounding-rect sampling, the induced
+-- crop and where it anchors, and whether SetTexCoordModifiesRect(false) takes
+-- the crop away.
+--
+-- The numbers carry most of it: corner dumps are normalized to the box, so an
+-- untouched quad reads BL(0,1) TL(0,0) BR(1,1) TR(1,0) and anything else is
+-- the crop in box fractions. The art answers only what a number cannot --
+-- which part of the sheet each box ends up showing.
+-- ---------------------------------------------------------------------------
+
+local texCornerFrame
+local TEXCORNER_SHEET = "Interface\\AddOns\\WeakestAuras\\textures\\RaidTargetIcons"
+
+-- GetTexCoord's arity is itself an answer: eight returns mean the engine keeps
+-- per-corner texcoords, four mean the corner form collapsed into a rect.
+local function cornerProbeTexCoords(name, tex)
+	local ok, a, b, c, d, e, f, g, h = pcall(tex.GetTexCoord, tex)
+	if not ok then
+		D.Log("  " .. name .. " tc: GetTexCoord failed (" .. tostring(a) .. ")")
+		return
+	end
+	local vals = { a, b, c, d, e, f, g, h }
+	local count, text = 0, ""
+	for i = 1, 8 do
+		if type(vals[i]) == "number" then
+			count = i
+			text = text .. string.format("%.3f ", vals[i])
+		end
+	end
+	D.Log("  " .. name .. " tc: " .. count .. " values -- " .. text)
+end
+
+local function cornerProbeQuad(name, tex)
+	if not tex.GetCorners then
+		D.Log("  " .. name .. " quad: GetCorners absent (older DLL build)")
+		return
+	end
+	local ok, blx, bly, tlx, tly, brx, bry, trx, try2, rt, rl, rb, rr = pcall(tex.GetCorners, tex)
+	if not ok or type(blx) ~= "number" then
+		D.Log("  " .. name .. " quad: unavailable (" .. tostring(blx) .. ")")
+		return
+	end
+	local w, h = rr - rl, rb - rt
+	if w == 0 or h == 0 then
+		D.Log("  " .. name .. " quad: rect not resolved yet")
+		return
+	end
+	D.Log(string.format("  %s quad: BL(%.3f,%.3f) TL(%.3f,%.3f) BR(%.3f,%.3f) TR(%.3f,%.3f)",
+		name, (blx - rl) / w, (bly - rt) / h, (tlx - rl) / w, (tly - rt) / h,
+		(brx - rl) / w, (bry - rt) / h, (trx - rl) / w, (try2 - rt) / h))
+end
+
+local function cornerProbeBox(x, y, label)
+	local box = texProbeBox(texCornerFrame, x, y)
+	local tex = box:CreateTexture(nil, "ARTWORK")
+	tex:SetAllPoints(box)
+	tex:SetTexture(TEXCORNER_SHEET)
+	texProbeLabel(texCornerFrame, label, "TOP", box, "BOTTOM", 0, -4)
+	return tex
+end
+
+-- Shape a texture into the 0-90 wedge with the spinner's own corner math, so
+-- the fixture measures the code that would ship rather than a hand-written
+-- approximation. `applyOffsets` is the second writer.
+local function cornerProbeWedge(tex, applyOffsets)
+	local coord = WA.TextureCoords.Create(tex)
+	coord:SetAngle(96, 96, 0, 90)
+	tex:SetTexCoord(coord.ULx, coord.ULy, coord.LLx, coord.LLy,
+		coord.URx, coord.URy, coord.LRx, coord.LRy)
+	if applyOffsets then coord:Apply() end
+end
+
+function D.TexCornerProbe()
+	D.Log("--- texprobe corners ---")
+
+	if not texCornerFrame then
+		texCornerFrame = CreateFrame("Frame", nil, UIParent)
+		texCornerFrame:SetWidth(478); texCornerFrame:SetHeight(316)
+		texCornerFrame:SetPoint("CENTER", UIParent, "CENTER", 0, 60)
+		texCornerFrame:SetBackdrop({ bgFile = "Interface\\Buttons\\WHITE8X8" })
+		texCornerFrame:SetBackdropColor(0, 0, 0, 0.85)
+		texProbeLabel(texCornerFrame, "Corner-form SetTexCoord: read every box against the full-span reference",
+			"TOP", texCornerFrame, "TOP", 0, -10)
+
+		local COL = 110
+		local fixtures = {}
+
+		fixtures.full = cornerProbeBox(18, -34, "full span\n(reference sheet)")
+		fixtures.full:SetTexCoord(0, 0, 0, 1, 1, 0, 1, 1)
+
+		fixtures.cell = cornerProbeBox(18 + COL, -34, "corner .25 span\n(one cell? shrunk?)")
+		fixtures.cell:SetTexCoord(0, 0, 0, 0.25, 0.25, 0, 0.25, 0.25)
+
+		fixtures.cellRectOff = cornerProbeBox(18 + 2 * COL, -34, "same, rect mod OFF\n(box still full size?)")
+		texProbeCall(fixtures.cellRectOff, "SetTexCoordModifiesRect", false)
+		fixtures.cellRectOff:SetTexCoord(0, 0, 0, 0.25, 0.25, 0, 0.25, 0.25)
+
+		fixtures.inset = cornerProbeBox(18 + 3 * COL, -34, "inset .25-.75\n(crop anchored where?)")
+		fixtures.inset:SetTexCoord(0.25, 0.25, 0.25, 0.75, 0.75, 0.25, 0.75, 0.75)
+
+		-- Full bounding span, one corner pulled in: a crop keyed on the span
+		-- leaves this box alone, so whether the art shears separates true
+		-- per-corner sampling from bounding-rect sampling.
+		fixtures.shear = cornerProbeBox(18, -174, "LR pulled to u .5\n(art sheared?)")
+		fixtures.shear:SetTexCoord(0, 0, 0, 1, 1, 0, 0.5, 1)
+
+		fixtures.swap90 = cornerProbeBox(18 + COL, -174, "90 deg corner swap\n(sheet turned)")
+		fixtures.swap90:SetTexCoord(0, 1, 1, 1, 0, 0, 1, 0)
+
+		fixtures.wedgeTC = cornerProbeBox(18 + 2 * COL, -174, "wedge 0-90 texcoords\n(no vertex offsets)")
+		cornerProbeWedge(fixtures.wedgeTC, false)
+
+		if WA.hasTextureTransforms then
+			fixtures.wedgeBoth = cornerProbeBox(18 + 3 * COL, -174, "wedge tc + offsets\n(two writers)")
+			cornerProbeWedge(fixtures.wedgeBoth, true)
+		end
+
+		texCornerFrame._fixtures = fixtures
+		texCornerFrame._order = {
+			"full", "cell", "cellRectOff", "inset", "shear", "swap90", "wedgeTC", "wedgeBoth",
+		}
+		texCornerFrame._scratch = texCornerFrame:CreateTexture(nil, "ARTWORK")
+	end
+	texCornerFrame:Show()
+
+	local getOK, defaultValue = texProbeCall(texCornerFrame._scratch, "GetTexCoordModifiesRect")
+	D.Log("  GetTexCoordModifiesRect default: " .. tostring(defaultValue) .. (getOK and "" or " (call failed)"))
+	D.Log("  sheet: " .. TEXCORNER_SHEET .. " -- every box draws it; only the texcoords differ")
+	D.Log("  quad numbers are box fractions; an untouched quad reads BL(0,1) TL(0,0) BR(1,1) TR(1,0)")
+
+	local function dumpAll(when)
+		D.Log("  [" .. when .. "]")
+		for _, name in ipairs(texCornerFrame._order) do
+			local tex = texCornerFrame._fixtures[name]
+			if tex then
+				cornerProbeTexCoords(name, tex)
+				cornerProbeQuad(name, tex)
+			end
+		end
+	end
+
+	-- The corner array fills on the layout resolve that follows this call, so
+	-- the dumps wait a tick. The second pass answers whether a two-writer quad
+	-- settles or keeps moving.
+	C_Timer.After(0.2, function() dumpAll("resolved") end)
+	C_Timer.After(1.2, function()
+		dumpAll("one second later")
+		D.Log("--- end texprobe corners ---")
+	end)
+end
+
+-- ---------------------------------------------------------------------------
+-- /wa progtex [id] -- what a circular progress texture's two spinners are
+-- actually made of.
+--
+-- The headless harness resolves every one of these correctly, so a wedge that
+-- looks wrong in the client is a disagreement between the region's state and
+-- what the client draws from it. This prints the state so the two can be
+-- compared: which family is drawing, what each spinner carries, the angle pair
+-- each was handed, and per wedge texture its visibility, texcoords and the
+-- drawn corners the client resolved (GetCorners, normalized to the region's
+-- own rect, so an untouched quad reads BL(0,1) TL(0,0) BR(1,1) TR(1,0)).
+-- ---------------------------------------------------------------------------
+
+local function progTexDumpSpinner(label, region, spinner)
+	if not spinner then D.Log("  " .. label .. ": absent"); return end
+	D.Log(string.format("  %s: %s  angles %s..%s  size %s x %s  crop %s/%s rot %s mirror %s",
+		label, tostring(spinner.textures[1]:GetTexture()),
+		tostring(spinner.angle1), tostring(spinner.angle2),
+		tostring(spinner.width), tostring(spinner.height),
+		tostring(spinner.crop_x), tostring(spinner.crop_y),
+		tostring(spinner.texRotation), tostring(spinner.mirror)))
+	for i = 1, 3 do
+		local tex = spinner.textures[i]
+		if tex:IsShown() then
+			local a, b, c, d, e, f, g, h = tex:GetTexCoord()
+			D.Log(string.format("    t%d tc UL(%.3f,%.3f) LL(%.3f,%.3f) UR(%.3f,%.3f) LR(%.3f,%.3f)",
+				i, a or 0, b or 0, c or 0, d or 0, e or 0, f or 0, g or 0, h or 0))
+			if tex.GetCorners then
+				local ok, blx, bly, tlx, tly, brx, bry, trx, try2, rt, rl, rb, rr = pcall(tex.GetCorners, tex)
+				local w = (ok and type(rr) == "number") and (rr - rl) or 0
+				local hh = (ok and type(rb) == "number") and (rb - rt) or 0
+				if w ~= 0 and hh ~= 0 then
+					D.Log(string.format("    t%d quad BL(%.3f,%.3f) TL(%.3f,%.3f) BR(%.3f,%.3f) TR(%.3f,%.3f)",
+						i, (blx - rl) / w, (bly - rt) / hh, (tlx - rl) / w, (tly - rt) / hh,
+						(brx - rl) / w, (bry - rt) / hh, (trx - rl) / w, (try2 - rt) / hh))
+				else
+					D.Log("    t" .. i .. " quad: rect not resolved")
+				end
+			end
+		else
+			D.Log("    t" .. i .. " hidden")
+		end
+	end
+end
+
+function D.ProgTex(rest)
+	D.Log("--- progtex ---")
+	local wanted = rest ~= "" and rest or nil
+	local found = 0
+	for id, data in pairs(WeakestAurasDB.displays or {}) do
+		if data.regionType == "progresstexture" and (not wanted or id == wanted) then
+			local region = WA.PeekRegion(id, "")
+			if region then
+				found = found + 1
+				D.Log(string.format("%s: orientation %s progress %s arc %s..%s",
+					id, tostring(region.orientation), tostring(region.progress),
+					tostring(region.startAngle), tostring(region.endAngle)))
+				D.Log(string.format("  region %sx%s  plain fg %s  plain bg %s  crop %s/%s",
+					tostring(region.regionWidth), tostring(region.regionHeight),
+					region.foreground:IsShown() and "SHOWN" or "hidden",
+					region.background:IsShown() and "SHOWN" or "hidden",
+					tostring(region.crop_x), tostring(region.crop_y)))
+				progTexDumpSpinner("foreground", region, region.foregroundSpinner)
+				progTexDumpSpinner("background", region, region.backgroundSpinner)
+			end
+		end
+	end
+	if found == 0 then D.Log("  no progresstexture region is live" .. (wanted and (" named " .. wanted) or "")) end
+	D.Log("--- end progtex ---")
 end
 
 -- ---------------------------------------------------------------------------
@@ -2182,56 +2914,84 @@ end
 -- stays a command so a client patch can be re-tested in one keystroke rather
 -- than re-argued.
 --
--- The inline texture escape is the one that decided a feature. An engine that
+-- The inline texture escape is the one that decides a feature. An engine that
 -- does not honour |T...|t prints the texture path as text instead, which is
 -- machine-checkable without an eye because the two outcomes have wildly
 -- different string widths -- an icon is about one line wide, the literal path is
--- thirty-odd characters. Four escape forms are measured, since a client could
--- honour the sized form and not the auto-sized one; this one honours none. The
--- SimpleHTML and message-frame sections then ask whether any *other* text widget
--- has an inline-image path. None does.
+-- thirty-odd characters. Several escape forms are measured, since a client could
+-- honour the sized form and not the auto-sized one. The SimpleHTML and
+-- message-frame sections then ask whether any *other* text widget has an
+-- inline-image path.
 --
--- Then the two Text-region unknowns (does GetHeight track wrapped text -- it
--- does, wrapping included) and the font list's own read-backs.
+-- The coin measurements answer a separate question from the escape's: whether
+-- the three MoneyFrame art files resolve on this client at all. An escape whose
+-- path the client cannot load still measures as an icon, so a coin has to be
+-- read against a path known to exist rather than against the literal-text
+-- width.
+--
+-- Then the height readings -- GetHeight against the engine's own
+-- GetStringHeight, including a string carrying an icon TALLER than its font,
+-- which is the one case the two can disagree on -- and the font list's own
+-- read-backs.
 -- ---------------------------------------------------------------------------
 
 local textProbeFrame
 local TEXTPROBE_ICON = "Interface\\Icons\\INV_Misc_QuestionMark"
+-- 1.12 has no per-coin UI-GoldIcon/UI-SilverIcon/UI-CopperIcon files -- those
+-- are a later-expansion split. Vanilla ships ONE 64x16 sheet of four 16px
+-- cells and FrameXML crops it, so the escape addresses a cell through its
+-- texW:texH:left:right:top:bottom tail: a 4x1 grid, cell index per coin.
+local TEXTPROBE_COINS = {
+	{ name = "gold", cell = "4:1:0:1:0:1" },
+	{ name = "silver", cell = "4:1:1:2:0:1" },
+	{ name = "copper", cell = "4:1:2:3:0:1" },
+}
+local TEXTPROBE_COIN_SHEET = "Interface\\MoneyFrame\\UI-MoneyIcons"
 
 function D.TextProbe()
 	D.Log("--- textprobe ---")
 
 	if not textProbeFrame then
 		textProbeFrame = CreateFrame("Frame", nil, UIParent)
-		textProbeFrame:SetWidth(320); textProbeFrame:SetHeight(90)
+		textProbeFrame:SetWidth(400); textProbeFrame:SetHeight(340)
 		textProbeFrame:SetPoint("CENTER", UIParent, "CENTER", 0, -160)
 		textProbeFrame:SetBackdrop({ bgFile = "Interface\\Buttons\\WHITE8X8" })
 		textProbeFrame:SetBackdropColor(0, 0, 0, 0.7)
 		textProbeFrame.lines = {}
-		for i = 1, 4 do
+		for i = 1, 9 do
 			local fs = textProbeFrame:CreateFontString(nil, "OVERLAY")
 			fs:SetFont("Fonts\\FRIZQT__.TTF", 12, "")
 			fs:SetJustifyH("LEFT")
 			fs:SetPoint("TOPLEFT", 8, -6 - (i - 1) * 20)
 			textProbeFrame.lines[i] = fs
 		end
+		-- A scratch string with no size of its own, so GetStringWidth reports
+		-- what the engine actually laid out rather than a width we imposed, and
+		-- a scratch texture for the coin paths. Both are kept on the frame:
+		-- nothing here can be destroyed, so a re-run must reuse them.
+		textProbeFrame.scratch = textProbeFrame:CreateFontString(nil, "OVERLAY")
+		textProbeFrame.scratchTex = textProbeFrame:CreateTexture(nil, "OVERLAY")
 	end
 	textProbeFrame:Show()
 
-	-- A scratch string with no size of its own, so GetStringWidth reports what
-	-- the engine actually laid out rather than a width we imposed.
-	local scratch = textProbeFrame:CreateFontString(nil, "OVERLAY")
+	local scratch = textProbeFrame.scratch
+	scratch:SetWidth(0)
 	scratch:SetFont("Fonts\\FRIZQT__.TTF", 12, "")
 
 	scratch:SetText("M")
 	local emWidth = scratch:GetStringWidth() or 0
 	D.Log(string.format("  reference: one 12px 'M' is %.1fpx wide", emWidth))
 
+	-- No live markup in a label. Once escapes render, a name written as
+	-- "|T<path>:0|t" stops being a description of the form and becomes an
+	-- instance of it -- pointing at a file called "<path>", which draws the
+	-- missing-texture box beside every row it labels and reads as a rendering
+	-- fault in the thing being probed. Same rule for anything sent to chat.
 	local forms = {
-		{ name = "auto  |T<path>:0|t", text = "|T" .. TEXTPROBE_ICON .. ":0|t" },
-		{ name = "sized |T<path>:14|t", text = "|T" .. TEXTPROBE_ICON .. ":14|t" },
-		{ name = "h:w   |T<path>:14:14|t", text = "|T" .. TEXTPROBE_ICON .. ":14:14|t" },
-		{ name = "offs  |T<path>:14:14:0:0|t", text = "|T" .. TEXTPROBE_ICON .. ":14:14:0:0|t" },
+		{ name = "auto  <path>:0", text = "|T" .. TEXTPROBE_ICON .. ":0|t" },
+		{ name = "sized <path>:14", text = "|T" .. TEXTPROBE_ICON .. ":14|t" },
+		{ name = "h:w   <path>:14:14", text = "|T" .. TEXTPROBE_ICON .. ":14:14|t" },
+		{ name = "offs  <path>:14:14:0:0", text = "|T" .. TEXTPROBE_ICON .. ":14:14:0:0|t" },
 	}
 	local anyRendered = false
 	for i = 1, table.getn(forms) do
@@ -2248,24 +3008,363 @@ function D.TextProbe()
 		end
 	end
 	D.Log("  verdict: inline texture escapes " ..
-		(anyRendered and "WORK in a FontString here -- which contradicts the recorded answer"
-		 or "do not work in a FontString here (the recorded answer)"))
+		(anyRendered and "WORK in a FontString here (the recorded answer)"
+		 or "do not work in a FontString here -- which contradicts the recorded answer"))
 	D.Log("  ICON_LIST = " .. type(ICON_LIST) .. ", ICON_TAG_LIST = " .. type(ICON_TAG_LIST))
 
-	-- Height. Upstream's auto-width text region measures GetStringHeight, which
-	-- this client does not have; whether GetHeight stands in for it decides
-	-- whether an auto-sized text region is possible at all.
-	scratch:SetText("one line")
-	local h1 = scratch:GetHeight() or 0
-	scratch:SetText("a\nb\nc")
-	local h3 = scratch:GetHeight() or 0
-	D.Log(string.format("  GetHeight: 1 line = %.1f, 3 lines = %.1f -- %s", h1, h3,
-		(h3 > h1 * 2) and "tracks the rendered text" or "does NOT track line count"))
+	-- What the addon resolved at load, beside what the probe just measured. A
+	-- disagreement is the interesting outcome: the flag also carries a version
+	-- gate, and the kill switch can be thrown between load and this run.
+	D.Log(string.format("  WA.hasInlineText = %s, WA.hasStringHeight = %s, FontString:SetRotation = %s",
+		tostring(WA.hasInlineText), tostring(WA.hasStringHeight), type(scratch.SetRotation)))
+	D.Log("  FeatureGate('inlineText') = " .. tostring(WA.FeatureGate("inlineText"))
+		.. ", ClassicAPI " .. tostring(WA.ClassicAPIVersionString()))
+
+	-- The Money format's coin art. A width measurement cannot answer this one:
+	-- the escape's advance is counted before the file is loaded, so a path that
+	-- does not exist still measures as an icon. The SetTexture read-back is what
+	-- separates "no such file" from "renders" -- clear first, because a refused
+	-- path leaves whatever the texture already held.
+	local coinTex = textProbeFrame.scratchTex
+	coinTex:SetTexture(nil)
+	coinTex:SetTexture(TEXTPROBE_COIN_SHEET)
+	D.Log("  coin sheet " .. TEXTPROBE_COIN_SHEET .. " -> "
+		.. (coinTex:GetTexture() and "RESOLVES" or "REFUSED -- no such file here"))
+	coinTex:SetTexture(nil)
+	for i = 1, table.getn(TEXTPROBE_COINS) do
+		local coin = TEXTPROBE_COINS[i]
+		local esc = "|T" .. TEXTPROBE_COIN_SHEET .. ":0:0:0:0:" .. coin.cell .. "|t"
+		scratch:SetText(esc)
+		D.Log(string.format("  coin %s cell %s -> %.1fpx escape", coin.name, coin.cell,
+			scratch:GetStringWidth() or 0))
+		local line = textProbeFrame.lines[4 + i]
+		if line then line:SetText(coin.name .. "  12" .. esc .. " 34") end
+	end
+	D.Log("  GetCoinTextureString = " .. type(GetCoinTextureString)
+		.. ", GOLD_AMOUNT_TEXTURE = " .. type(GOLD_AMOUNT_TEXTURE))
+
+	-- Height. GetStringHeight is the engine's own reading and GetHeight is the
+	-- region's; they agree on plain text. A TALL icon is where they can part,
+	-- since only GetStringHeight is documented to count the line growth an icon
+	-- bigger than its font forces -- which decides whether auto-sizing a string
+	-- carrying %i needs the engine reading or can keep the region one.
+	local function stringHeight(fs)
+		if type(fs.GetStringHeight) ~= "function" then return nil end
+		local ok, h = pcall(fs.GetStringHeight, fs)
+		return ok and h or nil
+	end
+	local function reportHeights(label, text)
+		scratch:SetText(text)
+		local gh = scratch:GetHeight() or 0
+		local sh = stringHeight(scratch)
+		D.Log(string.format("  %s: GetHeight = %.1f, GetStringHeight = %s", label, gh,
+			sh and string.format("%.1f", sh) or "absent"))
+		return gh, sh
+	end
+
+	local h1 = reportHeights("1 line", "one line")
+	local h3 = reportHeights("3 lines", "a\nb\nc")
+	D.Log("  -> GetHeight " .. ((h3 > h1 * 2) and "tracks line count" or "does NOT track line count"))
+
+	local hPlainGet, hPlainString = reportHeights("plain 12px", "Mg")
+	local hTallGet, hTallString = reportHeights("with a :32 icon", "Mg|T" .. TEXTPROBE_ICON .. ":32|t")
+	D.Log("  -> a tall icon grows GetHeight: " .. ((hTallGet > hPlainGet * 1.5) and "YES" or "NO"))
+	D.Log("  -> a tall icon grows GetStringHeight: " ..
+		((not hTallString or not hPlainString) and "n/a, method absent"
+		 or (hTallString > hPlainString * 1.5) and "YES" or "NO"))
+	if textProbeFrame.lines[8] then
+		textProbeFrame.lines[8]:SetText("tall  Mg|T" .. TEXTPROBE_ICON .. ":32|t Mg")
+	end
+	if textProbeFrame.lines[9] then
+		textProbeFrame.lines[9]:SetText("tint  |T" .. TEXTPROBE_ICON .. ":0:0:0:0:64:64:4:60:4:60:255:64:64|t red?")
+	end
+
+	-- Scale. An inline icon is an engine region the DLL anchors to the owning
+	-- FontString, and it converts its placement offsets through the region's
+	-- effective scale chain -- so a FontString on a scaled frame is the one
+	-- shape this panel's own unscaled rows cannot speak for, and it is the shape
+	-- every aura has (region scale, group scale, uiScale). Three nestings of the
+	-- same string, read against each other.
+	if not textProbeFrame.scaleRows then
+		textProbeFrame.scaleRows = {}
+		local scales = { 1, 0.75, 1.5 }
+		for i = 1, table.getn(scales) do
+			local host = CreateFrame("Frame", nil, textProbeFrame)
+			host:SetWidth(120); host:SetHeight(20)
+			host:SetPoint("TOPLEFT", textProbeFrame, "TOPLEFT", 200, -6 - (i - 1) * 24)
+			host:SetScale(scales[i])
+			local fs = host:CreateFontString(nil, "OVERLAY")
+			fs:SetFont("Fonts\\FRIZQT__.TTF", 12, "")
+			fs:SetJustifyH("LEFT")
+			fs:SetPoint("LEFT", host, "LEFT", 0, 0)
+			fs:SetText("x" .. scales[i] .. " A|T" .. TEXTPROBE_ICON .. ":0|t B")
+			textProbeFrame.scaleRows[i] = fs
+		end
+	end
+
+	-- Font-size sweep, testing whether the glyph artifacts on text FOLLOWING an
+	-- icon track the icon advance's fractional part. The DLL reserves
+	-- `w + 1.5 * fontH * 0.18` per icon and hands the result to the next run
+	-- unsnapped, so a fractional advance leaves every following glyph rounding
+	-- off a fractional pen.
+	--
+	-- The advance is MEASURED, not computed: the DLL's fontH comes from the
+	-- engine's own size mapping rather than from the size passed to SetFont, so
+	-- arithmetic on the requested size predicts the wrong fraction. Differencing
+	-- two GetStringWidth readings over the same letters gives the real one.
+	if not textProbeFrame.sizeRows then
+		textProbeFrame.sizeRows = {}
+		for i = 10, 16 do
+			local fs = textProbeFrame:CreateFontString(nil, "OVERLAY")
+			fs:SetFont("Fonts\\FRIZQT__.TTF", i, "")
+			fs:SetJustifyH("LEFT")
+			fs:SetPoint("TOPLEFT", textProbeFrame, "TOPLEFT", 200, -90 - (i - 10) * 19)
+			fs:SetText(i .. "px HH|T" .. TEXTPROBE_ICON .. ":0|t HHHH")
+			textProbeFrame.sizeRows[i] = fs
+		end
+	end
+	for size = 10, 16 do
+		scratch:SetFont("Fonts\\FRIZQT__.TTF", size, "")
+		scratch:SetText("HHHHHH")
+		local plain = scratch:GetStringWidth() or 0
+		scratch:SetText("HH|T" .. TEXTPROBE_ICON .. ":0|tHHHH")
+		local withIcon = scratch:GetStringWidth() or 0
+		local advance = withIcon - plain
+		D.Log(string.format("  %dpx icon advance = %.3fpx, fraction %.3f", size, advance,
+			advance - math.floor(advance)))
+	end
+	scratch:SetFont("Fonts\\FRIZQT__.TTF", 12, "")
+
+	-- Edge bleed. The artifact is a small mark touching the icon rather than
+	-- anything spread across the following glyphs, so the suspect is the icon
+	-- REGION's own rect: it is placed at fractional coordinates (the pool
+	-- converges its offsets against an effective-scale chain), and a quad
+	-- sampling a texture across a non-integer boundary smears its outermost
+	-- texels outward. INV_Misc_QuestionMark is bordered in near-black, which is
+	-- what such a sliver would be made of.
+	--
+	-- Cropping is the discriminator: pulling the sampled rect inside the art's
+	-- own border leaves no border texel to bleed. If the uncropped row marks and
+	-- the cropped ones do not, it is edge bleed and the fix is a half-texel
+	-- inset in the DLL's texcoords rather than anything about the pen.
+	if not textProbeFrame.edgeRows then
+		textProbeFrame.edgeRows = {}
+		local variants = {
+			{ label = "full  ", tail = "16:16" },
+			{ label = "crop 4", tail = "16:16:0:0:64:64:4:60:4:60" },
+			{ label = "crop 8", tail = "16:16:0:0:64:64:8:56:8:56" },
+		}
+		for i = 1, table.getn(variants) do
+			local fs = textProbeFrame:CreateFontString(nil, "OVERLAY")
+			fs:SetFont("Fonts\\FRIZQT__.TTF", 12, "")
+			fs:SetJustifyH("LEFT")
+			fs:SetPoint("TOPLEFT", textProbeFrame, "TOPLEFT", 8, -192 - (i - 1) * 20)
+			fs:SetText(variants[i].label .. " HH|T" .. TEXTPROBE_ICON
+				.. ":" .. variants[i].tail .. "|tHHHH")
+			textProbeFrame.edgeRows[i] = fs
+		end
+
+		-- The control every icon row above lacks: the same glyphs at the same
+		-- sizes with NO escape anywhere on the line. Marks here too would mean
+		-- the artifacts hunted through this panel were never about inline icons
+		-- at all, and belong to this client's text rendering or to another addon.
+		for i = 1, 2 do
+			local fs = textProbeFrame:CreateFontString(nil, "OVERLAY")
+			fs:SetFont("Fonts\\FRIZQT__.TTF", i == 1 and 20 or 32, "")
+			fs:SetJustifyH("LEFT")
+			fs:SetPoint("TOPLEFT", textProbeFrame, "TOPLEFT", 8, -256 - (i - 1) * 34)
+			fs:SetText((i == 1 and "20px" or "32px") .. " no icon HH 12px")
+		end
+	end
+
+	-- The SetFont size ceiling, and whether SetTextHeight is the way past it.
+	-- Past the ceiling the client rasterises at the ceiling and ignores the size
+	-- asked for, so text simply stops growing with nothing to report a failure --
+	-- a width sweep is the only way to find where it sits, since a clamped size
+	-- lays out exactly like the one below it.
+	--
+	-- The second reading is the one auto-sizing depends on: SetTextHeight scales
+	-- what was rasterised, and whether the scaled string MEASURES bigger as well
+	-- as DRAWING bigger decides whether a text region in Auto mode can size itself
+	-- to a font above the ceiling.
+	local function sweepWidth(path, size)
+		scratch:SetFont(path, size, "")
+		scratch:SetText("HHHHHH")
+		return scratch:GetStringWidth() or 0
+	end
+	local SWEEP_SIZES = { 8, 12, 16, 20, 24, 32, 48, 64 }
+	local sweepFonts = {
+		{ name = "Friz Quadrata", path = "Fonts\\FRIZQT__.TTF" },
+		{ name = "Roboto Mono", path = "Interface\\AddOns\\WeakestAuras\\fonts\\RobotoMono.ttf" },
+	}
+	for i = 1, table.getn(sweepFonts) do
+		local path = sweepFonts[i].path
+		local parts, ceiling, last = {}, SWEEP_SIZES[1], sweepWidth(path, SWEEP_SIZES[1])
+		table.insert(parts, string.format("%d=%.0f", SWEEP_SIZES[1], last))
+		for j = 2, table.getn(SWEEP_SIZES) do
+			local size = SWEEP_SIZES[j]
+			local w = sweepWidth(path, size)
+			if w > last + 0.5 then ceiling = size end
+			last = w
+			table.insert(parts, string.format("%d=%.0f", size, w))
+		end
+		D.Log("  [size] " .. sweepFonts[i].name .. ": " .. table.concat(parts, " "))
+		D.Log(string.format("  -> SetFont stops widening above %dpx%s", ceiling,
+			(ceiling >= SWEEP_SIZES[table.getn(SWEEP_SIZES)]) and " (no ceiling in range)" or ""))
+
+		scratch:SetFont(path, 48, "")
+		scratch:SetText("HHHHHH")
+		local before = scratch:GetStringWidth() or 0
+		scratch:SetTextHeight(48)
+		local after = scratch:GetStringWidth() or 0
+		D.Log(string.format("  -> SetTextHeight(48) after SetFont(48): %.0f -> %.0f (%s)",
+			before, after, (after > before + 0.5) and "measures bigger too"
+			or "draws scaled, measures unchanged"))
+	end
+	scratch:SetFont("Fonts\\FRIZQT__.TTF", 12, "")
+
+	-- Which ORDER of the SetFont/SetTextHeight pair actually draws at the size
+	-- asked for. Every row gets a FRESH FontString: a height override survives on
+	-- the one it was set on, and reusing a string carries the previous row's
+	-- override into the next one -- which is exactly how the first run of this
+	-- panel misread itself.
+	--
+	-- Row 1 is the plain request, the one that does not grow. Rows 2 and 3 ask for
+	-- a height EQUAL to the size SetFont was given, before and after the string;
+	-- row 4 asks for one that differs. Read the WIDTHS: the rows that scale
+	-- measure wider, and the difference between rows 2/3 and row 4 is the whole
+	-- reason textCore rasterises at the ceiling rather than at the size asked for.
+	local HEIGHT_ORDERS = {
+		{ label = "font 40", font = 40 },
+		{ label = "font 40 + h40 pre", font = 40, height = 40, before = true },
+		{ label = "font 40 + h40 post", font = 40, height = 40 },
+		{ label = "font 17 + h40 post", font = 17, height = 40 },
+	}
+	local function applyOrder(fs, order, text)
+		fs:SetFont("Fonts\\FRIZQT__.TTF", order.font, "")
+		if order.height and order.before then fs:SetTextHeight(order.height) end
+		fs:SetText(text)
+		if order.height and not order.before then fs:SetTextHeight(order.height) end
+	end
+	if not textProbeFrame.orderScratch then
+		textProbeFrame.orderScratch = {}
+		for i = 1, table.getn(HEIGHT_ORDERS) do
+			local fs = textProbeFrame:CreateFontString(nil, "BACKGROUND")
+			fs:SetAlpha(0)
+			fs:SetPoint("TOPLEFT", textProbeFrame, "TOPLEFT", 8, 40)
+			textProbeFrame.orderScratch[i] = fs
+		end
+	end
+	for i = 1, table.getn(HEIGHT_ORDERS) do
+		local order = HEIGHT_ORDERS[i]
+		local fs = textProbeFrame.orderScratch[i]
+		applyOrder(fs, order, "HHHHHH")
+		local face, reported = fs:GetFont()
+		D.Log(string.format("  [order] %-20s width %.1f, GetFont %s @ %s",
+			order.label, fs:GetStringWidth() or 0,
+			tostring(face and string.gsub(face, ".*\\", "") or "NONE"), tostring(reported)))
+	end
+	D.Log("  -> textCore's measured size ceiling: "
+		.. tostring(WA.textCore and WA.textCore.SizeCeiling and WA.textCore.SizeCeiling()))
+
+	-- Whether a face swap still lands on a string that is already scaled. If it
+	-- does not, changing font or outline on a big aura would silently do nothing --
+	-- every aura above the ceiling carries a height override for life.
+	if not textProbeFrame.swapScratch then
+		textProbeFrame.swapScratch = textProbeFrame:CreateFontString(nil, "BACKGROUND")
+		textProbeFrame.swapScratch:SetAlpha(0)
+		textProbeFrame.swapScratch:SetPoint("TOPLEFT", textProbeFrame, "TOPLEFT", 8, 40)
+	end
+	local swap = textProbeFrame.swapScratch
+	applyOrder(swap, HEIGHT_ORDERS[4], "HHHHHH")
+	local scaledW = swap:GetStringWidth() or 0
+	swap:SetFont("Interface\\AddOns\\WeakestAuras\\fonts\\RobotoMono.ttf", 17, "")
+	swap:SetTextHeight(40)
+	local swapFace = swap:GetFont()
+	D.Log(string.format("  [swap] scaled %.1f -> face swap %.1f, now %s", scaledW,
+		swap:GetStringWidth() or 0,
+		tostring(swapFace and string.gsub(swapFace, ".*\\", "") or "NONE")))
+
+	-- What the ceiling IS. The rasteriser's limit is in device pixels, not in the
+	-- units SetFont takes, so the ceiling above is only this client at this
+	-- resolution and this UI scale -- and the conversion is what makes it
+	-- reportable to whoever owns the rasteriser.
+	-- Parenthesised: gsub returns the count as a second value, and tonumber would
+	-- take it as a base.
+	local physH = tonumber((string.gsub(GetCVar("gxResolution") or "", ".*x", ""))) or 0
+	local unitH = GetScreenHeight() or 0
+	local pxPerUnit = (unitH > 0) and (physH / unitH) or 0
+	local ceilingUnits = WA.textCore and WA.textCore.SizeCeiling and WA.textCore.SizeCeiling()
+	D.Log(string.format("  [scale] %s, screen %.0f units, uiScale %s, %.3f px/unit",
+		tostring(GetCVar("gxResolution")), unitH, tostring(GetCVar("uiScale")), pxPerUnit))
+	if ceilingUnits then
+		D.Log(string.format("  -> the %d-unit ceiling is %.1f device px", ceilingUnits,
+			ceilingUnits * pxPerUnit))
+	end
+
+	-- Whether that ceiling is counted in device pixels or in font units, which is
+	-- the difference between "no lever exists" and "a scaled host frame buys
+	-- sharpness". A frame scaled 2x doubles the device pixels a given font size
+	-- asks for: if the limit is in pixels the plateau halves in units, if it is in
+	-- units it does not move.
+	if not textProbeFrame.scaledHost then
+		textProbeFrame.scaledHost = CreateFrame("Frame", nil, textProbeFrame)
+		textProbeFrame.scaledHost:SetWidth(10); textProbeFrame.scaledHost:SetHeight(10)
+		textProbeFrame.scaledHost:SetPoint("TOPLEFT", textProbeFrame, "TOPLEFT", 8, 40)
+		textProbeFrame.scaledHost:SetScale(2)
+		textProbeFrame.scaledProbe = textProbeFrame.scaledHost:CreateFontString(nil, "BACKGROUND")
+		textProbeFrame.scaledProbe:SetAlpha(0)
+		textProbeFrame.scaledProbe:SetPoint("TOPLEFT", textProbeFrame.scaledHost, "TOPLEFT", 0, 0)
+	end
+	local scaledPlateau, scaledLast = nil, nil
+	for size = 6, 40 do
+		textProbeFrame.scaledProbe:SetFont("Fonts\\FRIZQT__.TTF", size, "")
+		textProbeFrame.scaledProbe:SetText("HHHHHH")
+		local w = textProbeFrame.scaledProbe:GetStringWidth() or 0
+		if scaledLast and w > scaledLast + 0.5 then scaledPlateau = size end
+		scaledLast = w
+	end
+	D.Log("  [scale] the ceiling on a 2x-scaled frame: " .. tostring(scaledPlateau)
+		.. " units -- halved means the limit is DEVICE PIXELS, unchanged means FONT UNITS")
+
+	-- Whether a font object built by the client itself escapes the cap. FrameXML
+	-- creates its big faces (zone text at 32) at load; if those carry a bigger
+	-- glyph cache than SetFont will build, picking one is a way to draw big text
+	-- sharply and the font list would grow a few fixed-size entries.
+	local objProbe = textProbeFrame.orderScratch[1]
+	if ZoneTextFont then
+		objProbe:SetFontObject(ZoneTextFont)
+		objProbe:SetText("HHHHHH")
+		local objPath, objSize = objProbe:GetFont()
+		local objW = objProbe:GetStringWidth() or 0
+		objProbe:SetFont(objPath or "Fonts\\FRIZQT__.TTF", objSize or 32, "")
+		objProbe:SetText("HHHHHH")
+		D.Log(string.format("  [fontobject] ZoneTextFont @ %s: width %.1f, same face via SetFont: %.1f%s",
+			tostring(objSize), objW, objProbe:GetStringWidth() or 0,
+			(objW > (objProbe:GetStringWidth() or 0) + 0.5) and "  <- IT ESCAPES THE CAP" or ""))
+	end
+
+	-- The same four for the eye, since a width reading cannot say whether the
+	-- GLYPHS grew or only the spacing between them did -- which is the difference
+	-- between text that got bigger and text that got stretched.
+	if not textProbeFrame.heightRows then
+		textProbeFrame.heightRows = {}
+		for i = 1, table.getn(HEIGHT_ORDERS) do
+			local fs = textProbeFrame:CreateFontString(nil, "OVERLAY")
+			fs:SetJustifyH("LEFT")
+			fs:SetPoint("TOPLEFT", textProbeFrame, "TOPLEFT", 8, -300 - (i - 1) * 46)
+			applyOrder(fs, HEIGHT_ORDERS[i], "Ag " .. i)
+			textProbeFrame.heightRows[i] = fs
+		end
+		textProbeFrame:SetHeight(520)
+	end
 
 	scratch:SetWidth(120)
 	scratch:SetText("a long enough string that it has to wrap across several lines at this width")
 	local hWrap = scratch:GetHeight() or 0
-	D.Log(string.format("  GetHeight at width 120 with wrapping text = %.1f -- %s", hWrap,
+	local sWrap = stringHeight(scratch)
+	D.Log(string.format("  wrapping at width 120: GetHeight = %.1f, GetStringHeight = %s -- %s",
+		hWrap, sWrap and string.format("%.1f", sWrap) or "absent",
 		(hWrap > h1 * 1.5) and "sees the wrap" or "does NOT see the wrap"))
 	scratch:SetWidth(0)
 
@@ -2358,16 +3457,23 @@ function D.TextProbe()
 		D.Log("  MessageFrame regions escape -> " .. describe(escKinds))
 	end
 
-	-- The chat frame is a ScrollingMessageFrame and is the one widget Blizzard
-	-- would have needed an escape parser for. Straight to the user's own chat,
-	-- since that is the honest test of it.
+	-- The chat frame is a ScrollingMessageFrame. It carries an anti-spoof rule
+	-- the other widgets do not: the DLL strips a |T an addon injects into chat,
+	-- so a path here is the designed outcome rather than a missing parser.
 	DEFAULT_CHAT_FRAME:AddMessage("WA textprobe -- chat escape test: [|T" .. TEXTPROBE_ICON
-		.. ":0|t] <- an icon between the brackets, or a path?")
+		.. ":0|t] <- an icon between the brackets, a path, or nothing?")
 
-	D.Log("  a chat line was printed: if it shows an icon between the brackets, a")
-	D.Log("  ScrollingMessageFrame honours escapes even though a FontString does not.")
-	D.Log("  panels are up under CENTER,0,-160: the escape forms, then SimpleHTML, then")
-	D.Log("  the MessageFrame. Report what each one reads as.")
+	D.Log("  a chat line was printed: an icon means a ScrollingMessageFrame honours")
+	D.Log("  escapes; nothing between the brackets means the chat anti-spoof stripped it.")
+	D.Log("  panels are up under CENTER,0,-160. Left column: the four escape forms, the")
+	D.Log("  three coins, a tall :32 icon, a red-tinted cropped icon. Right column: the")
+	D.Log("  same string at frame scale 1 / 0.75 / 1.5, then a font-size sweep 10..16px.")
+	D.Log("  Bottom left: the same icon uncropped, then cropped 4 and 8 texels in. All")
+	D.Log("  three are the same size, so only the sampled rect differs -- a mark on the")
+	D.Log("  uncropped row alone is the icon's own border texels bleeding past a")
+	D.Log("  fractional region edge. Under those, two rows with NO escape on the line at")
+	D.Log("  all -- the control: marks there mean none of this was about inline icons.")
+	D.Log("  SimpleHTML and the MessageFrame are below.")
 	D.Log("--- end textprobe ---")
 end
 
@@ -3329,6 +4435,10 @@ function D.HandleSlash(msg)
 		D.SwipeTest(rest)
 	elseif cmd == "swipenudge" then
 		D.SwipeNudge(rest)
+	elseif cmd == "swipestress" then
+		D.SwipeStress(rest)
+	elseif cmd == "edgetest" then
+		if string.lower(rest or "") == "state" then D.EdgeState() else D.EdgeTest(rest) end
 	elseif cmd == "track" then
 		D.Track(rest)
 	elseif cmd == "states" then
@@ -3360,7 +4470,9 @@ function D.HandleSlash(msg)
 	elseif cmd == "plateprobe" then
 		D.PlateProbe()
 	elseif cmd == "texprobe" then
-		D.TexProbe()
+		if string.lower(rest or "") == "corners" then D.TexCornerProbe() else D.TexProbe() end
+	elseif cmd == "progtex" then
+		D.ProgTex(rest)
 	elseif cmd == "levelprobe" then
 		D.LevelProbe()
 	elseif cmd == "wa2probe" then
@@ -3395,6 +4507,6 @@ function D.HandleSlash(msg)
 		ensureFrame()
 		frame:Hide()
 	else
-		D.Log("[debug] unknown command \"" .. cmd .. "\". Available: dump [unit] [filter], watch [unit], events [EVENT ...], auraprobe [unit|all], overflow [unit], timers, linkprobe, commprobe [charname|throttle [channel] [rate] [secs]], threat [send|query|tm|report|off], cdtest, swipetest [sizes/WxH...], swipenudge <k> [yflat], track <spellName>, states <id>, conditions <id>, gen <id>, load <id>, probe, soundprobe, gcd, cdprobe <spell>, ver [version], codeprobe, textprobe, texprobe, levelprobe, plateprobe, wa2probe, wa2 <string>, codelive, codetab <1-8|tabs>, codefont <6-16>, rows, regions, configtest, libs, addons, export <id>, import, clear, show, hide")
+		D.Log("[debug] unknown command \"" .. cmd .. "\". Available: dump [unit] [filter], watch [unit], events [EVENT ...], auraprobe [unit|all], overflow [unit], timers, linkprobe, commprobe [charname|throttle [channel] [rate] [secs]], threat [send|query|tm|report|off], cdtest, swipetest [sizes/WxH...], swipenudge <k> [yflat], swipestress [N], edgetest [state|0], track <spellName>, states <id>, conditions <id>, gen <id>, load <id>, probe, soundprobe, gcd, cdprobe <spell>, ver [version], codeprobe, textprobe, texprobe [corners], progtex [id], levelprobe, plateprobe, wa2probe, wa2 <string>, codelive, codetab <1-8|tabs>, codefont <6-16>, rows, regions, configtest, libs, addons, export <id>, import, clear, show, hide")
 	end
 end

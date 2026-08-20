@@ -132,11 +132,12 @@ end
 -- Keeps the outline synced and redraws the chain. Re-resolves the live frame by
 -- id every tick so a regionType switch (which rebuilds the frame under the same
 -- id, without a selection change) re-attaches the mover instead of stranding it
--- on the old hidden frame.
+-- on the old hidden frame -- and so a display whose visible frame is a clone
+-- rather than the base one is followed as its clone set changes.
 local function moverOnUpdate()
 	local m = mover
 	if not m.id then return end
-	local region = WA.GetRegion(m.id, "")
+	local region = WA.MoverRegion(m.id)
 	if not region then return end
 	if region ~= m.region then
 		m.region = region
@@ -761,7 +762,7 @@ end
 function M.Attach(id)
 	local m = ensureMover()
 	local data = id and WeakestAurasDB.displays[id]
-	local region = id and WA.GetRegion(id, "")
+	local region = id and WA.MoverRegion(id)
 	if not data or not region then
 		M.Detach()
 		return

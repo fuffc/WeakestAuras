@@ -90,7 +90,7 @@ in-game verification.
 | Clones and dynamic groups | Core clone/group behavior implemented | Clone state handling, sorting, limits, stagger and per-unit anchoring are available. Custom, circular and grid growth, plus some group movement animation, are not. |
 | Animations | Core animations implemented | Region and sub-region animations are available. Dynamic-group movement animation and some upstream animation details remain different. |
 | Actions | Core actions implemented | Custom code, chat messages, sounds, looping and local glow actions are available, with fewer channels, sound controls and external glow targets. |
-| Text replacement and formats | Common formats implemented | Common dynamic text and numeric/time formats are available. Inline icons, raid markers and some upstream formats are not. |
+| Text replacement and formats | Common formats implemented | Common dynamic text and numeric/time formats are available. Inline icons, coin art, raid markers and rotated text need ClassicAPI 1.10.0 or newer and fall back to plain text without one. Some upstream formats are still unavailable. |
 | Import/export and sharing | Native round-trip; foreign imports best effort | WeakestAuras has its own round-trip format, can translate many WeakAuras2 strings, and supports chat links. It does not export a WeakAuras2-compatible string. |
 
 The table describes practical feature coverage, not a guarantee that every aura
@@ -115,8 +115,11 @@ limits:
   textures, custom/circular/grid group growth and some dynamic-group animation
   features are unavailable. Unsupported imported region types are displayed as
   a fallback message rather than working as they do in WeakAuras2.
-- **Text:** inline icons and raid markers are not supported. Some WeakAuras2
-  text formats, including GUID and GCDTime, are unavailable or reduced.
+- **Text:** inline icons (`%i`), the Money format's coin art, raid markers and
+  rotated text require ClassicAPI 1.10.0 or newer; on an older one they fall
+  back to plain text rather than failing. Turning a marker name back into
+  `{rtN}` is not supported on any build. Some WeakAuras2 text formats, including
+  GUID and GCDTime, are unavailable or reduced.
 - **Custom code and actions:** custom code must use Lua 5.0 and this client's
   APIs and events. The aura environment is not sandboxed like WeakAuras2, so
   only use custom code and imported auras you trust. Some action destinations,

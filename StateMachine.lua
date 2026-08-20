@@ -47,14 +47,15 @@ local loaded = {}
 -- as a bare truthy in WA.Add's two paths below.
 local standby = {}
 
--- Forward decl: WA.Add (above the preview section) re-injects a forced aura's
--- fake state synchronously after a recompile. Assigned in the preview section.
+-- Forward decl: WA.Add (above the preview section) re-derives a forced aura's
+-- preview states synchronously after a recompile. Assigned in the preview
+-- section.
 local fakeForced
 
--- forced[id] = true for every leaf whose fake state the preview ticker injects
--- (forced visibility, §14 FakeStatesFor). A group in the options list
+-- forced[id] = true for every leaf the preview builds states for (forced
+-- visibility, §14 FakeStatesFor). A group in the options list
 -- contributes its leaf descendants here, so selecting or eye-toggling a group
--- fake-shows its children -- which is what makes an inactive dynamic group's
+-- previews its children -- which is what makes an inactive dynamic group's
 -- layout visible to debug. Read by WA.Add (a forced leaf is collapse-exempt)
 -- and the trigger watchers (they skip a forced leaf so a real scan doesn't fight
 -- the fake). The union of the selection preview + eye pins; see WA.SetPreview.
@@ -306,12 +307,35 @@ function WA.ForEachClone(id, fn)
 	for cloneId, frame in pairs(entry.byClone) do fn(frame, cloneId) end
 end
 
--- The live on-screen frame for a display (default the base "" clone). The mover
--- grabs the previewed region through this. nil if the
--- display hasn't been rendered yet. Ensures the region so the options preview,
--- which always targets the base clone, can attach a mover before any state.
+-- The live on-screen frame for a display (default the base "" clone). Ensures
+-- the region rather than only looking it up, so a caller can reach a display's
+-- frame before any state has been applied to it.
 function WA.GetRegion(id, cloneId)
 	return EnsureRegion(id, cloneId or "")
+end
+
+-- The frame the options mover should outline: the base clone when it is really
+-- shown, otherwise the oldest live clone (WA2's SetMoverSizer, which takes
+-- `next(clones[id])` for the same reason). A display need not have a base state
+-- at all -- a Trigger State Updater naming its own clone keys has none, and
+-- neither does an aura trigger whose preview is a staggered clone set -- and
+-- outlining the base frame there leaves the border sitting at the display's
+-- anchor while everything visible is laid out somewhere else. Oldest rather than
+-- upstream's arbitrary `next`, because the mover re-resolves every frame: an
+-- unordered pick lets the outline hop between clones as the hash walk changes.
+function WA.MoverRegion(id)
+	local base = EnsureRegion(id, "")
+	if base and base.toShow then return base end
+	local entry = regions[id]
+	if not entry then return base end
+	local best
+	for cloneId, frame in pairs(entry.byClone) do
+		if cloneId ~= "" and frame.toShow
+			and (not best or (frame.cloneSeq or 0) < (best.cloneSeq or 0)) then
+			best = frame
+		end
+	end
+	return best or base
 end
 
 -- Like GetRegion but never creates -- returns nil if the frame doesn't exist
@@ -737,10 +761,20 @@ function WA.AddGroup(data)
 		if cd and WA.IsGroup(cd) then
 			WA.AddGroup(cd)
 		elseif cd then
-			local cf = WA.PeekRegion(cd.id, "")
-			if cf then WA.regionPrototype.ApplyPosition(cf, cd) end
+			-- Every live clone, not only the base one. A display that produces
+			-- clones keeps its visible frames under other keys, and those need the
+			-- reparent as much as the base frame does.
+			WA.ForEachClone(cd.id, function(cf)
+				WA.regionPrototype.ApplyPosition(cf, cd)
+			end)
 		end
 	end
+	-- ApplyPosition anchors a dynamicgroup's child CENTER-to-CENTER and zeroes its
+	-- offset, that being the origin the grower measures from -- so on its own it
+	-- stacks every child and every clone on the group's centre. The layout is what
+	-- re-issues the offsets, and it has to run here or a group edit that reaches
+	-- this path (a drag, a resize, a reparent) leaves the whole set piled up.
+	if data.regionType == "dynamicgroup" then WA.RelayoutGroup(data.id) end
 end
 
 -- Re-anchors a child whose group membership just changed and refreshes the
@@ -829,11 +863,11 @@ function addDisplay(data, simpleChange)
 		SetRegion(data)
 		-- A size/offset edit shifts this aura's contribution to its group's box.
 		if data.parent then WA.RelayoutGroup(data.parent) end
-		if WA.forced[id] then
-			if fakeForced then fakeForced(id) end
-		elseif loaded[id] then
-			WA.UpdatedTriggerState(id)
-		end
+		-- This path leaves the states alone, so a previewed display's are still
+		-- there and re-applying them is all it needs. Re-deriving the preview would
+		-- run the trigger's own code again, which a colour edit or a drag step has
+		-- no business doing.
+		if WA.forced[id] or loaded[id] then WA.UpdatedTriggerState(id) end
 		return
 	end
 
@@ -914,9 +948,10 @@ function addDisplay(data, simpleChange)
 	-- state must re-register.
 	applyLoad(data, WA.EvalLoad(data))
 	if WA.forced[id] then
-		-- Re-establish the fake state in the same frame (the recompile wiped it and
-		-- the region was left untouched above), so an edit doesn't drop the preview
-		-- until the 0.1s ticker's next fire.
+		-- Re-derive the preview in the same frame: the recompile wiped its states
+		-- and the region was left untouched above, and nothing else will rebuild
+		-- them -- the ticker only rolls existing deadlines forward. This is also
+		-- what makes an edit show up, since the preview runs the trigger's code.
 		if fakeForced then fakeForced(id) end
 	elseif loaded[id] then
 		WA.UpdatedTriggerState(id)
@@ -1032,9 +1067,9 @@ function WA.GetClonePoolStats(regionType)
 end
 
 -- ---------------------------------------------------------------------------
--- Forced visibility / fake states (§14 + FakeStatesFor). While the
--- options window is open, any number of leaves can be "forced" -- shown with a
--- looping fake state so they can be sized/positioned/debugged even when their
+-- Forced visibility / preview states (§14 + FakeStatesFor). While the
+-- options window is open, any number of leaves can be "forced" -- shown with
+-- preview states so they can be sized/positioned/debugged even when their
 -- real trigger doesn't match. A group forces its leaf descendants, so selecting
 -- (or eye-toggling) a dynamic group fake-shows its children and the grower lays
 -- them out instead of stacking them at the baseline. Two sources merge into
@@ -1045,7 +1080,7 @@ end
 local pinned = {}          -- leaf id -> true: eye-pinned (persists across selection)
 local selectionLeaves = {} -- leaf id -> true: from the current selection preview
 local previewTicker
-local PREVIEW_CYCLE = 7 -- seconds; matches WA2's fake-timer loop length
+local PREVIEW_ROLL = 1 -- seconds between roll-forwards; WA2's UpdateFakeTimers cadence
 
 -- The leaf ids under id (id itself if it's a leaf), accumulated into `into`.
 local function collectLeaves(id, into)
@@ -1059,60 +1094,58 @@ local function collectLeaves(id, into)
 	end
 end
 
--- Injects one leaf's looping fake state (name/icon from each trigger) and
--- re-runs the state machine so the region shows. *Every* trigger is faked, not
--- just trigger 1 (WA2's UpdateFakeStatesFor, which loops data.triggers): the
--- combination in UpdatedTriggerState still runs over the fakes, so faking only
--- one leaves disjunctive="all" (and any custom logic) unsatisfied -- the preview
--- would stay dark for exactly the multi-trigger displays that need it most.
+-- Drops every state one trigger holds, leaving the allstates table itself in
+-- place -- a TSU's helper methods live on its metatable, and replacing the table
+-- would strand the one its compiled code was handed. WA2's SetAllStatesHidden.
+local function wipeStates(ts, triggernum)
+	local as = ts[triggernum]
+	if not as then return end
+	for cloneId in pairs(as) do as[cloneId] = nil end
+end
+
+-- Builds one leaf's preview states and re-runs the state machine so the region
+-- shows. Each trigger's own system produces them: the generic system runs the
+-- real trigger function under a synthetic "OPTIONS" event and keeps whatever it
+-- produced, the aura system synthesises (§14, WA2's UpdateFakeStatesFor).
+--
+-- *Every* trigger is previewed, not just trigger 1: the combination in
+-- UpdatedTriggerState still runs over the results, so previewing only one leaves
+-- disjunctive="all" (and any custom logic) unsatisfied -- the preview would stay
+-- dark for exactly the multi-trigger displays that need it most. WA2 reaches the
+-- same place from the other end, by ignoring the combination entirely while its
+-- options window is open.
 local function fakeOne(id)
 	local data = WeakestAurasDB.displays[id]
 	local ts = triggerState[id]
 	if not data or not ts then return end
 
-	local remain = PREVIEW_CYCLE - math.mod(GetTime(), PREVIEW_CYCLE)
 	for triggernum = 1, ts.numTriggers do
+		wipeStates(ts, triggernum)
 		local system = WA.GetTriggerSystem(data, triggernum)
-		local name, icon = data.id, "Interface\\Icons\\INV_Misc_QuestionMark"
-		if system and system.GetNameAndIcon then
-			local n, i = system.GetNameAndIcon(data, triggernum)
-			-- An unconfigured trigger reports "" rather than nil, and "" is truthy
-			-- in Lua -- so test for content, not just presence, or the preview shows
-			-- a blank %n. The display's own id is the fallback, matching what %n
-			-- itself falls back to (TextReplace).
-			if n and n ~= "" then name = n end
-			if i then icon = i end
+		if system and system.CreateFakeStates then
+			WA.safecall(id .. ": preview trigger " .. triggernum,
+				system.CreateFakeStates, data, triggernum)
 		end
-
-		local states = ts[triggernum] or {}
-		ts[triggernum] = states
-		local state = states[""]
-		if not state then state = {}; states[""] = state end
-		state.show = true
-		state.changed = true
-		state.progressType = "timed"
-		state.name = name
-		state.icon = icon
-		state.stacks = 3
-		state.duration = PREVIEW_CYCLE
-		state.expirationTime = GetTime() + remain
+		-- A trigger type no system claims (an import naming one this client has
+		-- no producer for) would otherwise preview as nothing, and a forced leaf
+		-- that draws nothing is the one thing the preview exists to prevent.
+		local states = WA.GetTriggerStateForTrigger(id, triggernum)
+		if states and not next(states) then
+			states[""] = { show = true, changed = true, name = data.id,
+				icon = "Interface\\Icons\\INV_Misc_QuestionMark",
+				progressType = "timed", duration = 7, expirationTime = GetTime() + 7 }
+		end
 	end
 	WA.UpdatedTriggerState(id)
 end
 fakeForced = fakeOne -- resolve the forward decl WA.Add uses
 
--- Retires a leaf's fake state; the watcher re-establishes the real one (or the
--- region goes dark) on its next scan.
+-- Retires a leaf's preview states; the watcher re-establishes the real ones (or
+-- the region goes dark) on its next scan.
 local function retireFake(id)
 	local ts = triggerState[id]
 	if not ts then return end
-	for triggernum = 1, ts.numTriggers do
-		local as = ts[triggernum]
-		if as and as[""] then
-			as[""].show = false
-			as[""].changed = true
-		end
-	end
+	for triggernum = 1, ts.numTriggers do wipeStates(ts, triggernum) end
 	WA.UpdatedTriggerState(id)
 	-- The wipe above deleted every state, including ones a still-true status
 	-- trigger owns -- and an event-driven system only writes state when its event
@@ -1122,12 +1155,39 @@ local function retireFake(id)
 	eachSystem(function(system) if system.ForceUpdate then system.ForceUpdate({ id }) end end)
 end
 
+-- WA2's UpdateFakeTimers: a preview state whose countdown has run out is rolled
+-- forward by its own duration, so the preview keeps animating without re-running
+-- the trigger. Only the deadline moves -- the state is whatever its system
+-- produced, and re-deriving it belongs to the events that change it (selection,
+-- eye pin, recompile).
 local function previewTick()
-	for id in pairs(WA.forced) do fakeOne(id) end
+	local now = GetTime()
+	for id in pairs(WA.forced) do
+		local ts = triggerState[id]
+		local changed = false
+		if ts then
+			for triggernum = 1, ts.numTriggers do
+				local as = ts[triggernum]
+				if as then
+					for _, state in pairs(as) do
+						if state.progressType == "timed"
+							and type(state.expirationTime) == "number" and state.expirationTime < now
+							and type(state.duration) == "number" and state.duration > 0 then
+							state.expirationTime = now + state.duration
+							state.changed = true
+							changed = true
+						end
+					end
+				end
+			end
+		end
+		if changed then WA.UpdatedTriggerState(id) end
+	end
 end
 
--- Rebuilds WA.forced = pinned + selectionLeaves, retiring the fakes that dropped
--- out and (re)starting/stopping the ticker to match.
+-- Rebuilds WA.forced = pinned + selectionLeaves, retiring the previews that
+-- dropped out, building the ones that joined, and (re)starting/stopping the
+-- roll-forward ticker to match.
 local function recomputeForced()
 	local nextSet = {}
 	for id in pairs(pinned) do nextSet[id] = true end
@@ -1135,10 +1195,17 @@ local function recomputeForced()
 	for id in pairs(WA.forced) do
 		if not nextSet[id] then WA.forced[id] = nil; retireFake(id) end
 	end
-	for id in pairs(nextSet) do WA.forced[id] = true end
+	for id in pairs(nextSet) do
+		-- Only what just joined: fakeOne runs the leaf's trigger code, so re-running
+		-- it for every already-previewed leaf on every selection change would pay
+		-- that cost again for displays whose preview has not changed (WA2's
+		-- FakeStatesFor, which returns early when the visibility already matches).
+		local joined = not WA.forced[id]
+		WA.forced[id] = true
+		if joined then fakeOne(id) end
+	end
 	if next(WA.forced) then
-		if not previewTicker then previewTicker = C_Timer.NewTicker(0.1, previewTick) end
-		previewTick()
+		if not previewTicker then previewTicker = C_Timer.NewTicker(PREVIEW_ROLL, previewTick) end
 	elseif previewTicker then
 		previewTicker:Cancel()
 		previewTicker = nil

@@ -72,6 +72,12 @@ function WA.safecall(errTag, fn, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11)
 		return err
 	end)
 	if not ok then
+		-- The options preview runs trigger code that was written to read a live
+		-- event payload, and an aura opted into swallowing that (WA2's
+		-- ignoreOptionsEventErrors) wants the failure gone, not reported once per
+		-- preview. Nothing else sets this, and the one setter clears it in the
+		-- same call.
+		if WA.silenceErrors then return ok, res end
 		local message = "[" .. tostring(errTag) .. "] " .. tostring(res)
 		-- `errTag` is a label for a chat line, and half the call sites are not an
 		-- aura at all (Comm, the trigger-system dispatch), so it cannot key a

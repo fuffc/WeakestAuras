@@ -267,6 +267,43 @@ function TriggerAura.CreateFallbackState(data, triggernum, state)
 	return state
 end
 
+-- The options preview (§14). This system does *not* scan: it synthesises, the
+-- way WA2's BuffTrigger.CreateFakeStates does, because running the scanner over
+-- the live unit answers a question the user is not asking -- they are configuring
+-- an aura for a fight they are not in. A trigger that can produce clones gets two
+-- extra ones on staggered timers, so a dynamic group's ordering, limits and
+-- stagger are visible in the options window rather than only after closing it.
+--
+-- Diverges from upstream in taking `data` rather than an id (matching the other
+-- contract methods here), and in what "can have clones" means: upstream's
+-- `showClones` has no local counterpart, so it is a multi-unit family
+-- (group/party/raid/nameplate) -- the only shape that writes more than the base
+-- state at runtime.
+function TriggerAura.CreateFakeStates(data, triggernum)
+	local states = WA.GetTriggerStateForTrigger(data.id, triggernum)
+	if not states then return end
+
+	local function fake(cloneId, expiresIn, duration)
+		local state = TriggerAura.CreateFallbackState(data, triggernum, {})
+		state.show = true
+		state.changed = true
+		state.progressType = "timed"
+		state.duration = duration
+		state.expirationTime = GetTime() + expiresIn
+		state.stacks = 1
+		-- The fallback describes the *unmatched* case, which is not what a preview
+		-- carrying a countdown and a stack count is showing -- a condition on
+		-- Active would otherwise read false against a state drawn as present.
+		state.active = true
+		states[cloneId] = state
+	end
+
+	fake("", 60, 65)
+	if WA.MultiUnitFamily(WA.GetTrigger(data, triggernum)) then
+		for i = 1, 2 do fake(i, 60 + i * 20, 100) end
+	end
+end
+
 -- Condition-variable templates (§5/§10): what this trigger's state exposes
 -- to the conditions editor and interpreter. Each key is the state field a check
 -- reads; type drives the editor widget and the comparison. `timer` compares

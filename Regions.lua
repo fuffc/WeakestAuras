@@ -544,12 +544,59 @@ local function growGrid(data, list, n)
 	if centerBlock then centerSpan(1, n, secondary) end
 end
 
+-- Polar grower: children ride a ring of `radius` from the anchor, starting at
+-- `rotation` and stepping by whichever of the three `constantFactor` modes is
+-- picked -- RADIUS spreads the arc over the ring, ANGLE steps a fixed
+-- stepAngle, SPACING derives the radius from `space` and the count instead.
+-- `align` and `stagger` say nothing about a ring and are ignored here, as they
+-- are upstream.
+--
+-- The two names are one grower differing only in the sign of dAngle, and their
+-- labels read backwards: CIRCLE advances theta, and against WoW's y-up frame
+-- coordinates an increasing theta is counter-clockwise. Upstream's labels are
+-- the right way round; it is the internal names that mislead.
+local function growCircle(data, list, n)
+	local constantFactor = data.constantFactor or "RADIUS"
+	local arc = (data.fullCircle and 360 or data.arcLength or 0) * math.pi / 180
+	local mul = (data.grow == "COUNTERCIRCLE") and -1 or 1
+
+	local r
+	if constantFactor == "RADIUS" or constantFactor == "ANGLE" then
+		r = data.radius or 0
+	elseif n <= 1 then
+		r = 0
+	else
+		r = (n * (data.space or 0)) / (2 * math.pi)
+	end
+
+	-- A full circle divides the arc by n so the last child does not land on top
+	-- of the first; an arc divides by n - 1 because both of its endpoints are
+	-- wanted.
+	local dAngle
+	if n == 1 then
+		dAngle = 0
+	elseif constantFactor == "ANGLE" then
+		dAngle = mul * (data.stepAngle or 0) * math.pi / 180
+	elseif data.fullCircle then
+		dAngle = mul * arc / n
+	else
+		dAngle = mul * arc / (n - 1)
+	end
+
+	local theta = (data.rotation or 0) * math.pi / 180
+	for i = 1, n do
+		local c = list[i]
+		c.x, c.y = r * math.cos(theta), r * math.sin(theta)
+		theta = theta + dAngle
+	end
+end
+
 -- Axis-aligned grower: assigns each visible child of one run a position relative
 -- to that run's anchor, stacking successive children by their own dimension +
 -- spacing (WA2's DynamicGroup.lua growers, minus animation). HORIZONTAL/VERTICAL
 -- center the run on the anchor; the four cardinals grow from it; GRID wraps
--- (growGrid). Shortens the list to the visible ones (parking the rest) and
--- returns the box extents.
+-- (growGrid) and the two circles ring it (growCircle). Shortens the list to the
+-- visible ones (parking the rest) and returns the box extents.
 local function growRun(data, list)
 	local total = table.getn(list)
 	local visible = total
@@ -600,6 +647,8 @@ local function growRun(data, list)
 
 	if grow == "GRID" then
 		growGrid(data, list, n)
+	elseif grow == "CIRCLE" or grow == "COUNTERCIRCLE" then
+		growCircle(data, list, n)
 	elseif grow == "HORIZONTAL" or grow == "VERTICAL" then
 		local runLength = 0
 		for i = 1, n do
@@ -889,6 +938,27 @@ local GRID_TYPE_LABELS = {
 	VH = "Centered Vertical, then Centered Horizontal",
 }
 
+-- Upstream's grow_types, minus CUSTOM. CIRCLE reads as "Counter Clockwise" and
+-- COUNTERCIRCLE as "Clockwise" on purpose: the labels describe the direction the
+-- grower actually turns, and it is the internal names that are backwards.
+local GROW_TYPES = {
+	"UP", "DOWN", "LEFT", "RIGHT", "HORIZONTAL", "VERTICAL",
+	"CIRCLE", "COUNTERCIRCLE", "GRID",
+}
+local GROW_TYPE_LABELS = {
+	UP = "Up", DOWN = "Down", LEFT = "Left", RIGHT = "Right",
+	HORIZONTAL = "Centered Horizontal", VERTICAL = "Centered Vertical",
+	CIRCLE = "Counter Clockwise", COUNTERCIRCLE = "Clockwise", GRID = "Grid",
+}
+
+local CONSTANT_FACTOR_LABELS = {
+	RADIUS = "Radius", ANGLE = "Angle and Radius", SPACING = "Spacing",
+}
+
+local function isCircle(data)
+	return data.grow == "CIRCLE" or data.grow == "COUNTERCIRCLE"
+end
+
 WA.RegisterRegionType("dynamicgroup", {
 	displayName = "Dynamic Group",
 	description = "Arranges its children itself, closing the gaps as they come and go.",
@@ -913,6 +983,12 @@ WA.RegisterRegionType("dynamicgroup", {
 		gridWidth = 5,
 		rowSpace = 2,
 		columnSpace = 2,
+		radius = 200,
+		rotation = 0,
+		stepAngle = 15,
+		fullCircle = true,
+		arcLength = 360,
+		constantFactor = "RADIUS",
 		groupIcon = "",
 		stagger = 0,
 		useLimit = false,
@@ -931,7 +1007,7 @@ WA.RegisterRegionType("dynamicgroup", {
 			groupIconOption(data),
 			{
 				type = "select", name = "Grow direction", key = "grow",
-				values = { "UP", "DOWN", "LEFT", "RIGHT", "HORIZONTAL", "VERTICAL", "GRID" },
+				values = GROW_TYPES, labels = GROW_TYPE_LABELS,
 				get = function() return data.grow end,
 				set = function(v) data.grow = v; WA.Add(data); WA.RefreshOptions() end,
 			},
@@ -946,7 +1022,9 @@ WA.RegisterRegionType("dynamicgroup", {
 		}
 		-- A grid spaces its two axes separately and reads neither `space` nor
 		-- `align`, so it offers its own pair and withholds both -- upstream hides
-		-- the same three fields, `stagger` included, for the same reason.
+		-- the same three fields, `stagger` included, for the same reason. A circle
+		-- withholds the same three, and reads `space` only under SPACING, where it
+		-- sets the radius rather than a gap.
 		if data.grow == "GRID" then
 			table.insert(fields, {
 				type = "select", name = "Grid direction", key = "gridType",
@@ -972,6 +1050,58 @@ WA.RegisterRegionType("dynamicgroup", {
 				get = function() return data.columnSpace end,
 				set = function(v) data.columnSpace = v; WA.Add(data) end,
 			})
+		elseif isCircle(data) then
+			local constantFactor = data.constantFactor or "RADIUS"
+			table.insert(fields, {
+				type = "select", name = "Constant Factor", key = "constantFactor",
+				values = { "RADIUS", "ANGLE", "SPACING" }, labels = CONSTANT_FACTOR_LABELS,
+				get = function() return data.constantFactor end,
+				set = function(v) data.constantFactor = v; WA.Add(data); WA.RefreshOptions() end,
+			})
+			table.insert(fields, {
+				type = "range", name = "Start Angle", key = "rotation", min = 0, max = 360, step = 3,
+				get = function() return data.rotation end,
+				set = function(v) data.rotation = v; WA.Add(data) end,
+			})
+			if constantFactor == "SPACING" then
+				table.insert(fields, {
+					type = "range", name = "Spacing", key = "space", min = 0, max = 20, step = 1,
+					get = function() return data.space end,
+					set = function(v) data.space = v; WA.Add(data) end,
+				})
+			end
+			if constantFactor ~= "ANGLE" then
+				table.insert(fields, {
+					type = "toggle", name = "Full Circle", key = "fullCircle",
+					get = function() return data.fullCircle end,
+					set = function(v) data.fullCircle = v; WA.Add(data); WA.RefreshOptions() end,
+				})
+				-- Upstream greys this out under a full circle; conditional fields
+				-- here are expressed by not emitting them at all.
+				if not data.fullCircle then
+					table.insert(fields, {
+						type = "range", name = "Total Angle", key = "arcLength",
+						min = 0, max = 360, step = 3,
+						get = function() return data.arcLength end,
+						set = function(v) data.arcLength = v; WA.Add(data) end,
+					})
+				end
+			end
+			if constantFactor ~= "SPACING" then
+				table.insert(fields, {
+					type = "range", name = "Radius", key = "radius", min = 0, max = 500, step = 1,
+					get = function() return data.radius end,
+					set = function(v) data.radius = v; WA.Add(data) end,
+				})
+			end
+			if constantFactor == "ANGLE" then
+				table.insert(fields, {
+					type = "range", name = "Angle Between Auras", key = "stepAngle",
+					min = 0, max = 180, step = 1,
+					get = function() return data.stepAngle end,
+					set = function(v) data.stepAngle = v; WA.Add(data) end,
+				})
+			end
 		else
 			table.insert(fields, {
 				type = "range", name = "Spacing", key = "space", min = 0, max = 20, step = 1,
@@ -1018,9 +1148,10 @@ WA.RegisterRegionType("dynamicgroup", {
 				get = function() return data.customSort end,
 				set = function(v) data.customSort = v; WA.Add(data) end,
 				-- Seeded nil-safe on purpose: a comparator sees the options
-				-- preview's synthesised state as well as the real ones, and that
-				-- carries no producer fields at all. Answering nil is "no
-				-- opinion", which leaves the pair in the deterministic base order.
+				-- preview's states as well as the real ones, and a preview carries
+				-- only what its own trigger filled in -- a fallback state, none of
+				-- it. Answering nil is "no opinion", which leaves the pair in the
+				-- deterministic base order.
 				default = "function(a, b)\n"
 					.. "    local x = a.region.state and a.region.state.index\n"
 					.. "    local y = b.region.state and b.region.state.index\n"
@@ -1031,7 +1162,7 @@ WA.RegisterRegionType("dynamicgroup", {
 				end,
 			})
 		end
-		if data.grow ~= "GRID" then
+		if data.grow ~= "GRID" and not isCircle(data) then
 			table.insert(fields, {
 				type = "range", name = "Stagger", key = "stagger", min = -50, max = 50, step = 1,
 				get = function() return data.stagger end,
@@ -1332,6 +1463,12 @@ WA.RegisterRegionType("icon", {
 		displayIcon = "",
 		zoom = 0,
 		cooldownSwipe = true,
+		cooldownEdge = false,
+		-- Local drift: upstream drives the Blizzard Cooldown frame and has
+		-- neither of these. Offered only on the spinner backend.
+		swipeColor = { 0, 0, 0, 0.8 },
+		swipeEdgeColor = { 1, 0.82, 0.35, 1 },
+		inverse = false,
 		useAdjustededMin = false,
 		adjustedMin = "",
 		useAdjustededMax = false,
@@ -1349,18 +1486,41 @@ WA.RegisterRegionType("icon", {
 	icon = "Interface\\Icons\\INV_Misc_QuestionMark",
 	getSubRegionAnchors = function() return ICON_SUB_ANCHORS end,
 	-- List-row preview: the resolved icon (WA.ResolveDisplayIcon, Data.lua) at
-	-- the saved zoom, same texcoord rule as the runtime region's own SetZoom.
+	-- the saved zoom, same texcoord rule as the runtime region's own SetZoom,
+	-- under a wedge frozen part-way so the row shows the swipe's colour and
+	-- direction. The wedge is built with the frame and never per bind: a row is
+	-- rebound to a different aura on every scroll tick and frames cannot be
+	-- destroyed here.
 	createThumbnail = function(parent)
 		local frame = CreateFrame("Frame", nil, parent)
 		local tex = frame:CreateTexture(nil, "ARTWORK")
 		tex:SetAllPoints(frame)
 		frame.tex = tex
+		frame.spinner = WA.Spinner and WA.Spinner.Create(frame, "OVERLAY")
 		return frame
 	end,
 	modifyThumbnail = function(frame, data)
 		frame.tex:SetTexture(WA.ResolveDisplayIcon(data) or "Interface\\Icons\\INV_Misc_QuestionMark")
 		local inset = 0.07 + (data.zoom or 0) * 0.20
 		frame.tex:SetTexCoord(inset, 1 - inset, inset, 1 - inset)
+		local spinner = frame.spinner
+		if not spinner then return end
+		if not data.cooldownSwipe then
+			spinner:Hide(); spinner:Reset()
+			return
+		end
+		local c = data.swipeColor or { 0, 0, 0, 0.8 }
+		spinner:SetSolidColor(c[1] or 0, c[2] or 0, c[3] or 0, c[4] == nil and 0.8 or c[4])
+		spinner:SetWidth(frame:GetWidth() or 0)
+		spinner:SetHeight(frame:GetHeight() or 0)
+		-- A third of the way round: enough wedge to read as a cooldown, little
+		-- enough that the icon underneath still identifies the aura.
+		if data.inverse then
+			spinner:SetProgress(0, 126)
+		else
+			spinner:SetProgress(234, 360)
+		end
+		spinner:Show()
 	end,
 	-- The overridable-property registry conditions and their editor read
 	-- Setter names a region method defined in modify below.
@@ -1371,6 +1531,10 @@ WA.RegisterRegionType("icon", {
 		color = { display = "Color", setter = "Color", type = "color" },
 		zoom = { display = "Zoom", setter = "SetZoom", type = "number", min = 0, max = 1, step = 0.05 },
 		cooldownSwipe = { display = "Cooldown Swipe", setter = "SetCooldownSwipe", type = "bool" },
+		cooldownEdge = { display = "Cooldown Edge", setter = "SetCooldownEdge", type = "bool" },
+		swipeColor = { display = "Swipe Color", setter = "SetSwipeColor", type = "color" },
+		swipeEdgeColor = { display = "Cooldown Edge Color", setter = "SetSwipeEdgeColor", type = "color" },
+		inverse = { display = "Inverse", setter = "SetInverse", type = "bool" },
 		iconSource = { display = "Icon Source", setter = "SetIconSource", type = "list", values = { [-1] = "Automatic", [0] = "Manual" }, default = 0 },
 		displayIcon = { display = "Manual Icon", setter = "SetIcon", type = "icon" },
 	})),
@@ -1400,6 +1564,26 @@ WA.RegisterRegionType("icon", {
 				set = function(v) data.cooldownSwipe = v; WA.Add(data, true) end,
 			},
 			{
+				type = "toggle", name = "Cooldown edge (bright leading line)", key = "cooldownEdge",
+				get = function() return data.cooldownEdge end,
+				set = function(v) data.cooldownEdge = v; WA.Add(data, true) end,
+			},
+			{
+				type = "color", name = "Swipe colour", key = "swipeColor",
+				get = function() return data.swipeColor end,
+				set = function(v) data.swipeColor = v; WA.Add(data, true) end,
+			},
+			{
+				type = "color", name = "Edge colour", key = "swipeEdgeColor",
+				get = function() return data.swipeEdgeColor end,
+				set = function(v) data.swipeEdgeColor = v; WA.Add(data, true) end,
+			},
+			{
+				type = "toggle", name = "Inverse (dark wedge grows)", key = "inverse",
+				get = function() return data.inverse end,
+				set = function(v) data.inverse = v; WA.Add(data, true) end,
+			},
+			{
 				type = "range", name = "Zoom", key = "zoom", min = 0, max = 1, step = 0.05, half = true,
 				get = function() return data.zoom end,
 				set = function(v) data.zoom = v; WA.Add(data, true) end,
@@ -1421,6 +1605,18 @@ WA.RegisterRegionType("icon", {
 				set = function(v) data.height = v; WA.Add(data, true) end,
 			},
 		}
+		-- The edge and the two colours are the spinner's to draw; the Model
+		-- fallback carries its own fixed art. Withdrawing the controls beats
+		-- leaving some that do nothing -- the keys stay on the aura either way,
+		-- so it costs an old client nothing on the trip back to a new one.
+		if not WA.regionPrototype.SwipeSupportsLooks() then
+			for i = table.getn(fields), 1, -1 do
+				local key = fields[i].key
+				if key == "cooldownEdge" or key == "swipeColor" or key == "swipeEdgeColor" then
+					table.remove(fields, i)
+				end
+			end
+		end
 		for _, f in ipairs(WA.regionPrototype.ProgressOptions(data)) do
 			table.insert(fields, f)
 		end
@@ -1429,8 +1625,8 @@ WA.RegisterRegionType("icon", {
 		end
 		return fields
 	end,
-	-- Frame + icon texture + a native cooldown swipe (regionPrototype.CreateSwipe;
-	-- the radial spiral, built as a Model on this client -- see that helper).
+	-- Frame + icon texture + a cooldown swipe (regionPrototype.CreateSwipe; the
+	-- radial spiral -- spinner-drawn, with a 3D Model fallback, see that helper).
 	-- Countdown/stacks text rides on %p/%s subtext elements (SubText.lua) on top.
 	create = function(parent, data)
 		local region = CreateFrame("Frame", nil, parent)
@@ -1454,6 +1650,13 @@ WA.RegisterRegionType("icon", {
 
 		region.swipe = WA.regionPrototype.CreateSwipe(region)
 
+		-- CreateSwipe levels the spiral once, off the level the region had at
+		-- create time; a subbackground row moves the region afterwards and the
+		-- spiral has to come with it or the icon paints over its own countdown.
+		function region:ApplyInternalFrameLevels()
+			if self.swipe then self.swipe:SetFrameLevel(self:GetFrameLevel() + 1) end
+		end
+
 		WA.regionPrototype.create(region)
 		function region:GetSubAnchorTarget(key)
 			if key == "region" or key == "ALL" then return self end
@@ -1474,43 +1677,79 @@ WA.RegisterRegionType("icon", {
 			WA.regionPrototype.UpdateProgress(self)
 		end
 
+		-- The aura's configured inverse and the active state's combine by XOR,
+		-- matching upstream's effectiveInverse (its Icon.lua SetInverse).
+		function region:SwipeReverse()
+			return (self.inverse and true or false) ~= (self.stateInverse and true or false)
+		end
+
 		-- UpdateProgress dispatches here after setting duration/expirationTime:
-		-- a timed state drives the swipe (when enabled), a static one clears it.
+		-- a timed state runs the swipe (when enabled), a paused one holds it at
+		-- the frozen fraction, a static one holds it at value/total. The swipe
+		-- runs for either draw flag -- an edge with the wedge switched off is
+		-- upstream's own combination, and the Model backend, which has no edge,
+		-- draws nothing for it.
 		function region:UpdateTime()
-			-- The swipe is a 3D Model armed with a start and duration, not a value
-			-- it can hold part-way -- a paused aura clears it rather than leaving a
-			-- swipe running on regardless of the freeze.
+			local swipe = self.swipe
+			if not swipe then return end
+			if not (self.cooldownSwipe or self.cooldownEdge) then swipe:Clear(); return end
 			if self.paused then
-				WA.regionPrototype.ArmSwipe(self.swipe, 0, 0)
-			elseif self.cooldownSwipe then
-				WA.regionPrototype.ArmSwipe(self.swipe, self.expirationTime, self.duration)
+				local fraction = 0
+				if self.duration and self.duration > 0 then
+					fraction = (self.remaining or 0) / self.duration
+				end
+				swipe:Hold(fraction, self:SwipeReverse())
+			elseif self.duration and self.duration > 0 then
+				swipe:Arm(self.expirationTime, self.duration, self:SwipeReverse())
 			else
-				WA.regionPrototype.ArmSwipe(self.swipe, 0, 0)
+				swipe:Clear()
 			end
 		end
 		function region:UpdateValue()
-			WA.regionPrototype.ArmSwipe(self.swipe, 0, 0)
+			local swipe = self.swipe
+			if not swipe then return end
+			if (self.cooldownSwipe or self.cooldownEdge) and (self.total or 0) > 0 then
+				swipe:Hold((self.value or 0) / self.total, self:SwipeReverse())
+			else
+				swipe:Clear()
+			end
 		end
 
 		region:Hide()
 		return region
 	end,
 	modify = function(region, data)
-		-- Both dimensions feed the swipe's square sizing (SizeSwipe centers a
-		-- min(width,height) square rather than stretching non-uniformly), so
-		-- either setter re-runs it with the latest known value of the other.
+		-- Both dimensions feed the swipe's sizing (the spinner needs the wedge
+		-- magnitudes; the Model fallback centers a min(width,height) square),
+		-- so either setter re-runs it with the latest known value of the other.
 		function region:SetRegionWidth(w) self.regionWidth = w; self:SetWidth(w); self:UpdateInnerOuterSize(); WA.regionPrototype.SizeSwipe(self.swipe, w, self.regionHeight) end
 		function region:SetRegionHeight(h) self.regionHeight = h; self:SetHeight(h); self:UpdateInnerOuterSize(); WA.regionPrototype.SizeSwipe(self.swipe, self.regionWidth, h) end
 		function region:SetDesaturated(b) self.iconTex:SetDesaturated(b and true or false) end
 		function region:Color(r, g, b, a) self.iconTex:SetVertexColor(r, g, b, a or 1) end
-		-- Off clears the swipe now; on re-drives from the current state (if any).
+		-- Two draw flags on one swipe object, either of which keeps it running.
+		-- Each re-drives from the current state, since turning one on has no
+		-- frame of its own coming to place it while the other holds.
 		function region:SetCooldownSwipe(b)
 			self.cooldownSwipe = b and true or false
-			if not self.cooldownSwipe then
-				WA.regionPrototype.ArmSwipe(self.swipe, 0, 0)
-			elseif self.state then
-				WA.regionPrototype.UpdateProgress(self)
-			end
+			if self.swipe then self.swipe:SetSwipe(self.cooldownSwipe) end
+			if self.state then WA.regionPrototype.UpdateProgress(self) end
+		end
+		function region:SetCooldownEdge(b)
+			self.cooldownEdge = b and true or false
+			if self.swipe then self.swipe:SetEdge(self.cooldownEdge) end
+			if self.state then WA.regionPrototype.UpdateProgress(self) end
+		end
+		function region:SetSwipeColor(r, g, b, a)
+			self.swipeColor = { r, g, b, a }
+			if self.swipe then self.swipe:SetSwipeColor(r, g, b, a) end
+		end
+		function region:SetSwipeEdgeColor(r, g, b, a)
+			self.swipeEdgeColor = { r, g, b, a }
+			if self.swipe then self.swipe:SetEdgeColor(r, g, b, a) end
+		end
+		function region:SetInverse(v)
+			self.inverse = v and true or false
+			if self.state then WA.regionPrototype.UpdateProgress(self) end
 		end
 		-- Zoom crops the texcoords inward from the fixed 0.07 border trim (zoom=0
 		-- keeps the default look; zoom=1 shows the center ~46%).
@@ -1538,7 +1777,21 @@ WA.RegisterRegionType("icon", {
 		region:SetRegionAlpha(data.alpha)
 		region:SetDesaturated(data.desaturate)
 		region:SetZoom(data.zoom)
+		-- Fields first, then one push each: the setters re-drive the state, and
+		-- modify has not reached the state machine yet.
 		region.cooldownSwipe = data.cooldownSwipe and true or false
+		region.cooldownEdge = data.cooldownEdge and true or false
+		-- Colours before the draw flags: SetEdge builds the edge texture on
+		-- first enable and tints it from what the swipe is already holding.
+		local sc = data.swipeColor or { 0, 0, 0, 0.8 }
+		region:SetSwipeColor(sc[1], sc[2], sc[3], sc[4])
+		local ec = data.swipeEdgeColor or { 1, 0.82, 0.35, 1 }
+		region:SetSwipeEdgeColor(ec[1], ec[2], ec[3], ec[4])
+		if region.swipe then
+			region.swipe:SetSwipe(region.cooldownSwipe)
+			region.swipe:SetEdge(region.cooldownEdge)
+		end
+		region.inverse = data.inverse and true or false
 		local col = data.color or { 1, 1, 1, 1 }
 		region:Color(col[1], col[2], col[3], col[4])
 		region.iconSource = data.iconSource
@@ -2445,6 +2698,17 @@ WA.RegisterRegionType("progressbar", {
 		-- tracks the end of the fill rather than sitting past the icon.
 		region.subRegionAnchor = bar
 
+		-- Three levels wide, which is what sets proto.SUB_STEP: the region
+		-- itself, the bar over it, the icon over that. Called from modifyFinish
+		-- rather than from modify, because a subbackground row moves the region
+		-- and these have to land above wherever it ended up. ApplyPosition's
+		-- SetParent resets them either way.
+		function region:ApplyInternalFrameLevels()
+			local base = self:GetFrameLevel()
+			self.bar:SetFrameLevel(base + 1)
+			self.iconFrame:SetFrameLevel(base + 2)
+		end
+
 		WA.regionPrototype.create(region)
 		function region:GetSubAnchorTarget(key)
 			if key == "region" or key == "bar" then return self.bar end
@@ -2651,12 +2915,7 @@ WA.RegisterRegionType("progressbar", {
 			self.iconTex:SetTexture(WA.DrawableTexture(path) or "Interface\\Icons\\INV_Misc_QuestionMark")
 		end
 
-		-- ApplyPosition may SetParent, which resets child frame levels (and
-		-- strata, if inherited), so both are re-asserted right after it.
 		WA.regionPrototype.ApplyPosition(region, data)
-		local base = region:GetFrameLevel()
-		region.bar:SetFrameLevel(base + 1)
-		region.iconFrame:SetFrameLevel(base + 2)
 
 		region.inverse = data.inverse and true or false
 		region.smoothProgress = data.smoothProgress and true or false
@@ -2794,7 +3053,14 @@ local function textAutoSize(region, data)
 	local host = fs:GetParent()
 	fs:SetParent(UIParent)
 	local w = fs:GetStringWidth() or 0
-	local h = fs:GetHeight() or 0
+	-- GetStringHeight is the engine's own reading and is preferred where the
+	-- client has it; GetHeight is the region's and stands in where it does not.
+	-- The two agree everywhere measured here, tall inline icons included, so
+	-- this is not a fix for a wrong number -- it is asking the question of
+	-- whoever is authoritative about it.
+	local h = 0
+	if WA.hasStringHeight then h = fs:GetStringHeight() or 0 end
+	if h == 0 then h = fs:GetHeight() or 0 end
 	fs:SetParent(host)
 	if w < MIN_TEXT_DIM then w = MIN_TEXT_DIM end
 	if h < MIN_TEXT_DIM then h = MIN_TEXT_DIM end
@@ -2812,12 +3078,15 @@ local function textCreate(parent, data)
 	-- The FontString sits on a child frame rather than on the region, the trap
 	-- SubText.lua documents: a child frame's draw layers all sit above its
 	-- parent's, so a border sub-region built as a child frame would paint over
-	-- text created directly on the region. The level is asserted in modify, since
-	-- SetParent resets it.
+	-- text created directly on the region.
 	local textFrame = CreateFrame("Frame", nil, region)
 	textFrame:SetAllPoints(region)
 	region.textFrame = textFrame
 	region.text = textFrame:CreateFontString(nil, "OVERLAY")
+
+	function region:ApplyInternalFrameLevels()
+		self.textFrame:SetFrameLevel(self:GetFrameLevel() + 1)
+	end
 
 	WA.regionPrototype.create(region)
 
@@ -2852,10 +3121,10 @@ local function textModify(region, data)
 	-- Not merely SetTextHeight: upstream re-calls SetFont at the new size first
 	-- (Text.lua), so a condition-driven size change re-enters the read-back that
 	-- keeps a face the client refuses from leaving the string unrendered. Routed
-	-- through textCore rather than opening a second SetFont call site.
+	-- through textCore rather than opening a second SetFont call site, which is
+	-- also what applies the SetTextHeight the client's size ceiling needs.
 	function region:SetTextHeight(size)
 		WA.textCore.Apply(self.text, data, "", size, WA.textCore.REGION_KEYS)
-		self.text:SetTextHeight(size)
 	end
 
 	-- A condition can replace the whole string, and that changes two answers, not
@@ -2924,10 +3193,7 @@ local function textModify(region, data)
 	local col = data.color or { 1, 1, 1, 1 }
 	region:Color(col[1], col[2], col[3], col[4])
 
-	-- ApplyPosition may SetParent, which resets child frame levels, so the text
-	-- frame's is asserted after it -- below SUB_LEVEL, where region internals live.
 	WA.regionPrototype.ApplyPosition(region, data)
-	region.textFrame:SetFrameLevel(region:GetFrameLevel() + 1)
 
 	-- The region's own FrameTick subscription is installed *after* modifyFinish,
 	-- which drops every subscriber before rebuilding the sub-regions'.
@@ -2937,12 +3203,33 @@ local function textModify(region, data)
 	region:ConfigureSubscribers()
 end
 
-local PROGTEX_ORIENTATIONS = { "HORIZONTAL", "HORIZONTAL_INVERSE", "VERTICAL", "VERTICAL_INVERSE" }
+local PROGTEX_ORIENTATIONS = {
+	"HORIZONTAL", "HORIZONTAL_INVERSE", "VERTICAL", "VERTICAL_INVERSE",
+	"CLOCKWISE", "ANTICLOCKWISE",
+}
 local PROGTEX_ORIENTATION_LABELS = {
 	HORIZONTAL = "Right to Left", HORIZONTAL_INVERSE = "Left to Right",
 	VERTICAL = "Bottom to Top", VERTICAL_INVERSE = "Top to Bottom",
+	-- "Fills", because unlike the linear labels beside them these name the
+	-- direction the wedge is laid out from the start angle, not the direction
+	-- its edge travels: a draining aura's progress falls, so a clockwise fill
+	-- empties anticlockwise. Upstream's own labels say only "Clockwise" and
+	-- read as a promise about motion.
+	CLOCKWISE = "Fills Clockwise", ANTICLOCKWISE = "Fills Anticlockwise",
 }
+
+-- The two orientation families draw through different primitives: a linear one
+-- resizes and crops a single texture, a circular one hands an angle pair to a
+-- three-texture WA.Spinner.
+local function isCircular(o)
+	return o == "CLOCKWISE" or o == "ANTICLOCKWISE"
+end
 local PROGTEX_DEFAULT = "Interface\\AddOns\\WeakestAuras\\textures\\shapes\\Square_FullWhite.tga"
+
+-- Upstream's default crop, and the value that means "no crop": the transform
+-- scales the sampled area by sqrt(2) before dividing by 1 + crop, so 0.41
+-- cancels it and anything smaller zooms in.
+local PROGTEX_CROP_DEFAULT = 0.41
 
 -- Corner texcoords cropping the source to the drawn fraction, in SetTexCoord's
 -- (UL, LL, UR, LR) order. Ported from WA2 LinearProgressTextureBase's
@@ -2970,40 +3257,27 @@ local PROGTEX_TEXCOORDS = {
 	end,
 }
 
--- Rotates/mirrors one source corner about the texture's centre (WA2
--- TextureCoords.TransformPoint, minus the crop and user-offset terms this
--- region type exposes no options for). Upstream's 1/sqrt(2) shrink is absent
--- with it: that shrink exists to be cancelled by upstream's default crop of
--- 1.41, so reproducing only half the pair would silently zoom the art. A
--- rotation therefore runs the corners outside [0, 1], which reads as
--- transparent margins on this client rather than as wrapped or clamped art.
-local function progTexPoint(x, y, cosR, sinR, mirror, userX, userY)
-	x, y = x - 0.5, y - 0.5
-	if mirror then x = -x end
-	x, y = cosR * x - sinR * y, sinR * x + cosR * y
-	return x + 0.5 + (userX or 0), y + 0.5 + (userY or 0)
-end
-
--- The crop above, then the rotation/mirror on top of it -- upstream's order in
--- LinearProgressTextureBase.UpdateTextures, and it is load-bearing: rotating
--- first would spin the axis the crop then measures along.
+-- The progress crop first, then the display transform on top of it --
+-- upstream's order in LinearProgressTextureBase.UpdateTextures, and it is
+-- load-bearing: rotating first would spin the axis the progress crop then
+-- measures along.
+--
+-- The transform is the spinner's, shared verbatim, which is what gives the two
+-- orientation families one meaning for `crop_x` and friends -- and upstream's
+-- meaning, so a WeakAuras2 aura's values travel untranslated. `crop_x` is a
+-- sampling SCALE about the texture centre (larger samples wider), not an inset
+-- of each edge; the sqrt(2) growth inside TransformPoint is exactly what the
+-- 1.41 default cancels, so the two halves only make sense together.
 local function progTexCoords(o, p, rotation, mirror, cropX, cropY, userX, userY)
 	local coords = PROGTEX_TEXCOORDS[o] or PROGTEX_TEXCOORDS.HORIZONTAL
 	local ULx, ULy, LLx, LLy, URx, URy, LRx, LRy = coords(p)
-	cropX, cropY = cropX or 0, cropY or 0
-	local sx, sy = 1 - cropX * 2, 1 - cropY * 2
-	local function crop(x, y) return cropX + x * sx, cropY + y * sy end
-	ULx, ULy = crop(ULx, ULy); LLx, LLy = crop(LLx, LLy)
-	URx, URy = crop(URx, URy); LRx, LRy = crop(LRx, LRy)
-	if not mirror and math.mod(rotation or 0, 360) == 0 then
-		return ULx + (userX or 0), ULy + (userY or 0), LLx + (userX or 0), LLy + (userY or 0), URx + (userX or 0), URy + (userY or 0), LRx + (userX or 0), LRy + (userY or 0)
-	end
-	local r = math.rad(rotation or 0)
-	local cosR, sinR = math.cos(r), math.sin(r)
-	ULx, ULy = progTexPoint(ULx, ULy, cosR, sinR, mirror, userX, userY)
-	LLx, LLy = progTexPoint(LLx, LLy, cosR, sinR, mirror, userX, userY)
-	URx, URy = progTexPoint(URx, URy, cosR, sinR, mirror, userX, userY)
-	LRx, LRy = progTexPoint(LRx, LRy, cosR, sinR, mirror, userX, userY)
+	local transform = WA.TextureCoords.TransformPoint
+	local scaleX, scaleY = 1 + (cropX or 0), 1 + (cropY or 0)
+	local texRotation = rotation or 0
+	ULx, ULy = transform(ULx, ULy, scaleX, scaleY, texRotation, mirror, false, userX, userY)
+	LLx, LLy = transform(LLx, LLy, scaleX, scaleY, texRotation, mirror, false, userX, userY)
+	URx, URy = transform(URx, URy, scaleX, scaleY, texRotation, mirror, false, userX, userY)
+	LRx, LRy = transform(LRx, LRy, scaleX, scaleY, texRotation, mirror, false, userX, userY)
 	return ULx, ULy, LLx, LLy, URx, URy, LRx, LRy
 end
 
@@ -3019,6 +3293,45 @@ local PROGTEX_ALIGN = {
 	VERTICAL_INVERSE = { "TOPLEFT", "TOPRIGHT" },
 }
 
+-- Six wedge textures -- three per layer -- built on the first circular
+-- orientation, so a linear region never pays for textures it will not draw.
+-- False without the client's corner transforms, which is what keeps
+-- WA.RegionSpecFor routing a circular aura to the fallback region there.
+local function progTexSpinners(region)
+	if region.foregroundSpinner then return true end
+	if not (WA.Spinner and WA.hasTextureTransforms) then return false end
+	local bgSpinner = WA.Spinner.Create(region, "BACKGROUND")
+	local fgSpinner = WA.Spinner.Create(region, "ARTWORK")
+	if not (bgSpinner and fgSpinner) then return false end
+	region.backgroundSpinner, region.foregroundSpinner = bgSpinner, fgSpinner
+	-- The look setters run before the first circular orientation reaches the
+	-- region, so the values they cached are pushed once here; from now on each
+	-- setter reaches the spinner directly.
+	fgSpinner:SetTexture(region.fgTexture or PROGTEX_DEFAULT)
+	bgSpinner:SetTexture(region.bgTexture or PROGTEX_DEFAULT)
+	local fc = region.fgColor or { 1, 1, 1, 1 }
+	local bc = region.bgColor or { 0.5, 0.5, 0.5, 0.5 }
+	fgSpinner:SetColor(fc[1], fc[2], fc[3], fc[4] or 1)
+	bgSpinner:SetColor(bc[1], bc[2], bc[3], bc[4] or 1)
+	fgSpinner:SetDesaturated(region.desaturateForeground)
+	bgSpinner:SetDesaturated(region.desaturateBackground)
+	return true
+end
+
+-- The wedge span this region's angles describe. Matches upstream's normalize:
+-- both ends into [0, 360), then lift the end above the start -- which is what
+-- turns the 0/360 default pair into a full circle rather than a zero span.
+-- math.mod keeps the dividend's sign here, so the negative branch is not
+-- optional.
+local function progTexAngles(region)
+	local a1 = math.mod(region.startAngle or 0, 360)
+	local a2 = math.mod(region.endAngle or 360, 360)
+	if a1 < 0 then a1 = a1 + 360 end
+	if a2 < 0 then a2 = a2 + 360 end
+	if a2 <= a1 then a2 = a2 + 360 end
+	return a1, a2
+end
+
 -- Sizes and crops the fill texture to region.progress. Both have to move
 -- together, exactly as in fillBar: the texture is cropped to the same fraction
 -- of the same axis it is scaled to, or the art squashes instead of revealing.
@@ -3030,6 +3343,21 @@ local function progTexFill(region)
 	if p < 0 then p = 0 elseif p > 1 then p = 1 end
 	local fg = region.foreground
 	if not fg then return end
+
+	-- The per-frame half of the circular path: one angle pair and nothing else.
+	-- Everything the wedges are made of is pushed by progTexBackground, which
+	-- only ever runs off a setter.
+	if isCircular(o) then
+		local spinner = region.foregroundSpinner
+		if not spinner then return end
+		local a1, a2 = progTexAngles(region)
+		if o == "ANTICLOCKWISE" then
+			spinner:SetProgress(a1 + (a2 - a1) * (1 - p), a2)
+		else
+			spinner:SetProgress(a1, a1 + (a2 - a1) * p)
+		end
+		return
+	end
 
 	local vertical = isVertical(o)
 	local extent = (vertical and (region.regionHeight or 0) or (region.regionWidth or 0)) * p
@@ -3046,10 +3374,42 @@ local function progTexFill(region)
 	fg:Show()
 end
 
+-- The background, and with it everything about a circular fill that is not the
+-- angle pair: which family draws, the wedge size, and the texcoord transform.
+-- Every caller is a setter or modify -- never the per-frame path -- because
+-- each of these rebuilds all three wedges of both spinners.
 local function progTexBackground(region)
 	local background = region.background
 	if not background then return end
 	local o = region.orientation or "HORIZONTAL"
+
+	if isCircular(o) and progTexSpinners(region) then
+		background:Hide()
+		region.foreground:Hide()
+		local fgSpinner, bgSpinner = region.foregroundSpinner, region.backgroundSpinner
+		local w, h = region.regionWidth or 0, region.regionHeight or 0
+		local scaleX = 1 + (region.crop_x or 0)
+		local scaleY = 1 + (region.crop_y or 0)
+		local texRotation = region.animRotation or region.rotation or 0
+		local mirror = region.mirror and true or false
+		fgSpinner:SetWidth(w); fgSpinner:SetHeight(h)
+		bgSpinner:SetWidth(w); bgSpinner:SetHeight(h)
+		fgSpinner:SetMirror(mirror); bgSpinner:SetMirror(mirror)
+		fgSpinner:SetTexRotation(texRotation); bgSpinner:SetTexRotation(texRotation)
+		fgSpinner:SetCropX(scaleX); bgSpinner:SetCropX(scaleX)
+		fgSpinner:SetCropY(scaleY); bgSpinner:SetCropY(scaleY)
+		bgSpinner:SetProgress(progTexAngles(region))
+		fgSpinner:Show(); bgSpinner:Show()
+		return
+	end
+
+	-- Leaving the circular family releases the wedges, and the client holds a
+	-- texture's vertex offsets until something explicitly clears them.
+	if region.foregroundSpinner then
+		region.foregroundSpinner:Hide(); region.foregroundSpinner:Reset()
+		region.backgroundSpinner:Hide(); region.backgroundSpinner:Reset()
+	end
+	background:Show()
 	background:SetTexCoord(progTexCoords(o, 1, region.animRotation or region.rotation, region.mirror, region.crop_x, region.crop_y, region.user_x, region.user_y))
 end
 
@@ -3066,7 +3426,8 @@ WA.RegisterRegionType("progresstexture", {
 		desaturateBackground = false,
 		width = 200, height = 32, alpha = 1,
 		orientation = "HORIZONTAL", inverse = false, mirror = false, rotation = 0,
-		crop_x = 0, crop_y = 0, user_x = 0, user_y = 0,
+		startAngle = 0, endAngle = 360,
+		crop_x = PROGTEX_CROP_DEFAULT, crop_y = PROGTEX_CROP_DEFAULT, user_x = 0, user_y = 0,
 		progressSource = -1, progressSourceManualValue = 0, progressSourceManualTotal = 100,
 		anchorFrameType = "SCREEN", selfPoint = "CENTER", anchorPoint = "CENTER",
 		xOffset = 0, yOffset = 0, frameStrata = 1,
@@ -3082,31 +3443,75 @@ WA.RegisterRegionType("progresstexture", {
 		inverse = { display = "Inverse", setter = "SetInverse", type = "bool" },
 		mirror = { display = "Mirror", setter = "SetMirror", type = "bool" },
 		rotation = { display = "Texture Rotation", setter = "SetTexRotation", type = "number", min = 0, max = 360, step = 1 },
-		crop_x = { display = "Crop X", setter = "SetCropX", type = "number", min = 0, max = 0.5, step = 0.01 },
-		crop_y = { display = "Crop Y", setter = "SetCropY", type = "number", min = 0, max = 0.5, step = 0.01 },
+		crop_x = { display = "Crop X", setter = "SetCropX", type = "number", min = 0, max = 2, step = 0.01 },
+		crop_y = { display = "Crop Y", setter = "SetCropY", type = "number", min = 0, max = 2, step = 0.01 },
 		user_x = { display = "Re-center X", setter = "SetUserX", type = "number", min = -0.5, max = 0.5, step = 0.01 },
 		user_y = { display = "Re-center Y", setter = "SetUserY", type = "number", min = -0.5, max = 0.5, step = 0.01 },
 		foregroundTexture = { display = "Foreground Texture", setter = "SetForegroundTexture", type = "texture" },
 		backgroundTexture = { display = "Background Texture", setter = "SetBackgroundTexture", type = "texture" },
 	})),
+	-- The wedge pair is built with the frame and never per bind: a row is
+	-- rebound to a different aura on every scroll tick and frames cannot be
+	-- destroyed here.
 	createThumbnail = function(parent)
 		local frame = CreateFrame("Frame", nil, parent)
 		frame.bg = frame:CreateTexture(nil, "BACKGROUND")
 		frame.fg = frame:CreateTexture(nil, "ARTWORK")
+		frame.bgSpinner = WA.Spinner and WA.Spinner.Create(frame, "BACKGROUND")
+		frame.fgSpinner = WA.Spinner and WA.Spinner.Create(frame, "ARTWORK")
 		return frame
 	end,
+	-- The same fixed 60% fill either family draws, so switching orientation in
+	-- the editor changes the row's shape and nothing else.
 	modifyThumbnail = function(frame, data)
 		local size = frame:GetHeight() or 32
 		local o = data.orientation or "HORIZONTAL"
+		local bc = data.backgroundColor or { 0.5, 0.5, 0.5, 0.5 }
+		local c = data.foregroundColor or { 1, 1, 1, 1 }
+		local p = 0.6
+
+		if isCircular(o) and frame.fgSpinner then
+			frame.bg:Hide(); frame.fg:Hide()
+			local fgSpinner, bgSpinner = frame.fgSpinner, frame.bgSpinner
+			local w, h = frame:GetWidth() or 0, size
+			fgSpinner:SetTexture(WA.DrawableTexture(data.foregroundTexture) or PROGTEX_DEFAULT)
+			bgSpinner:SetTexture(WA.DrawableTexture(data.backgroundTexture) or PROGTEX_DEFAULT)
+			fgSpinner:SetColor(c[1], c[2], c[3], c[4] or 1)
+			bgSpinner:SetColor(bc[1], bc[2], bc[3], bc[4] or 1)
+			fgSpinner:SetWidth(w); fgSpinner:SetHeight(h)
+			bgSpinner:SetWidth(w); bgSpinner:SetHeight(h)
+			fgSpinner:SetCropX(1 + (data.crop_x or 0)); bgSpinner:SetCropX(1 + (data.crop_x or 0))
+			fgSpinner:SetCropY(1 + (data.crop_y or 0)); bgSpinner:SetCropY(1 + (data.crop_y or 0))
+			fgSpinner:SetTexRotation(data.rotation or 0); bgSpinner:SetTexRotation(data.rotation or 0)
+			fgSpinner:SetMirror(data.mirror and true or false)
+			bgSpinner:SetMirror(data.mirror and true or false)
+			local a1, a2 = progTexAngles(data)
+			bgSpinner:SetProgress(a1, a2)
+			if o == "ANTICLOCKWISE" then
+				fgSpinner:SetProgress(a1 + (a2 - a1) * (1 - p), a2)
+			else
+				fgSpinner:SetProgress(a1, a1 + (a2 - a1) * p)
+			end
+			fgSpinner:Show(); bgSpinner:Show()
+			return
+		end
+
+		-- Leaving the circular family releases the wedges, and the client holds
+		-- a texture's vertex offsets until something explicitly clears them.
+		if frame.fgSpinner then
+			frame.fgSpinner:Hide(); frame.fgSpinner:Reset()
+			frame.bgSpinner:Hide(); frame.bgSpinner:Reset()
+		end
 		local vertical = isVertical(o)
-		local long, thick = size * 0.82, size * 0.35
+		-- Without the corner transforms a circular aura has no wedges to draw,
+		-- and gets the square hint the linear bar cannot be mistaken for.
+		local long, thick = size * 0.82, isCircular(o) and size * 0.82 or size * 0.35
 		frame.bg:SetWidth(vertical and thick or long); frame.bg:SetHeight(vertical and long or thick)
 		frame.bg:SetPoint("CENTER", frame, "CENTER")
-		frame.bg:SetTexture((data.backgroundColor or { 0.5, 0.5, 0.5, 0.5})[1], (data.backgroundColor or { 0.5, 0.5, 0.5, 0.5})[2], (data.backgroundColor or { 0.5, 0.5, 0.5, 0.5})[3], (data.backgroundColor or { 0.5, 0.5, 0.5, 0.5})[4])
+		frame.bg:SetTexture(bc[1], bc[2], bc[3], bc[4])
+		frame.bg:Show()
 		frame.fg:SetTexture(WA.DrawableTexture(data.foregroundTexture) or PROGTEX_DEFAULT)
-		local c = data.foregroundColor or { 1, 1, 1, 1 }
 		frame.fg:SetVertexColor(c[1], c[2], c[3], c[4] or 1)
-		local p = 0.6
 		frame.fg:SetWidth(vertical and thick or long * p); frame.fg:SetHeight(vertical and long * p or thick)
 		frame.fg:SetPoint(vertical and "BOTTOM" or "LEFT", frame.bg, vertical and "BOTTOM" or "LEFT")
 		frame.fg:Show()
@@ -3125,14 +3530,29 @@ WA.RegisterRegionType("progresstexture", {
 			{ type = "toggle", name = "Mirror", key = "mirror", half = true, get = function() return data.mirror end, set = function(v) data.mirror = v; WA.Add(data, true) end },
 			{ type = "range", name = "Texture rotation", key = "rotation", min = 0, max = 360, step = 1, half = true, get = function() return data.rotation end, set = function(v) data.rotation = v; WA.Add(data, true) end },
 			{ type = "range", name = "Alpha", key = "alpha", min = 0, max = 1, step = 0.05, half = true, get = function() return data.alpha end, set = function(v) data.alpha = v; WA.Add(data, true) end },
-			{ type = "range", name = "Crop X", key = "crop_x", min = 0, max = 0.5, step = 0.01, half = true, get = function() return data.crop_x end, set = function(v) data.crop_x = v; WA.Add(data, true) end },
-			{ type = "range", name = "Crop Y", key = "crop_y", min = 0, max = 0.5, step = 0.01, half = true, get = function() return data.crop_y end, set = function(v) data.crop_y = v; WA.Add(data, true) end },
+			{ type = "range", name = "Crop X", key = "crop_x", min = 0, max = 2, step = 0.01, half = true, get = function() return data.crop_x end, set = function(v) data.crop_x = v; WA.Add(data, true) end },
+			{ type = "range", name = "Crop Y", key = "crop_y", min = 0, max = 2, step = 0.01, half = true, get = function() return data.crop_y end, set = function(v) data.crop_y = v; WA.Add(data, true) end },
 			{ type = "range", name = "Re-center X", key = "user_x", min = -0.5, max = 0.5, step = 0.01, half = true, get = function() return data.user_x end, set = function(v) data.user_x = v; WA.Add(data, true) end },
 			{ type = "range", name = "Re-center Y", key = "user_y", min = -0.5, max = 0.5, step = 0.01, half = true, get = function() return data.user_y end, set = function(v) data.user_y = v; WA.Add(data, true) end },
 			{ type = "header", name = "Size" },
 			{ type = "range", name = "Width", key = "width", min = 8, max = 512, step = 1, half = true, get = function() return data.width end, set = function(v) data.width = v; WA.Add(data, true) end },
 			{ type = "range", name = "Height", key = "height", min = 8, max = 512, step = 1, half = true, get = function() return data.height end, set = function(v) data.height = v; WA.Add(data, true) end },
 		}
+		-- The arc the fill sweeps, which only a circular orientation has; it
+		-- belongs beside the orientation that introduced it, not at the tail.
+		if isCircular(data.orientation) then
+			-- Re-centering is linear-only, here as upstream: the spinner's own
+			-- transform has no user-offset term at all.
+			for i = table.getn(fields), 1, -1 do
+				if fields[i].key == "user_x" or fields[i].key == "user_y" then
+					table.remove(fields, i)
+				end
+			end
+			local at = table.getn(fields) + 1
+			for i, f in ipairs(fields) do if f.key == "orientation" then at = i + 1 end end
+			table.insert(fields, at, { type = "range", name = "End angle", key = "endAngle", min = 0, max = 360, step = 1, half = true, get = function() return data.endAngle end, set = function(v) data.endAngle = v; WA.Add(data, true) end })
+			table.insert(fields, at, { type = "range", name = "Start angle", key = "startAngle", min = 0, max = 360, step = 1, half = true, get = function() return data.startAngle end, set = function(v) data.startAngle = v; WA.Add(data, true) end })
+		end
 		if not data.sameTexture then
 			table.insert(fields, 3, { type = "texture", name = "Background texture", key = "backgroundTexture", get = function() return data.backgroundTexture end, set = function(v) data.backgroundTexture = v; WA.Add(data, true); WA.RefreshList() end })
 		end
@@ -3193,23 +3613,54 @@ WA.RegisterRegionType("progresstexture", {
 		return region
 	end,
 	modify = function(region, data)
-		function region:SetRegionWidth(v) self.regionWidth = v; self:SetWidth(v); progTexFill(self) end
-		function region:SetRegionHeight(v) self.regionHeight = v; self:SetHeight(v); progTexFill(self) end
-		function region:SetForegroundTexture(v) self.foreground:SetTexture(WA.DrawableTexture(v) or PROGTEX_DEFAULT); progTexFill(self) end
-		function region:SetBackgroundTexture(v) self.background:SetTexture(WA.DrawableTexture(v) or PROGTEX_DEFAULT); progTexBackground(self) end
-		function region:Color(r, g, b, a) self.foreground:SetVertexColor(r, g, b, a or 1) end
-		function region:SetBackgroundColor(r, g, b, a) self.background:SetVertexColor(r, g, b, a or 1) end
-		function region:SetForegroundDesaturated(v) self.foreground:SetDesaturated(v and true or false) end
-		function region:SetBackgroundDesaturated(v) self.background:SetDesaturated(v and true or false) end
+		-- Each look setter caches what it resolved: a circular orientation can
+		-- arrive after them (modify sets the art and the colors first), and the
+		-- spinners are built at that point out of the cache.
+		function region:SetRegionWidth(v) self.regionWidth = v; self:SetWidth(v); progTexBackground(self); progTexFill(self) end
+		function region:SetRegionHeight(v) self.regionHeight = v; self:SetHeight(v); progTexBackground(self); progTexFill(self) end
+		function region:SetForegroundTexture(v)
+			self.fgTexture = WA.DrawableTexture(v) or PROGTEX_DEFAULT
+			self.foreground:SetTexture(self.fgTexture)
+			if self.foregroundSpinner then self.foregroundSpinner:SetTexture(self.fgTexture) end
+			progTexFill(self)
+		end
+		function region:SetBackgroundTexture(v)
+			self.bgTexture = WA.DrawableTexture(v) or PROGTEX_DEFAULT
+			self.background:SetTexture(self.bgTexture)
+			if self.backgroundSpinner then self.backgroundSpinner:SetTexture(self.bgTexture) end
+			progTexBackground(self)
+		end
+		function region:Color(r, g, b, a)
+			self.fgColor = { r, g, b, a or 1 }
+			self.foreground:SetVertexColor(r, g, b, a or 1)
+			if self.foregroundSpinner then self.foregroundSpinner:SetColor(r, g, b, a or 1) end
+		end
+		function region:SetBackgroundColor(r, g, b, a)
+			self.bgColor = { r, g, b, a or 1 }
+			self.background:SetVertexColor(r, g, b, a or 1)
+			if self.backgroundSpinner then self.backgroundSpinner:SetColor(r, g, b, a or 1) end
+		end
+		function region:SetForegroundDesaturated(v)
+			self.desaturateForeground = v and true or false
+			self.foreground:SetDesaturated(self.desaturateForeground)
+			if self.foregroundSpinner then self.foregroundSpinner:SetDesaturated(self.desaturateForeground) end
+		end
+		function region:SetBackgroundDesaturated(v)
+			self.desaturateBackground = v and true or false
+			self.background:SetDesaturated(self.desaturateBackground)
+			if self.backgroundSpinner then self.backgroundSpinner:SetDesaturated(self.desaturateBackground) end
+		end
 		function region:SetOrientation(v) self.orientation = v; progTexBackground(self); progTexFill(self) end
 		function region:SetInverse(v) self.inverse = v and true or false; if self.state then WA.regionPrototype.UpdateProgress(self) end end
 		function region:SetMirror(v) self.mirror = v and true or false; progTexBackground(self); progTexFill(self) end
 		function region:SetTexRotation(v) self.rotation = v or 0; progTexBackground(self); progTexFill(self) end
 		function region:SetAnimRotation(v) self.animRotation = v; progTexBackground(self); progTexFill(self) end
 		function region:GetBaseRotation() return self.rotation or 0 end
-		function region:SetCropX(v) self.crop_x = math.max(0, math.min(0.5, v or 0)); progTexBackground(self); progTexFill(self) end
-		function region:SetCropY(v) self.crop_y = math.max(0, math.min(0.5, v or 0)); progTexBackground(self); progTexFill(self) end
-		function region:SetUserX(v) self.user_x = math.max(-0.5, math.min(0.5, v or 0)); progTexBackground(self); progTexFill(self) end
+		function region:SetCropX(v) self.crop_x = math.max(0, v or 0); progTexBackground(self); progTexFill(self) end
+		function region:SetCropY(v) self.crop_y = math.max(0, v or 0); progTexBackground(self); progTexFill(self) end
+		-- The stored X shift is negated on the way to the texture, upstream's
+		-- own sign for this key, so a positive value moves the art right.
+		function region:SetUserX(v) self.user_x = -math.max(-0.5, math.min(0.5, v or 0)); progTexBackground(self); progTexFill(self) end
 		function region:SetUserY(v) self.user_y = math.max(-0.5, math.min(0.5, v or 0)); progTexBackground(self); progTexFill(self) end
 		region:SetRegionWidth(data.width); region:SetRegionHeight(data.height)
 		region:SetRegionAlpha(data.alpha)
@@ -3218,9 +3669,11 @@ WA.RegisterRegionType("progresstexture", {
 		local bc = data.backgroundColor or { 0.5, 0.5, 0.5, 0.5 }; region:SetBackgroundColor(bc[1], bc[2], bc[3], bc[4])
 		region:SetForegroundDesaturated(data.desaturateForeground); region:SetBackgroundDesaturated(data.desaturateBackground)
 		region.orientation = data.orientation; region.inverse = data.inverse
+		region.startAngle = data.startAngle or 0; region.endAngle = data.endAngle or 360
 		region.rotation = data.rotation; region.mirror = data.mirror and true or false
-		region.crop_x = data.crop_x or 0; region.crop_y = data.crop_y or 0
-		region.user_x = data.user_x or 0; region.user_y = data.user_y or 0
+		region:SetCropX(data.crop_x or PROGTEX_CROP_DEFAULT)
+		region:SetCropY(data.crop_y or PROGTEX_CROP_DEFAULT)
+		region:SetUserX(data.user_x); region:SetUserY(data.user_y)
 		region.progress = region.progress or 1
 		progTexBackground(region)
 		progTexFill(region)
@@ -3266,7 +3719,7 @@ WA.RegisterRegionType("text", {
 	-- offering to change it would silently do nothing.
 	properties = WA.regionPrototype.AddProperties({
 		color = { display = "Color", setter = "Color", type = "color" },
-		fontSize = { display = "Font Size", setter = "SetTextHeight", type = "number", min = 6, max = 72, step = 1 },
+		fontSize = { display = "Font Size", setter = "SetTextHeight", type = "number", min = 6, softMax = 72, step = 1 },
 		displayText = { display = "Text", setter = "ChangeText", type = "string" },
 	}),
 	-- List-row preview: the configured string, not a resolved one -- there is no
@@ -3299,9 +3752,8 @@ WA.RegisterRegionType("text", {
 		local fields = {
 			{ type = "header", name = "Text" },
 			{
-				-- %i is absent from the label deliberately: it resolves to nothing
-				-- here, this client's FontString having no inline texture escape.
-				type = "multiline", name = "Display text (%p %t %n %s %c)", key = "displayText", height = 60,
+				type = "multiline", name = WA.TextSymbolLabel("Display text"),
+				key = "displayText", height = 60,
 				get = function() return data.displayText end,
 				-- Re-renders the tab: the Format rows below are one per symbol in
 				-- this string, so editing it changes which rows exist.
@@ -3314,7 +3766,7 @@ WA.RegisterRegionType("text", {
 				end,
 			},
 			{
-				type = "range", name = "Size", key = "fontSize", min = 6, max = 72, step = 1, half = true,
+				type = "range", name = "Size", key = "fontSize", min = 6, softMax = 72, step = 1, half = true,
 				get = function() return data.fontSize end,
 				set = function(v) data.fontSize = v; WA.Add(data, true) end,
 			},
@@ -3434,7 +3886,6 @@ WA.RegisterRegionType("fallback", {
 
 		region:SetRegionAlpha(data.alpha or 1)
 		WA.regionPrototype.ApplyPosition(region, data)
-		region.textFrame:SetFrameLevel(region:GetFrameLevel() + 1)
 		WA.regionPrototype.modifyFinish(region, data)
 
 		local requested = data.regionType

@@ -111,10 +111,11 @@ local FACTION_LABELS = { Horde = "Horde", Alliance = "Alliance" }
 -- the character (combat, zone, group, stance, alive, mounted, taxi). Skipping
 -- exactly those is what separates "this aura isn't for this character" from
 -- "this aura is mine but the moment doesn't qualify" -- see WA.EvalLoadStatic.
--- `never` is handled outside this list (a plain gate-less kill switch). `class`
--- is the one entry the options renderer special-cases: its gate isn't a plain
--- on/off toggle but a 3-way "off"/"single"/"multi" mode select (`use_class`
--- holds the string, not a boolean) -- see OptionsFrame.lua's appendLoadOptions.
+-- `never` is handled outside this list (a plain gate-less kill switch).
+-- A `multiselect` widget is the one gate that is not a plain on/off toggle:
+-- `use_<name>` holds a mode string, and the constraint passes if the character's
+-- value is the one chosen or in the set chosen. The convention and its editor
+-- live in WeakestAuras.lua; these entries only say which constraints take one.
 WA.loadPrototype = {
 	{
 		name = "combat", display = "Combat", widget = "select", optional = true,
@@ -126,40 +127,34 @@ WA.loadPrototype = {
 		end,
 	},
 	{
-		-- Two tiers, matching WA2's multiselect single/multi toggle: `use_class`
-		-- is "single" (L.class, one token) or "multi" (L.classes, a token set),
-		-- not a plain on/off boolean -- see OptionsFrame.lua's appendLoadOptions.
-		-- isActive is required here: WA.EvalLoad's default gate treats *any*
-		-- truthy L.use_class as "constraint on", but a stray non-"single"/"multi"
-		-- value (a leftover "off" from an older save, say) is truthy in Lua and
-		-- would permanently fail eval() below, silently hard-blocking the aura
-		-- while the Load tab's own dropdown still displays "Ignored".
-		name = "class", display = "Class", widget = "classtier",
-		isActive = function(L) return L.use_class == "single" or L.use_class == "multi" end,
+		-- isActive is required on every multiselect: WA.EvalLoad's default gate
+		-- treats *any* truthy `use_<name>` as "constraint on", but a stray
+		-- non-"single"/"multi" value (a leftover "off" from an older save, say) is
+		-- truthy in Lua and would permanently fail eval() below, silently
+		-- hard-blocking the aura while the Load tab still displays "Ignored".
+		name = "class", display = "Class", widget = "multiselect",
+		values = WA.CLASS_TOKENS, labels = WA.CLASS_COLOR_LABELS,
+		isActive = function(L) return WA.MultiSelectMode(L, "class") ~= "off" end,
 		eval = function(L)
 			local _, cls = UnitClass("player")
-			if L.use_class == "single" then
-				return cls == L.class
-			elseif L.use_class == "multi" then
-				return L.classes ~= nil and L.classes[cls] and true or false
-			end
-			return false
+			return WA.MultiSelectMatches(L, "class", cls)
 		end,
 	},
 	{
-		name = "race", display = "Race", widget = "select",
+		name = "race", display = "Race", widget = "multiselect",
 		values = RACE_TOKENS, labels = RACE_LABELS, default = "Human",
+		isActive = function(L) return WA.MultiSelectMode(L, "race") ~= "off" end,
 		eval = function(L)
 			local token = UnitRaceBase and UnitRaceBase("player")
-			return token == L.race
+			return WA.MultiSelectMatches(L, "race", token)
 		end,
 	},
 	{
-		name = "faction", display = "Faction", widget = "select",
+		name = "faction", display = "Faction", widget = "multiselect",
 		values = FACTION_VALUES, labels = FACTION_LABELS, default = "Alliance",
+		isActive = function(L) return WA.MultiSelectMode(L, "faction") ~= "off" end,
 		eval = function(L)
-			local faction = UnitFactionGroup("player")
-			return faction == L.faction
+			return WA.MultiSelectMatches(L, "faction", UnitFactionGroup("player"))
 		end,
 	},
 	{
@@ -179,9 +174,10 @@ WA.loadPrototype = {
 		end,
 	},
 	{
-		name = "ingroup", display = "Group Type", widget = "select", optional = true,
+		name = "ingroup", display = "Group Type", widget = "multiselect", optional = true,
 		values = INGROUP_VALUES, labels = INGROUP_LABELS, default = "solo",
-		eval = function(L) return groupType() == (L.ingroup or "solo") end,
+		isActive = function(L) return WA.MultiSelectMode(L, "ingroup") ~= "off" end,
+		eval = function(L) return WA.MultiSelectMatches(L, "ingroup", groupType()) end,
 	},
 	{
 		name = "stance", display = "Stance/Form (0 = none)", widget = "range", optional = true,
