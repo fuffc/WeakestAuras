@@ -47,7 +47,7 @@ local function groupRect(gdata)
 	local kids = gdata.controlledChildren or {}
 	for i = 1, table.getn(kids) do
 		local cd = WeakestAurasDB.displays[kids[i]]
-		if cd then
+		if cd and WA.regionPrototype.IsGroupAnchored(cd) then
 			local a, b, c, d = childRect(cd)
 			if not blx or a < blx then blx = a end
 			if not bly or b < bly then bly = b end
@@ -110,7 +110,14 @@ end
 -- makes the frame's rectangle the content rectangle, which in turn is what lets
 -- the border, the mover and magnetism all read the frame instead of each
 -- re-deriving the box from the cached corners.
-local function drawGroupBox(region, data, blx, bly, trx, try)
+--
+-- `hasBox` is whether the corners describe anything at all. A static group can
+-- hold nothing the box is measured from -- every child anchored to a nameplate
+-- or a unit frame -- and the degenerate 8px minimum below then reads as a real
+-- box, which is the same stray patch at the group's own point that
+-- useAnchorPerUnit produces. The dynamic path always has one, its grower having
+-- placed every child it iterated whatever that child's own anchor says.
+local function drawGroupBox(region, data, blx, bly, trx, try, hasBox)
 	local changed = region.blx ~= blx or region.bly ~= bly
 		or region.trx ~= trx or region.try ~= try
 	region.blx, region.bly, region.trx, region.try = blx, bly, trx, try
@@ -124,7 +131,7 @@ local function drawGroupBox(region, data, blx, bly, trx, try)
 	-- Anchoring per unit puts every child on a frame of its own, so there is no
 	-- box left to wrap and the border would be a stray patch at the group's own
 	-- point (upstream's Resize suppresses it on the same test).
-	if data.border and not data.useAnchorPerUnit and groupHasVisibleChild(data) then
+	if data.border and hasBox and not data.useAnchorPerUnit and groupHasVisibleChild(data) then
 		border:Show()
 	else
 		border:Hide()
@@ -145,13 +152,14 @@ end
 -- are.
 local function applyGroupBounds(region, data)
 	local blx, bly, trx, try = groupRect(data)
-	drawGroupBox(region, data, blx or 0, bly or 0, trx or 0, try or 0)
+	drawGroupBox(region, data, blx or 0, bly or 0, trx or 0, try or 0, blx ~= nil)
 	-- Fitting the frame to the box moved it under the children, so their offsets
-	-- into it moved by the same amount.
+	-- into it moved by the same amount. Only the children the box was measured
+	-- from: one anchored elsewhere never moved with the frame and owes nothing.
 	local kids = data.controlledChildren or {}
 	for i = 1, table.getn(kids) do
 		local cd = WeakestAurasDB.displays[kids[i]]
-		if cd then
+		if cd and WA.regionPrototype.IsGroupAnchored(cd) then
 			WA.ForEachClone(cd.id, function(frame)
 				frame:SetOffset(WA.regionPrototype.GroupChildOffset(region, cd))
 			end)
@@ -1093,7 +1101,7 @@ local function layoutDynamicGroup(region, data)
 			stopSlide(r)
 		end
 	end
-	drawGroupBox(region, data, blx, bly, trx, try)
+	drawGroupBox(region, data, blx, bly, trx, try, true)
 end
 
 -- Every dynamic group anchoring per unit, re-laid-out because the frames it
@@ -3096,7 +3104,7 @@ WA.RegisterRegionType("progressbar", {
 		selfPoint = "CENTER",
 		anchorPoint = "CENTER",
 		xOffset = 0,
-		yOffset = -100,
+		yOffset = 0,
 		frameStrata = 1,
 	},
 	icon = "Interface\\Icons\\Spell_Nature_TimeStop",
@@ -3200,11 +3208,11 @@ WA.RegisterRegionType("progressbar", {
 		end
 	end,
 	properties = WA.regionPrototype.AddProgressProperties(WA.regionPrototype.AddProperties({
-		-- Both axes share one range: a VERTICAL bar is a tall narrow region, so a
-		-- height capped near a horizontal bar's thickness would make that
+		-- Both axes share one upper bound: a VERTICAL bar is a tall narrow region,
+		-- so a height capped near a horizontal bar's thickness would make that
 		-- orientation unbuildable from the options tab.
 		width = { display = "Width", setter = "SetRegionWidth", type = "number", min = 8, max = 400, step = 1 },
-		height = { display = "Height", setter = "SetRegionHeight", type = "number", min = 8, max = 400, step = 1 },
+		height = { display = "Height", setter = "SetRegionHeight", type = "number", min = 1, max = 400, step = 1 },
 		texture = { display = "Bar Texture", setter = "SetBarTexture", type = "list", values = BAR_TEXTURE_LABELS },
 		textureSource = { display = "Texture Source", setter = "SetBarTextureSource", type = "list", values = { LSM = "Bundled", Picker = "Custom path" } },
 		textureInput = { display = "Texture Path", setter = "SetBarTextureInput", type = "string" },
@@ -3505,7 +3513,7 @@ WA.RegisterRegionType("progressbar", {
 				set = function(v) data.width = v; WA.Add(data, true) end,
 			},
 			{
-				type = "range", name = "Height", key = "height", min = 8, max = 400, step = 1, half = true,
+				type = "range", name = "Height", key = "height", min = 1, max = 400, step = 1, half = true,
 				get = function() return data.height end,
 				set = function(v) data.height = v; WA.Add(data, true) end,
 			},

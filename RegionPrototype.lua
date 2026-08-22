@@ -1743,6 +1743,22 @@ local function settleDynamicAnchor(region, data)
 	if not region:IsVisible() then queueAnchorRetry(data) end
 end
 
+-- Whether a group's child is positioned *by* that group, which is the same
+-- question as whether it belongs in the group's bounding box. A child anchored
+-- to anything but the screen -- a nameplate, a unit frame, another aura --
+-- measures xOffset/yOffset from that frame instead, so it occupies no known
+-- point in the group's coordinate space.
+--
+-- Three places have to agree on this or they corrupt each other: ApplyPosition
+-- (which frame the child anchors to), the box union, and the post-fit offset
+-- pass that hands every child GroupChildOffset. Reading a foreign-anchored
+-- child's offsets as group-relative both stretches the box to a corner nothing
+-- occupies and then subtracts that box's centre out of the child's real offset,
+-- so the group mis-sizes itself *and* drags the child off its own anchor.
+function proto.IsGroupAnchored(cdata)
+	return cdata ~= nil and cdata.anchorFrameType == "SCREEN"
+end
+
 -- A static group's child measures xOffset/yOffset from the group's anchor, but
 -- the frame it anchors to is centred on the children's bounding box instead
 -- (UpdatePosition's box slot). The difference is what the child owes back, and
@@ -1762,7 +1778,7 @@ function proto.ApplyPosition(region, data)
 	-- client's own again; modifyFinish raises it from here if the aura carries a
 	-- subbackground row.
 	proto.ResetFrameLevel(region)
-	if pdata and WA.IsGroup(pdata) and data.anchorFrameType == "SCREEN" then
+	if pdata and WA.IsGroup(pdata) and proto.IsGroupAnchored(data) then
 		if pdata.regionType == "dynamicgroup" then
 			region:SetAnchor("CENTER", anchorFrame, "CENTER")
 			region:SetOffset(0, 0)
