@@ -74,8 +74,17 @@ local function updateChain(m)
 	m.selfIcon:Show()
 	m.anchorIcon:Show()
 
+	-- A group's frame sits on its children's bounding box rather than on the point
+	-- its anchor pins (RegionPrototype UpdatePosition's box slot), so the pinned
+	-- point is that far back from the frame's centre. Backing the icon out by it
+	-- is what keeps the chain -- and the offset it reports -- about the anchor
+	-- instead of about wherever the children happen to have pushed the box. The
+	-- offsets are the mover's own units and the box is the region's, hence the
+	-- scale; a leaf carries no box and lands on its selfPoint unchanged.
+	local scale = (region:GetEffectiveScale() or 1) / (UIParent:GetEffectiveScale() or 1)
 	m.selfIcon:ClearAllPoints()
-	m.selfIcon:SetPoint("CENTER", region, region.selfPoint or "CENTER")
+	m.selfIcon:SetPoint("CENTER", region, region.selfPoint or "CENTER",
+		-(region.xOffsetBox or 0) * scale, -(region.yOffsetBox or 0) * scale)
 	m.anchorIcon:ClearAllPoints()
 	m.anchorIcon:SetPoint("CENTER", region.anchorFrame or UIParent, region.anchorPoint or "CENTER")
 
@@ -103,30 +112,26 @@ local function updateChain(m)
 
 	-- Report the offset in the region's own (unscaled) coordinates -- the same
 	-- numbers the Position sliders and data.xOffset/yOffset carry.
-	local scale = (region:GetEffectiveScale() or 1) / (UIParent:GetEffectiveScale() or 1)
 	m.label:SetText(string.format("(%d, %d)", floor(dX / scale + 0.5), floor(dY / scale + 0.5)))
 	m.label:ClearAllPoints()
 	m.label:SetPoint("CENTER", m.anchorIcon, "CENTER", (dist / 2) * cos(angle), (dist / 2) * sin(angle))
 	m.label:Show()
 end
 
--- Positions/sizes the outline over the region: a leaf's outline tracks the frame
--- directly; a group's follows its bounding box (which changes as children come
--- and go). Split out so both Attach and the per-frame re-resolve reuse it.
+-- Positions/sizes the outline over the region. Two-point anchoring for both a
+-- leaf and a group: a group's frame is fitted to its children's bounding box
+-- (Regions.lua drawGroupBox), so its rectangle is the thing to outline just as a
+-- leaf's is. Reading the corners instead -- upstream's SetToRegion does, and
+-- pays for it by scaling every one of them by the region's effective scale over
+-- UIParent's -- would put the box's own coordinates into a frame that is a child
+-- of UIParent and does not share the group's scale. Split out so both Attach and
+-- the per-frame re-resolve reuse it.
 local function anchorToRegion(m, region)
 	m:ClearAllPoints()
-	if m.isGroup then
-		local blx, bly = (region.blx or 0) - OUTLINE_PAD, (region.bly or 0) - OUTLINE_PAD
-		local trx, try = (region.trx or 0) + OUTLINE_PAD, (region.try or 0) + OUTLINE_PAD
-		m:SetPoint("BOTTOMLEFT", region, "CENTER", blx, bly)
-		m:SetWidth(math.max(trx - blx, 8))
-		m:SetHeight(math.max(try - bly, 8))
-	else
-		-- Pad outward so the inward-painted outline straddles the region edge
-		-- rather than sitting inside it.
-		m:SetPoint("TOPLEFT", region, "TOPLEFT", -OUTLINE_PAD, OUTLINE_PAD)
-		m:SetPoint("BOTTOMRIGHT", region, "BOTTOMRIGHT", OUTLINE_PAD, -OUTLINE_PAD)
-	end
+	-- Pad outward so the inward-painted outline straddles the region edge rather
+	-- than sitting inside it.
+	m:SetPoint("TOPLEFT", region, "TOPLEFT", -OUTLINE_PAD, OUTLINE_PAD)
+	m:SetPoint("BOTTOMRIGHT", region, "BOTTOMRIGHT", OUTLINE_PAD, -OUTLINE_PAD)
 end
 
 -- Keeps the outline synced and redraws the chain. Re-resolves the live frame by
@@ -144,8 +149,6 @@ local function moverOnUpdate()
 		anchorToRegion(m, region)
 		m.resizable = (not m.isGroup) and m.data and m.data.width ~= nil and region.SetRegionWidth ~= nil
 		updateHandles(m)
-	elseif m.isGroup then
-		anchorToRegion(m, region)
 	end
 	updateChain(m)
 end

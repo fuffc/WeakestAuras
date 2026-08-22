@@ -589,6 +589,350 @@ end
 function W.CloseIconPicker()
 	if W.iconPicker then W.iconPicker.Close() end
 end
+
+-- ---------------------------------------------------------------------------
+-- Model browser
+--
+-- The icon and texture pickers browse art a grid cell can paint; a model
+-- cannot be painted into a tile, so this is a name list beside one live
+-- PlayerModel preview. Fed from WA2ModelIDs.lua's packed string -- the models
+-- this client provably contains -- indexed per top directory on first open, so
+-- a session that never browses pays nothing.
+-- ---------------------------------------------------------------------------
+
+local MODEL_CATEGORY_VALUES = { "creature", "spells", "character", "item", "world", "interface", "particles" }
+local MODEL_CATEGORY_LABELS = {
+	creature = "Creatures", spells = "Spells", character = "Characters",
+	item = "Items", world = "World", interface = "Interface", particles = "Particles",
+}
+
+local modelIndex
+local function modelListFor(category)
+	if not modelIndex then
+		modelIndex = {}
+		for i = 1, table.getn(MODEL_CATEGORY_VALUES) do
+			modelIndex[MODEL_CATEGORY_VALUES[i]] = {}
+		end
+		for path in string.gfind(WA.wa2ModelIDs or "", "%d+,([^;]+)") do
+			local _, _, top, rest = string.find(path, "^([^/]+)/(.+)$")
+			local list = top and modelIndex[top]
+			if list then table.insert(list, rest) end
+		end
+		for i = 1, table.getn(MODEL_CATEGORY_VALUES) do
+			table.sort(modelIndex[MODEL_CATEGORY_VALUES[i]])
+		end
+	end
+	return modelIndex[category] or {}
+end
+
+-- The stored form: backslashes and the .mdx spelling SetModel provably takes.
+local function modelPickPath(category, rest)
+	return string.gsub(category .. "/" .. rest, "/", "\\") .. ".mdx"
+end
+
+-- The stored form back to (category, rest), for opening the dialog on the
+-- model already in use. nil for a path outside the indexed trees.
+local function modelPickParse(value)
+	if type(value) ~= "string" or value == "" then return nil end
+	local low = string.lower(string.gsub(value, "\\", "/"))
+	low = string.gsub(low, "%.md[xl]$", "")
+	low = string.gsub(low, "%.m2$", "")
+	local _, _, top, rest = string.find(low, "^([^/]+)/(.+)$")
+	if top and MODEL_CATEGORY_LABELS[top] then return top, rest end
+	return nil
+end
+
+local MODEL_ROWS = 14
+local MODEL_ROW_H = 16
+
+local function buildModelPicker()
+	local scrollName = "WeakestAurasModelPickerScroll"
+	local pad = 10
+	local listW, previewW = 290, 200
+	local listH = MODEL_ROWS * MODEL_ROW_H + 8
+
+	local frame = CreateFrame("Frame", "WeakestAurasModelPickerDialog", UIParent)
+	frame:SetWidth(listW + previewW + pad * 3)
+	frame:SetHeight(listH + 124)
+	frame:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
+	frame:SetBackdrop(W.EDITBOX_BACKDROP)
+	frame:SetBackdropColor(0, 0, 0, 0.92)
+	frame:SetBackdropBorderColor(0.4, 0.4, 0.4, 0.9)
+	frame:SetFrameStrata("FULLSCREEN_DIALOG")
+	frame:SetToplevel(true)
+	frame:EnableMouse(true)
+	frame:SetMovable(true)
+	frame:RegisterForDrag("LeftButton")
+	frame:SetScript("OnDragStart", function() this:StartMoving() end)
+	frame:SetScript("OnDragStop", function() this:StopMovingOrSizing() end)
+	frame:SetScript("OnMouseDown", function() LibWidgets.CloseAllMenus() end)
+	frame:SetScript("OnHide", function() LibWidgets.CloseAllMenus() end)
+	frame:Hide()
+
+	local title = frame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+	title:SetPoint("TOPLEFT", pad, -pad)
+	title:SetText("Select Model")
+
+	local count = frame:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+	count:SetPoint("TOPRIGHT", -pad, -pad - 2)
+	count:SetJustifyH("RIGHT")
+
+	local selectedCategory, selectedRest = "spells", nil
+	local filtered = {}
+	local refresh, applyFilter
+
+	local search = LibWidgets.NewTextBox(frame, {
+		width = 150, height = 20, hint = "Search",
+		onChange = function(text) applyFilter(text) end,
+	})
+	search:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -pad, -pad - 22)
+	search:SetScript("OnEscapePressed", function() this:SetText(""); this:ClearFocus() end)
+
+	local categoryButton = LibWidgets.NewDropButton(frame, {
+		values = MODEL_CATEGORY_VALUES,
+		labels = MODEL_CATEGORY_LABELS,
+		width = 130, height = 20,
+		menuParent = frame,
+		get = function() return selectedCategory end,
+		onSelect = function(value)
+			selectedCategory = value
+			selectedRest = nil
+			applyFilter(search:GetText() or "")
+		end,
+	})
+	categoryButton:SetPoint("TOPLEFT", frame, "TOPLEFT", pad, -pad - 22)
+
+	local list = CreateFrame("Frame", nil, frame)
+	list:SetPoint("TOPLEFT", pad, -pad - 48)
+	list:SetWidth(listW)
+	list:SetHeight(listH)
+	list:SetBackdrop(W.EDITBOX_BACKDROP)
+	list:SetBackdropColor(0, 0, 0, 0.5)
+	list:SetBackdropBorderColor(0.4, 0.4, 0.4, 0.8)
+
+	local scroll = CreateFrame("ScrollFrame", scrollName, list, "FauxScrollFrameTemplate")
+	scroll:SetPoint("TOPLEFT", list, "TOPLEFT", 4, -4)
+	scroll:SetPoint("BOTTOMRIGHT", list, "BOTTOMRIGHT", -22, 4)
+
+	-- The live preview. Configuration rides wa* fields plus an OnShow
+	-- re-apply, because a hidden model drops its geometry.
+	local previewBox = CreateFrame("Frame", nil, frame)
+	previewBox:SetPoint("TOPLEFT", list, "TOPRIGHT", pad, 0)
+	previewBox:SetWidth(previewW)
+	previewBox:SetHeight(listH)
+	previewBox:SetBackdrop(W.EDITBOX_BACKDROP)
+	previewBox:SetBackdropColor(0, 0, 0, 0.5)
+	previewBox:SetBackdropBorderColor(0.4, 0.4, 0.4, 0.8)
+	local previewApply = function(model)
+		if model.waPath then
+			-- A known creature entry textures the preview; the raw path is
+			-- the white fallback (skins live in CreatureDisplayInfo, which
+			-- SetModel never consults).
+			local entry = WA.ResolveCreatureEntry(model.waPath)
+			if entry and model.SetCreature then
+				pcall(model.SetCreature, model, entry)
+			else
+				pcall(model.SetModel, model, model.waPath)
+			end
+			pcall(model.SetPosition, model, 0, 0, 0)
+			pcall(model.SetFacing, model, 0)
+		else
+			pcall(model.ClearModel, model)
+		end
+	end
+	local preview
+	local ok, built = pcall(CreateFrame, "PlayerModel", nil, previewBox)
+	if ok and built then
+		preview = built
+		preview:SetPoint("TOPLEFT", previewBox, "TOPLEFT", 4, -4)
+		preview:SetPoint("BOTTOMRIGHT", previewBox, "BOTTOMRIGHT", -4, 4)
+		preview:SetScript("OnShow", function() previewApply(this) end)
+		-- The model renders where the frame sat at apply time and does not
+		-- follow a later move (Regions.lua's modelOnUpdate documents the
+		-- quirk), so re-apply when the dialog stops moving.
+		preview:SetScript("OnUpdate", function()
+			local left, top = this:GetLeft(), this:GetTop()
+			if left ~= this.waLeft or top ~= this.waTop then
+				this.waLeft, this.waTop = left, top
+				this.waMoved = left and true or nil
+			elseif this.waMoved then
+				this.waMoved = nil
+				previewApply(this)
+			end
+		end)
+	end
+	local previewLabel = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+	previewLabel:SetPoint("TOPLEFT", previewBox, "BOTTOMLEFT", 2, -4)
+	previewLabel:SetPoint("TOPRIGHT", previewBox, "BOTTOMRIGHT", -2, -4)
+	previewLabel:SetJustifyH("LEFT")
+
+	local function setPreview(rest)
+		if preview then
+			preview.waPath = rest and modelPickPath(selectedCategory, rest) or nil
+			previewApply(preview)
+		end
+		previewLabel:SetText(rest or "")
+	end
+
+	local rows = {}
+	local function rowAt(i)
+		local r = rows[i]
+		if r then return r end
+		r = CreateFrame("Button", nil, list)
+		r:SetWidth(listW - 30)
+		r:SetHeight(MODEL_ROW_H)
+		r:SetPoint("TOPLEFT", list, "TOPLEFT", 6, -4 - (i - 1) * MODEL_ROW_H)
+		local hl = r:CreateTexture(nil, "HIGHLIGHT")
+		hl:SetAllPoints(r)
+		hl:SetTexture(1, 0.82, 0, 0.2)
+		local fs = r:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+		fs:SetPoint("LEFT", 2, 0)
+		fs:SetPoint("RIGHT", -2, 0)
+		fs:SetJustifyH("LEFT")
+		r.text = fs
+		r:SetScript("OnClick", function()
+			LibWidgets.CloseAllMenus()
+			if not this.rest then return end
+			selectedRest = this.rest
+			setPreview(selectedRest)
+			refresh()
+		end)
+		rows[i] = r
+		return r
+	end
+
+	refresh = function()
+		local n = table.getn(filtered)
+		FauxScrollFrame_Update(scroll, n, MODEL_ROWS, MODEL_ROW_H)
+		local offset = FauxScrollFrame_GetOffset(scroll)
+		for i = 1, MODEL_ROWS do
+			local r = rowAt(i)
+			local rest = filtered[offset + i]
+			if rest then
+				r.rest = rest
+				r.text:SetText(rest)
+				if rest == selectedRest then
+					r.text:SetTextColor(1, 0.82, 0)
+				else
+					r.text:SetTextColor(1, 1, 1)
+				end
+				r:Show()
+			else
+				r.rest = nil
+				r:Hide()
+			end
+		end
+		count:SetText(n .. (n == 1 and " model" or " models"))
+	end
+
+	applyFilter = function(text)
+		local all = modelListFor(selectedCategory)
+		filtered = {}
+		if not text or text == "" then
+			for i = 1, table.getn(all) do filtered[i] = all[i] end
+		else
+			local needle = string.lower(text)
+			for i = 1, table.getn(all) do
+				if string.find(all[i], needle, 1, true) then table.insert(filtered, all[i]) end
+			end
+		end
+		local bar = getglobal(scrollName .. "ScrollBar")
+		if bar then bar:SetValue(0) end
+		setPreview(selectedRest)
+		refresh()
+	end
+
+	scroll:SetScript("OnVerticalScroll", function()
+		FauxScrollFrame_OnVerticalScroll(MODEL_ROW_H, refresh)
+	end)
+	local function wheel()
+		local bar = getglobal(scrollName .. "ScrollBar")
+		if bar then bar:SetValue(bar:GetValue() - arg1 * MODEL_ROW_H * 3) end
+	end
+	scroll:EnableMouseWheel(true); scroll:SetScript("OnMouseWheel", wheel)
+	list:EnableMouseWheel(true); list:SetScript("OnMouseWheel", wheel)
+
+	local function scrollToSelected()
+		if not selectedRest then return end
+		for i = 1, table.getn(filtered) do
+			if filtered[i] == selectedRest then
+				local bar = getglobal(scrollName .. "ScrollBar")
+				if bar then
+					local target = (i - 1 - math.floor(MODEL_ROWS / 2)) * MODEL_ROW_H
+					local lo, hi = bar:GetMinMaxValues()
+					if target < lo then target = lo elseif target > hi then target = hi end
+					bar:SetValue(target)
+				end
+				return
+			end
+		end
+	end
+
+	local cancel = LibWidgets.NewButton(frame, {
+		text = "Cancel", width = 90,
+		onClick = function() frame.Close() end,
+	})
+	cancel:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -pad, pad)
+
+	local accept = LibWidgets.NewButton(frame, {
+		text = "Okay", width = 90,
+		onClick = function()
+			local category, rest = selectedCategory, selectedRest
+			frame.Close()
+			if rest and W.onModelPicked then W.onModelPicked(modelPickPath(category, rest)) end
+		end,
+	})
+	accept:SetPoint("RIGHT", cancel, "LEFT", -6, 0)
+
+	function frame.Open(current)
+		local category, rest = modelPickParse(current)
+		if category then
+			selectedCategory, selectedRest = category, rest
+		else
+			selectedRest = nil
+		end
+		search:SetText("")
+		applyFilter("")
+		scrollToSelected()
+		setPreview(selectedRest)
+		refresh()
+		frame:Show()
+	end
+
+	function frame.Close()
+		LibWidgets.CloseAllMenus()
+		search:ClearFocus()
+		frame:Hide()
+	end
+
+	if UISpecialFrames then table.insert(UISpecialFrames, "WeakestAurasModelPickerDialog") end
+
+	frame.search = search
+	frame.categoryButton = categoryButton
+	frame.accept = accept
+	frame.rows = rows
+	frame.preview = preview
+
+	return frame
+end
+
+-- One shared dialog behind the model region's Browse button, same shape as
+-- the icon picker's: built on first use, pick routed through a stored
+-- callback rather than rebuilding per field.
+function W.OpenModelPicker(current, onPick)
+	if not (LibWidgets.NewTextBox and LibWidgets.NewDropButton and LibWidgets.NewButton) then
+		DEFAULT_CHAT_FRAME:AddMessage("|cffff4040WeakestAuras:|r "
+			.. (W.LibWidgetsProblem() or "the loaded LibWidgets is missing the controls the model browser needs."))
+		return
+	end
+	if not W.modelPicker then W.modelPicker = buildModelPicker() end
+	W.onModelPicked = onPick
+	W.modelPicker.Open(current)
+end
+
+function W.CloseModelPicker()
+	if W.modelPicker then W.modelPicker.Close() end
+end
 -- Comparison operators offered by opnumber fields; the same set the runtime
 -- cmp() in TriggerAura understands.
 W.OPERATORS = { "==", "~=", "<", "<=", ">", ">=" }

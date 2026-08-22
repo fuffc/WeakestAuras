@@ -90,7 +90,7 @@ WA.author_option_fields = {
 	},
 	media = {
 		mediaType = "sound",
-		media = "Interface\\AddOns\\WeakAuras\\Media\\Sounds\\AirHorn.ogg",
+		media = "Interface\\AddOns\\WeakestAuras\\sounds\\AirHorn.ogg",
 	},
 	multiselect = {
 		default = {true},
@@ -115,7 +115,7 @@ WA.author_option_fields = {
 }
 
 WA.author_option_media_defaults = {
-	sound = "Interface\\AddOns\\WeakestAuras\\Media\\Sounds\\AirHorn.ogg",
+	sound = "Interface\\AddOns\\WeakestAuras\\sounds\\AirHorn.ogg",
 	font = "Friz Quadrata TT",
 	border = "1 Pixel",
 	background = "None",

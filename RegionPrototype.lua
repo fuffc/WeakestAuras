@@ -78,6 +78,8 @@ function proto.create(region)
 	region.xOffset, region.yOffset = 0, 0
 	region.xOffsetAnim, region.yOffsetAnim = 0, 0
 	region.xOffsetRelative, region.yOffsetRelative = 0, 0
+	region.xOffsetLayout, region.yOffsetLayout = 0, 0
+	region.xOffsetBox, region.yOffsetBox = 0, 0
 	region.selfPoint = "CENTER"
 	region.anchorFrame = UIParent
 	region.anchorPoint = "CENTER"
@@ -93,13 +95,30 @@ function proto.create(region)
 	region.subRegionEvents = CreateSubscribers()
 	if WA.AttachActionMethods then WA.AttachActionMethods(region) end
 
-	-- Effective position composes config + animation + relative(condition)
-	-- offsets, so those three never fight over SetPoint (§7). Anim/relative
-	-- slots stay zero until animations/conditions exist, but the composition is
-	-- built now to prevent that bug class later.
+	-- Effective position composes config + animation + relative(condition) +
+	-- layout + box offsets, so those five never fight over SetPoint (§7).
+	--
+	-- The layout slot belongs to a dynamic group's animated expand and collapse:
+	-- the config slot holds the child's *new* slot the moment the layout runs,
+	-- and the group decays this one from the old-minus-new delta to zero. It is
+	-- a slot of its own rather than a second user of the anim slot because the
+	-- animation registry holds one animation per frame -- a child that both
+	-- pulses and slides needs somewhere for the slide to live. (Upstream buys the
+	-- same separation with a per-child control-point frame.)
+	--
+	-- The box slot is a group's alone: its frame is sized to its children's
+	-- bounding box, and the box is rarely centred on the anchor the children were
+	-- measured from (a DOWN grow's hangs entirely below it). Carrying the box
+	-- centre here is what makes the frame's *rectangle* the content rectangle
+	-- while the anchor still pins the origin -- so GetLeft/GetTop on a group mean
+	-- what they say, and the border is a plain outset of the frame. It is a slot
+	-- rather than an addend on the config one because the mover writes that one
+	-- straight from a drag and would drop the correction.
 	function region:UpdatePosition()
 		local x = (self.xOffset or 0) + (self.xOffsetAnim or 0) + (self.xOffsetRelative or 0)
+			+ (self.xOffsetLayout or 0) + (self.xOffsetBox or 0)
 		local y = (self.yOffset or 0) + (self.yOffsetAnim or 0) + (self.yOffsetRelative or 0)
+			+ (self.yOffsetLayout or 0) + (self.yOffsetBox or 0)
 		self:ClearAllPoints()
 		self:SetPoint(self.selfPoint, self.anchorFrame or UIParent, self.anchorPoint, x, y)
 	end
@@ -112,6 +131,8 @@ function proto.create(region)
 	end
 	function region:SetOffset(x, y) self.xOffset, self.yOffset = x, y; self:UpdatePosition() end
 	function region:SetOffsetAnim(x, y) self.xOffsetAnim, self.yOffsetAnim = x, y; self:UpdatePosition() end
+	function region:SetOffsetLayout(x, y) self.xOffsetLayout, self.yOffsetLayout = x, y; self:UpdatePosition() end
+	function region:SetOffsetBox(x, y) self.xOffsetBox, self.yOffsetBox = x, y; self:UpdatePosition() end
 	function region:SetXOffsetRelative(x) self.xOffsetRelative = x; self:UpdatePosition() end
 	function region:SetYOffsetRelative(y) self.yOffsetRelative = y; self:UpdatePosition() end
 
@@ -426,21 +447,31 @@ end
 function proto.modifyFinish(region, data)
 	local setWidth, setHeight = region.SetRegionWidth, region.SetRegionHeight
 	if setWidth and setHeight and not WA.IsGroup(data) then
-		region.configWidth = region.configWidth or data.width
-		region.configHeight = region.configHeight or data.height
+		-- `width`/`height` hold the *configured* size, never the scaled one, and
+		-- they are upstream's field names because user code reads them: a custom
+		-- grow is handed regionData.region and does arithmetic on them to lay a
+		-- row out. Scale lives in scaleX/scaleY and is applied to the frame at
+		-- write time, exactly as upstream's UpdateSize applies `scalex` -- storing
+		-- the scaled value here instead would compound it on every Scale.
+		--
+		-- One field, not a public `width` beside a private `configWidth`: the two
+		-- would carry the same number until something wrote one of them directly,
+		-- and then Scale would silently restore the stale one.
+		region.width = region.width or data.width
+		region.height = region.height or data.height
 		region.scaleX, region.scaleY = region.scaleX or 1, region.scaleY or 1
 		function region:SetRegionWidth(width)
-			self.configWidth = width
+			self.width = width
 			setWidth(self, math.max(math.abs(width * (self.scaleX or 1)), 0.01))
 		end
 		function region:SetRegionHeight(height)
-			self.configHeight = height
+			self.height = height
 			setHeight(self, math.max(math.abs(height * (self.scaleY or 1)), 0.01))
 		end
 		function region:Scale(x, y)
 			self.scaleX, self.scaleY = x or 1, y or 1
-			self:SetRegionWidth(self.configWidth or data.width)
-			self:SetRegionHeight(self.configHeight or data.height)
+			self:SetRegionWidth(self.width or data.width)
+			self:SetRegionHeight(self.height or data.height)
 		end
 		region:SetRegionWidth(data.width)
 		region:SetRegionHeight(data.height)
@@ -1442,9 +1473,27 @@ local function unitForRegion(region)
 	return state.unit or state.unitId, state.guid or state.guidUnit
 end
 
+local function looksLikeGuid(value)
+	return type(value) == "string" and string.find(value, "^0[xX]%x+$") ~= nil
+end
+
+-- A GUID standing in for a unit token is the ordinary shape here, not an edge
+-- case: SuperWoW makes every unit-taking function accept one, and a trigger
+-- following units it has no token for -- anything keyed off a combat event --
+-- has nothing else to store.
+--
+-- C_NamePlate does not follow suit, and fails in the one way that hides itself.
+-- ClassicAPI's GetNamePlateForUnit hands the string straight to the engine's own
+-- 1.12 token resolver (src/nameplate/Info.cpp, FUN_TOKEN_TO_GUID), which knows
+-- nothing about GUIDs and answers with the *current target* rather than with
+-- nothing -- so the unit path returns a real frame, the GUID path below is never
+-- reached, and every plate-anchored clone silently stacks on the target's plate.
+-- A GUID therefore has to bypass the unit path outright: falling back to it on
+-- a nil result would not help, because it does not return nil.
 nameplateFor = function(unit, guid)
 	if not C_NamePlate then return nil end
-	if unit and C_NamePlate.GetNamePlateForUnit then
+	if not guid and looksLikeGuid(unit) then guid = unit end
+	if unit and not looksLikeGuid(unit) and C_NamePlate.GetNamePlateForUnit then
 		local frame = C_NamePlate.GetNamePlateForUnit(unit)
 		if frame then return frame end
 	end
@@ -1523,9 +1572,10 @@ end
 -- region on a hidden singleton and schedules one shared retry.
 --   * Grouped child (data.parent is a group): SetParent + anchor to the group
 --     frame's CENTER, so the group's scale cascades and moving/dragging the
---     group carries its children. xOffset/yOffset are CENTER-relative and
---     data.anchorPoint is ignored -- the group case is always center-relative
---     (WA2's Group.lua getRect reads xOffset/yOffset as such).
+--     group carries its children. xOffset/yOffset are measured from the group's
+--     anchor and data.anchorPoint is ignored -- the group case is always
+--     center-relative (WA2's Group.lua getRect reads xOffset/yOffset as such) --
+--     with GroupChildOffset converting them into the frame's own coordinates.
 --   * Top-level (SCREEN): anchor selfPoint to UIParent at data.anchorPoint.
 -- Ensuring the group frame here (WA.GetRegion) means a child applied before its
 -- group still resolves -- the group is created on demand.
@@ -1693,6 +1743,16 @@ local function settleDynamicAnchor(region, data)
 	if not region:IsVisible() then queueAnchorRetry(data) end
 end
 
+-- A static group's child measures xOffset/yOffset from the group's anchor, but
+-- the frame it anchors to is centred on the children's bounding box instead
+-- (UpdatePosition's box slot). The difference is what the child owes back, and
+-- both the reanchor here and the group's own relayout hand it the same numbers.
+function proto.GroupChildOffset(groupFrame, cdata)
+	local cx = groupFrame and groupFrame.xOffsetBox or 0
+	local cy = groupFrame and groupFrame.yOffsetBox or 0
+	return (cdata.xOffset or 0) - cx, (cdata.yOffset or 0) - cy
+end
+
 function proto.ApplyPosition(region, data)
 	local anchorFrame, anchorPoint, setParent = proto.ResolveAnchor(region, data)
 	local parentId = data.parent
@@ -1708,7 +1768,7 @@ function proto.ApplyPosition(region, data)
 			region:SetOffset(0, 0)
 		else
 			region:SetAnchor(data.selfPoint or "CENTER", anchorFrame, anchorPoint)
-			region:SetOffset(data.xOffset or 0, data.yOffset or 0)
+			region:SetOffset(proto.GroupChildOffset(anchorFrame, data))
 		end
 	else
 		if data.anchorFrameType == "MOUSE" then anchorPoint = "CENTER" end
@@ -1750,13 +1810,6 @@ function proto.PositionOptions(data)
 			end,
 		},
 		{
-			type = "anchorgrid", name = "Anchor", key = "selfPoint", half = true,
-			width = 100, height = 50,
-			values = proto.anchorGridPoints,
-			get = function() return data.selfPoint end,
-			set = function(v) data.selfPoint = v; WA.Add(data, true) end,
-		},
-		{
 			type = "anchorgrid", name = (data.anchorFrameType == "SELECTFRAME" and "To frame point")
 				or (data.anchorFrameType == "UIPARENT" and "To UIParent point")
 				or (data.anchorFrameType == "MOUSE" and "To mouse point")
@@ -1780,6 +1833,20 @@ function proto.PositionOptions(data)
 		},
 		FrameStrataField(data),
 	}
+	-- A group gets no self-anchor grid: its frame is sized to its children's
+	-- bounding box and pinned by the centre, so any other point would displace the
+	-- whole pack by half that box and drift it as children come and go.
+	-- groupModify writes the field back to CENTER, and WA2Import reports an
+	-- imported one as a drop rather than carrying it.
+	if not WA.IsGroup(data) then
+		table.insert(fields, 3, {
+			type = "anchorgrid", name = "Anchor", key = "selfPoint", half = true,
+			width = 100, height = 50,
+			values = proto.anchorGridPoints,
+			get = function() return data.selfPoint end,
+			set = function(v) data.selfPoint = v; WA.Add(data, true) end,
+		})
+	end
 	if data.anchorFrameType ~= "SCREEN" and data.anchorFrameType ~= "UIPARENT" then
 		table.insert(fields, 3, {
 			type = "toggle", name = "Set parent to anchor", key = "anchorFrameParent",

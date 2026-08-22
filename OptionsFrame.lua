@@ -1159,7 +1159,7 @@ function S.defaultOpValue(vtype, template)
 	elseif vtype == "number" then return ">=", 1
 	elseif vtype == "bool" then return "==", true
 	elseif vtype == "select" then return "==", (template and template.values and template.values[1]) or ""
-	elseif vtype == "combination" then return nil, nil end
+	elseif vtype == "combination" or vtype == "alwaystrue" then return nil, nil end
 	return "==", ""
 end
 
@@ -1630,7 +1630,9 @@ local function conditionOptionsCore(fields, members)
 	-- says which half of it a widget wears (the string case splits op and
 	-- value across two).
 	local function appendCheckValue(out, cond, path, check, vtype, template, indent)
-		if vtype == "combination" or vtype == "incompatible" then return end
+		-- alwaystrue takes no operator and no value, so it gets no widgets: the
+		-- string fallback at the end of this chain would otherwise offer two.
+		if vtype == "combination" or vtype == "incompatible" or vtype == "alwaystrue" then return end
 		local top = table.getn(path) == 0
 		local opDiff = multi and top and cond.check.sameop == false
 		local valDiff = multi and top and cond.check.samevalue == false
@@ -2652,11 +2654,14 @@ function S.paintNewPane()
 		row.onClick = function() S.createAura(rtype) end
 
 		-- The preview is of the *type*, so it renders against that type's own
-		-- defaults rather than any saved aura.
+		-- defaults rather than any saved aura. A type marked thumbnailNoScroll
+		-- keeps its static icon here: this pane is a ScrollFrame's scroll
+		-- child, where its live preview cannot render in place.
 		if row.thumbType ~= rtype then
 			if row.thumb then WA.ReleaseThumbnail(row.thumb) end
 			local sample = S.newPaneSample(rtype)
-			row.thumb = WA.AcquireThumbnail(rtype, row, sample, S.NEW_ROW_H - 8)
+			row.thumb = (not spec.thumbnailNoScroll)
+				and WA.AcquireThumbnail(rtype, row, sample, S.NEW_ROW_H - 8) or nil
 			row.thumbType = row.thumb and rtype or nil
 			if row.thumb then
 				row.thumb:SetPoint("TOPLEFT", row.box, "TOPLEFT", 0, 0)

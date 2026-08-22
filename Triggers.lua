@@ -173,7 +173,7 @@ WA.RegisterTriggerType("aura", {
 		-- comes back when the override is switched off.
 		table.insert(fields, {
 			type = "select", name = "Unit", key = "unit", half = true,
-			values = WA.unit_tokens_multi, labels = WA.unit_labels_multi,
+			values = WA.unit_tokens_aura, labels = WA.unit_labels_aura,
 			get = function() return t.unit end,
 			set = function(v) t.unit = v; WA.Add(data); WA.RefreshOptions() end,
 		})

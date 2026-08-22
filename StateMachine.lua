@@ -121,6 +121,12 @@ local function resetRegionState(frame)
 	frame.states = {}
 	frame.toShow = false
 	frame.limited = false
+	-- Region frames are pooled and cannot be destroyed, so a dynamic-group slide
+	-- still running on one would go on moving whichever aura takes it next, and
+	-- a stale layoutPlaced would let that aura's first layout animate from a
+	-- position belonging to the previous tenant.
+	if WA.StopLayoutSlide then WA.StopLayoutSlide(frame) end
+	frame.layoutPlaced = nil
 end
 
 local function acquireClone(rt, data, cloneId)
@@ -774,7 +780,11 @@ function WA.AddGroup(data)
 	-- stacks every child and every clone on the group's centre. The layout is what
 	-- re-issues the offsets, and it has to run here or a group edit that reaches
 	-- this path (a drag, a resize, a reparent) leaves the whole set piled up.
-	if data.regionType == "dynamicgroup" then WA.RelayoutGroup(data.id) end
+	--
+	-- Static groups relayout here too, and for the ordering rather than the
+	-- offsets: SetRegion above sized this group's box before the recursion below
+	-- gave any child group one, so a group holding a group measured it as empty.
+	WA.RelayoutGroup(data.id)
 end
 
 -- Re-anchors a child whose group membership just changed and refreshes the

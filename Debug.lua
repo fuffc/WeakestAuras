@@ -786,6 +786,52 @@ function D.CooldownTest()
 end
 
 -- ---------------------------------------------------------------------------
+-- /wa modeltest [arg] -- settles: can this client texture a creature model?
+-- SetModel(path) loads geometry only; a creature's skin comes from
+-- CreatureDisplayInfo, which is why a raw creature model renders untextured
+-- white. If PlayerModel:SetCreature exists and takes something addressable --
+-- a display id from the client's own DBCs, or a creature entry resolved
+-- through the WDB cache -- an offline fileID -> id table could texture them.
+-- With no arg the probe reports whether the method exists and shows a raw
+-- SetModel murloc for comparison; with a number it calls SetCreature(n) on
+-- the same frame. Murloc display ids in 1.12's CreatureDisplayInfo: 506,
+-- 4132; Ragnaros: 8842. A creature *entry* id for murlocs: 46. Whichever
+-- numbering textures the model is the numbering the table should ship.
+-- ---------------------------------------------------------------------------
+
+local modelTestFrame
+
+function D.ModelTest(rest)
+	if not modelTestFrame then
+		local ok, model = pcall(CreateFrame, "PlayerModel", nil, UIParent)
+		if not ok or not model then
+			D.Log("[modeltest] CreateFrame(\"PlayerModel\") failed: " .. tostring(model))
+			return
+		end
+		modelTestFrame = model
+		model:SetWidth(150); model:SetHeight(150)
+		model:SetPoint("CENTER", UIParent, "CENTER", 0, 120)
+	end
+	local model = modelTestFrame
+	model:Show()
+	local id = tonumber(rest)
+	if not id then
+		D.Log("[modeltest] SetCreature is " .. (model.SetCreature and "present" or "ABSENT")
+			.. ", SetModel raw murloc armed at CENTER,0,120 -- expect white. Now try /wa modeltest 506 (displayId?) and /wa modeltest 46 (creature entry?).")
+		pcall(model.SetModel, model, "Creature\\Murloc\\Murloc.mdx")
+		return
+	end
+	if not model.SetCreature then
+		D.Log("[modeltest] SetCreature is absent on this client; nothing to try with " .. id .. ".")
+		return
+	end
+	pcall(model.ClearModel, model)
+	local ok, err = pcall(model.SetCreature, model, id)
+	D.Log("[modeltest] SetCreature(" .. id .. ") " .. (ok and "did not error" or ("errored: " .. tostring(err)))
+		.. " -- if a textured creature shows at CENTER,0,120, this numbering works.")
+end
+
+-- ---------------------------------------------------------------------------
 -- /wa swipetest [sizes...] + /wa swipenudge <k> [yflat] -- fast, no-/reload
 -- loop for tuning RegionPrototype.lua's SizeSwipe alignment constants.
 -- swipetest spawns one real icon+swipe rig per size (default 16/32/64/128)
@@ -4431,6 +4477,8 @@ function D.HandleSlash(msg)
 		D.Threat(rest)
 	elseif cmd == "cdtest" then
 		D.CooldownTest()
+	elseif cmd == "modeltest" then
+		D.ModelTest(rest)
 	elseif cmd == "swipetest" then
 		D.SwipeTest(rest)
 	elseif cmd == "swipenudge" then
@@ -4507,6 +4555,6 @@ function D.HandleSlash(msg)
 		ensureFrame()
 		frame:Hide()
 	else
-		D.Log("[debug] unknown command \"" .. cmd .. "\". Available: dump [unit] [filter], watch [unit], events [EVENT ...], auraprobe [unit|all], overflow [unit], timers, linkprobe, commprobe [charname|throttle [channel] [rate] [secs]], threat [send|query|tm|report|off], cdtest, swipetest [sizes/WxH...], swipenudge <k> [yflat], swipestress [N], edgetest [state|0], track <spellName>, states <id>, conditions <id>, gen <id>, load <id>, probe, soundprobe, gcd, cdprobe <spell>, ver [version], codeprobe, textprobe, texprobe [corners], progtex [id], levelprobe, plateprobe, wa2probe, wa2 <string>, codelive, codetab <1-8|tabs>, codefont <6-16>, rows, regions, configtest, libs, addons, export <id>, import, clear, show, hide")
+		D.Log("[debug] unknown command \"" .. cmd .. "\". Available: dump [unit] [filter], watch [unit], events [EVENT ...], auraprobe [unit|all], overflow [unit], timers, linkprobe, commprobe [charname|throttle [channel] [rate] [secs]], threat [send|query|tm|report|off], cdtest, modeltest [id], swipetest [sizes/WxH...], swipenudge <k> [yflat], swipestress [N], edgetest [state|0], track <spellName>, states <id>, conditions <id>, gen <id>, load <id>, probe, soundprobe, gcd, cdprobe <spell>, ver [version], codeprobe, textprobe, texprobe [corners], progtex [id], levelprobe, plateprobe, wa2probe, wa2 <string>, codelive, codetab <1-8|tabs>, codefont <6-16>, rows, regions, configtest, libs, addons, export <id>, import, clear, show, hide")
 	end
 end

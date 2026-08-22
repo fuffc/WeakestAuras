@@ -59,6 +59,29 @@ local function substrMatch(hay, needle)
 	return string.find(string.lower(hay or ""), string.lower(needle), 1, true) ~= nil
 end
 
+-- The instance-size bucket of the current moment, approximated: WA2's Instance
+-- Size Type reads GetInstanceInfo, which this client does not have, so raid
+-- head-count stands in for the raid sizes, the battleground comes off the queue
+-- status (locale-proof, unlike zone names), and the native IsInInstance --
+-- boolean-only on 1.12 -- separates "none" from a dungeon. Head-count is an
+-- estimate by construction: a 22-strong Molten Core run reads "twentyfive"
+-- until three more join. Bucket keys are upstream's, so an import lands
+-- without renaming.
+local function instanceSizeBucket()
+	if GetBattlefieldStatus then
+		for i = 1, (MAX_BATTLEFIELD_QUEUES or 3) do
+			if GetBattlefieldStatus(i) == "active" then return "pvp" end
+		end
+	end
+	if not (IsInInstance and IsInInstance()) then return "none" end
+	local raid = GetNumRaidMembers and GetNumRaidMembers() or 0
+	if raid > 25 then return "fortyman" end
+	if raid > 20 then return "twentyfive" end
+	if raid > 10 then return "twenty" end
+	if raid > 5 then return "ten" end
+	return "party"
+end
+
 WA.CLASS_TOKENS = { "WARRIOR", "PALADIN", "HUNTER", "ROGUE", "PRIEST", "SHAMAN", "MAGE", "WARLOCK", "DRUID" }
 WA.CLASS_LABELS = {
 	WARRIOR = "Warrior", PALADIN = "Paladin", HUNTER = "Hunter", ROGUE = "Rogue",
@@ -93,6 +116,15 @@ local TAXI_LABELS = { ontaxi = "On Taxi", nottaxi = "Not On Taxi" }
 -- Mirrors WA2's Private.group_types (solo / party / raid) -- see groupType().
 local INGROUP_VALUES = { "solo", "group", "raid" }
 local INGROUP_LABELS = { solo = "Not in Group", group = "In Party", raid = "In Raid" }
+-- WA2's Private.instance_types, minus the flavors this client cannot be in
+-- (scenario, flexible, arena, rated anything) -- see instanceSizeBucket() for
+-- how each is decided without GetInstanceInfo.
+local INSTANCE_SIZE_VALUES = { "none", "party", "ten", "twenty", "twentyfive", "fortyman", "pvp" }
+local INSTANCE_SIZE_LABELS = {
+	none = "No Instance", party = "Dungeon", ten = "Raid (up to 10)",
+	twenty = "Raid (11-20)", twentyfive = "Raid (21-25)", fortyman = "Raid (26-40)",
+	pvp = "Battleground",
+}
 -- UnitRaceBase's locale-independent tokens (ClassicAPI). "Scourge" is the
 -- internal token for Undead, relabeled for the picker.
 local RACE_TOKENS = { "Human", "Orc", "Dwarf", "NightElf", "Scourge", "Tauren", "Gnome", "Troll" }
@@ -178,6 +210,12 @@ WA.loadPrototype = {
 		values = INGROUP_VALUES, labels = INGROUP_LABELS, default = "solo",
 		isActive = function(L) return WA.MultiSelectMode(L, "ingroup") ~= "off" end,
 		eval = function(L) return WA.MultiSelectMatches(L, "ingroup", groupType()) end,
+	},
+	{
+		name = "instancesize", display = "Instance Size (estimated)", widget = "multiselect", optional = true,
+		values = INSTANCE_SIZE_VALUES, labels = INSTANCE_SIZE_LABELS, default = "none",
+		isActive = function(L) return WA.MultiSelectMode(L, "instancesize") ~= "off" end,
+		eval = function(L) return WA.MultiSelectMatches(L, "instancesize", instanceSizeBucket()) end,
 	},
 	{
 		name = "stance", display = "Stance/Form (0 = none)", widget = "range", optional = true,
@@ -331,6 +369,7 @@ local LOAD_EVENTS = {
 	"RAID_ROSTER_UPDATE", "PARTY_MEMBERS_CHANGED", "UPDATE_SHAPESHIFT_FORM", "UPDATE_SHAPESHIFT_FORMS",
 	"PLAYER_DEAD", "PLAYER_ALIVE", "PLAYER_UNGHOST", "UNIT_FLAGS",
 	"PLAYER_GUILD_UPDATE", "SPELLS_CHANGED", "PLAYER_EQUIPMENT_CHANGED",
+	"UPDATE_BATTLEFIELD_STATUS",
 }
 
 local loadFrame = CreateFrame("Frame")

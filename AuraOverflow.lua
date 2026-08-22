@@ -94,11 +94,17 @@ local function record()
 	if not spellId or not targetGuid then return end
 	if targetGuid == "" or targetGuid == NULL_GUID then return end
 
-	-- Helpful auras land through the same two events. The helpful range is 32
-	-- slots and has not been seen to overflow, so they are dropped rather than
-	-- cached. A client whose ClassicAPI predates the classifier keeps everything
-	-- instead of nothing, since a too-large cache still answers correctly.
-	if C_Spell and C_Spell.IsSpellHarmful and not C_Spell.IsSpellHarmful(spellId) then return end
+	-- Helpful auras land through the same two events and are kept with a marker
+	-- rather than dropped. The overflow reader asks for harmful ones only -- the
+	-- helpful range is 32 slots and has not been seen to overflow -- but a
+	-- multi-target trigger's subject is any unit at all, buffs included, and this
+	-- store is the only place an aura on a unit nobody is targeting is knowable.
+	-- A client whose ClassicAPI predates the classifier calls everything harmful,
+	-- which is what every reader here assumed of the whole cache anyway.
+	local harmful = true
+	if C_Spell and C_Spell.IsSpellHarmful then
+		harmful = C_Spell.IsSpellHarmful(spellId) and true or false
+	end
 
 	local now = GetTime()
 	local unitStore = store[targetGuid]
@@ -128,6 +134,7 @@ local function record()
 		duration = (tonumber(durationMs) or 0) / 1000,
 		name = (C_Spell and C_Spell.GetSpellName and C_Spell.GetSpellName(spellId)) or nil,
 		cap = tonumber(capStatus) or 0,
+		harmful = harmful,
 	}
 end
 
@@ -200,6 +207,22 @@ function AO.GetByName(guid, name, caster)
 	return entry, entry.spellId
 end
 
+-- Every GUID with something cached, in no order, as a snapshot the caller may
+-- walk while queries evict from under it.
+--
+-- Deliberately ungated, which is the whole difference between this and
+-- Reconcile below: that gate answers "is the descriptor full", the question
+-- overflow *recovery* has to ask before it may believe the cache over a unit it
+-- can address. A multi-target trigger's subject is the opposite case -- a unit
+-- carrying one aura that nobody is looking at -- so it takes the store as it is
+-- and leaves reconciliation to the units that do have a token.
+function AO.TrackedGuids()
+	local out = {}
+	if not enabled then return out end
+	for guid in pairs(store) do table.insert(out, guid) end
+	return out
+end
+
 -- Every live entry on the unit, flat, each carrying its own spellId and caster.
 -- nil when the unit has nothing cached at all.
 function AO.EntriesFor(guid)
@@ -214,8 +237,11 @@ function AO.EntriesFor(guid)
 	return out
 end
 
--- The trust gate, and the reconciliation that comes with it. An overflow entry
--- may only ever be surfaced for a unit whose harmful descriptor is *full*:
+-- The trust gate, and the reconciliation that comes with it. It governs the
+-- overflow reader -- the one that has a unit token and could have read the
+-- descriptor instead (TrackedGuids above is the reader that has neither). An
+-- overflow entry may only ever be surfaced for a unit whose harmful descriptor
+-- is *full*:
 -- below 16 the descriptor is the whole truth, so an entry the descriptor does
 -- not carry is stale by definition and goes. That is what keeps the common case
 -- self-correcting -- as a unit's debuff count falls the cache is reconciled
@@ -244,7 +270,10 @@ function AO.Reconcile(unit, guid)
 			local anyCaster = false
 			for key, entry in pairs(byCaster) do
 				local drop = expired(entry, now)
-				if not drop and count < HARMFUL_SLOTS and not present[spellId]
+				-- The snapshot is the harmful range, so a helpful entry's absence
+				-- from it is not evidence of anything.
+				if not drop and entry.harmful ~= false and count < HARMFUL_SLOTS
+					and not present[spellId]
 					and not wasCapped(entry)
 					and (now - entry.start) >= EVICT_GRACE then
 					drop = true

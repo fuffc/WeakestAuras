@@ -10,9 +10,10 @@ local REGION_MAP = {
 	texture = "texture",
 	progresstexture = "progresstexture",
 	text = "text",
+	empty = "empty",
 	group = "group",
 	dynamicgroup = "dynamicgroup",
-	model = "fallback",
+	model = "model",
 	stopmotion = "fallback",
 }
 
@@ -62,7 +63,12 @@ local TEXT_KEYS = {
 	"shadowXOffset", "shadowYOffset",
 }
 
-local TOP_LEVEL_DROPS = {
+-- Wago's own bookkeeping: an id, a version stamp, the update-channel flags. It
+-- travels on every display and none of it is display data, so reporting it per
+-- key per display costs a 52-child pack 192 lines of the summary and buries
+-- everything in it that is a real loss. Not carried, and noted once for the
+-- whole import instead of dropped per display.
+local WAGO_BOOKKEEPING_KEYS = {
 	"information", "semver", "skipWagoUpdate", "ignoreWagoUpdate",
 	"preferToUpdate", "wagoID", "tocversion",
 }
@@ -91,6 +97,7 @@ local TRIGGER_CODE_KEYS = {
 local DISPLAY_CODE_KEYS = {
 	{ key = "customText", label = "custom text" },
 	{ key = "customSort", label = "custom sort" },
+	{ key = "customGrow", label = "custom grow" },
 	{ key = "customAnchorPerUnit", label = "custom anchor" },
 }
 
@@ -104,12 +111,17 @@ local GROUP_KEYS = {
 local GROW_TYPES = {
 	UP = true, DOWN = true, LEFT = true, RIGHT = true,
 	HORIZONTAL = true, VERTICAL = true, GRID = true,
-	CIRCLE = true, COUNTERCIRCLE = true,
+	CIRCLE = true, COUNTERCIRCLE = true, CUSTOM = true,
 }
 
 -- Group fields with no local counterpart at all, each changing how the group
 -- behaves rather than how one aura is decorated, so each is reported.
-local GROUP_DROP_KEYS = { "animate", "sortOn", "anchorOn", "growOn" }
+--
+-- `growOn` is deliberately not among them. It is upstream's list of the state
+-- fields whose change re-runs a custom grow; ours re-runs the grow on every
+-- layout pass, so dropping it changes how often the author's function runs and
+-- never what it produces. The function itself is carried.
+local GROUP_DROP_KEYS = { "sortOn", "anchorOn" }
 
 -- A group's border here is one fixed edge; upstream picks an edge file, a
 -- backdrop and three insets. Reported only when the border is actually on --
@@ -184,11 +196,19 @@ local CUSTOM_TYPES = { status = true, event = true, stateupdate = true }
 -- are mapped by GENERIC_ARG_NAMES, which is the same divergence seen from the
 -- editor's side rather than a second one.
 local GENERIC_VARIABLE_NAMES = {
+	-- Upstream's aura trigger calls "did the aura match" `buffed`, and offers it
+	-- only when the trigger shows a state either way -- which is the one case
+	-- where our own `active` says anything, so the two are the same flag.
+	aura = { buffed = "active" },
+	-- Upstream's cast trigger stores the spell name as `spell`; ours is the
+	-- `name` every other prototype uses.
+	cast = { spell = "name" },
 	health = { deficit = "healthDeficit" },
 	power = { deficit = "powerDeficit" },
 	-- A combo aura's conditions were written against upstream's Power trigger,
 	-- so they name its `power` variable rather than ours.
-	combopoints = { power = "comboPoints" },
+	combopoints = { power = "comboPoints", percentpower = "percentComboPoints",
+		deficit = "comboPointDeficit" },
 	charstats = { attackpower = "attackPower" },
 	experience = { currentXP = "xp", totalXP = "xpMax", percentXP = "xpPercent" },
 	rangecheck = { range = "distance" },
@@ -210,6 +230,13 @@ local SUBBORDER_KEYS = {
 	"border_visible", "border_color", "border_size", "border_offset", "anchor_mode", "anchor_area",
 }
 
+-- Edge art that is a plain solid line, which is exactly what SubBorder draws
+-- with WHITE8X8 sized by border_size. Anything outside this set is real art we
+-- have no counterpart for, and still reports.
+local SOLID_BORDER_EDGES = {
+	["Square Full White"] = true, ["1 Pixel"] = true, ["None"] = true,
+}
+
 local SUBGLOW_KEYS = {
 	"glow", "useGlowColor", "glowColor", "glowType", "glowLines", "glowFrequency",
 	"glowLength", "glowThickness", "glowScale", "glowBorder", "glowXOffset",
@@ -225,7 +252,7 @@ local SUBTICK_KEYS = {
 
 local SUBREGION_TYPES = {
 	subtext = true, subborder = true, subglow = true, subtick = true,
-	subbackground = true,
+	subbackground = true, subforeground = true,
 }
 
 local DROPPED_FORMATS = { Unit = true, GUID = true, GCDTime = true }
@@ -342,11 +369,16 @@ end
 -- `sound` also names a *condition property*, but that is a `property` key rather
 -- than a `sound` one, and the paths it points at live in the change's `value`
 -- table -- which this walk reaches anyway.
+--
+-- The kind here is documentation: `rewriteMedia` takes the kind from the path's
+-- own MEDIA_ROOTS prefix, so this table only decides *whether* a key is walked.
+-- That is what lets `media` -- an author option's chosen path, whose kind is
+-- whatever its sibling `mediaType` says -- sit in a table keyed by one kind.
 local MEDIA_KEYS = {
 	displayIcon = "texture", groupIcon = "texture", texture = "texture",
 	foregroundTexture = "texture", backgroundTexture = "texture",
 	sparkTexture = "texture", tick_texture = "texture",
-	sound = "sound", sound_path = "sound",
+	sound = "sound", sound_path = "sound", media = "sound",
 	text_font = "font", font = "font",
 }
 
@@ -381,34 +413,64 @@ local function copyBlock(dst, src, key)
 	if src[key] ~= nil then dst[key] = WA.DeepCopy(src[key]) end
 end
 
--- The unit tokens a trigger may name here: the single ones the Unit dropdown
--- offers, plus its `specific` escape hatch. Upstream's group/party/raid/nameplate
--- families are refused rather than collapsed onto one unit -- only three
--- prototypes fan a family out, and importing a raid-wide aura as a single-unit
--- one is the failure that looks right and behaves wrong.
--- `family` widens the accepted tokens to the multi-unit dropdown, and is only
--- ever true for a prototype that declares `statesParameter = "unit"` -- one that
--- fans a family out into a clone per member. Without that declaration "group" is
--- a unit token this client does not have, and a trigger given it would watch
--- nothing at all rather than watch the group.
-local function isSupportedUnit(unit, family)
+-- The unit tokens a trigger may name here. `tokens` is the list the target
+-- trigger actually offers, and passing the wrong one imports a display that
+-- watches nothing: the single tokens plus the `specific` escape hatch by
+-- default; the multi-unit families for a trigger that fans one out into a clone
+-- per member (a generic prototype declaring `statesParameter = "unit"`, or the
+-- aura system); and the aura system's own list, which adds upstream's `multi` on
+-- top -- any-target GUID-keyed tracking, which TriggerAura alone has a producer
+-- for. A token off the end of the right list refuses the whole display, since
+-- importing it as some other unit is the failure that looks right and behaves
+-- wrong.
+local function isSupportedUnit(unit, tokens)
 	if unit == nil then return true end
-	local tokens = (family and WA.unit_tokens_multi) or WA.unit_tokens
+	tokens = tokens or WA.unit_tokens
 	for i = 1, table.getn(tokens or {}) do
 		if tokens[i] == unit then return true end
 	end
 	return false
 end
 
+-- Constructs 5.0's parser refuses, caught by reading rather than by compiling:
+-- the headless harness runs 5.1, where both compile, so loadstring alone would
+-- accept code the real client cannot take.
+--
+-- ClassicAPI rewrites all three at source before the parser sees them, and it
+-- hooks the function loadstring funnels through, so with that build the client
+-- takes them and this filter has to stand down -- it would otherwise drop 19 of
+-- the corpus's 355 custom-Lua fields that the client can now run.
+--
+-- Modulo is not tested for. `a % b` is a 5.0 parse error like the other two, but
+-- `%` is also every format and pattern string's escape character, and a reading
+-- test cannot tell `("%d"):format(n)` from `a % b` without lexing strings. The
+-- 5.0 client's own loadstring refuses it a moment later, which is the check that
+-- catches it; only the 5.1 harness is fooled, and only into keeping it.
+--
+-- String-method sugar (`s:gsub(...)`) is not looked for either, for a different
+-- reason: it parses on 5.0, and the release carrying the transpile also
+-- resolves it at run time through the string table. On a client behind that
+-- release it imports and errors where it stands -- a call on an arbitrary
+-- receiver cannot be told from a table method by reading.
 local function lua50SourceError(source)
+	if WA.FeatureGate("luaSyntax51") then return nil end
 	if string.find(source, "#%s*[%a_]") then return "length operator" end
 	if string.find(source, "%.%.%.") then return "vararg syntax" end
 	return nil
 end
 
+-- The one drop a user can fix by updating a client mod rather than editing the
+-- aura, so the detail names the construct and the release that carries it.
+local function syntaxDropDetail(detail, why)
+	local gate = WA.FEATURE_GATES and WA.FEATURE_GATES.luaSyntax51
+	return detail .. ": " .. why .. " needs ClassicAPI "
+		.. (gate and WA.FeatureGateNeeds(gate) or "?")
+end
+
 local function validateTriggerCode(source, detail, report, tableExpression)
 	if not hasSource(source) then return true end
-	local valid = not lua50SourceError(source)
+	local why = lua50SourceError(source)
+	local valid = not why
 	if valid and type(WA.LoadFunction) == "function" then
 		local candidate = source
 		if tableExpression then
@@ -417,7 +479,7 @@ local function validateTriggerCode(source, detail, report, tableExpression)
 		valid = WA.LoadFunction(candidate, nil) ~= nil
 	end
 	if not valid then
-		reportDrop(report, "custom code", detail)
+		reportDrop(report, "custom code", why and syntaxDropDetail(detail, why) or detail)
 		return false
 	end
 	return true
@@ -425,12 +487,13 @@ end
 
 local function validateConditionCode(source, detail, report, body)
 	if not hasSource(source) then return false end
-	local valid = not lua50SourceError(source)
+	local why = lua50SourceError(source)
+	local valid = not why
 	if valid and type(WA.LoadFunction) == "function" then
 		valid = WA.LoadFunction(source, nil, body) ~= nil
 	end
 	if not valid then
-		reportDrop(report, "custom code", detail)
+		reportDrop(report, "custom code", why and syntaxDropDetail(detail, why) or detail)
 		return false
 	end
 	return true
@@ -439,6 +502,11 @@ end
 local function conditionLabel(data, index)
 	return tostring(data.id or "?") .. " condition " .. index
 end
+
+-- The second return of translateConditionCheck for a check that was never
+-- filled in, as opposed to one that was and could not be translated. Its own
+-- table so it can never collide with a detail string a caller prints.
+local UNFILLED_CHECK = {}
 
 local function conditionTemplate(templates, trigger, variable)
 	if trigger == -1 then return WA.globalConditions and WA.globalConditions[variable] end
@@ -454,19 +522,28 @@ local function translateConditionCheck(source, templates, report, label, types)
 			return nil, "unknown combinator " .. tostring(source.variable)
 		end
 		if type(source.checks) ~= "table" then return nil, "combinator has no checks" end
-		local checks = {}
+		local checks, filled = {}, 0
 		for i = 1, table.getn(source.checks) do
 			local child, detail = translateConditionCheck(source.checks[i], templates, report,
 				label .. " check " .. i, types)
 			if child then
 				table.insert(checks, child)
-			else
+				filled = filled + 1
+			elseif detail ~= UNFILLED_CHECK then
+				filled = filled + 1
 				reportDrop(report, "condition check", label .. " check " .. i .. ": " .. tostring(detail))
 			end
 		end
-		if table.getn(checks) == 0 then return nil, "all combinator checks are invalid" end
+		if table.getn(checks) == 0 then
+			return nil, (filled == 0 and UNFILLED_CHECK) or "all combinator checks are invalid"
+		end
 		return { trigger = -2, variable = source.variable, checks = checks }
 	end
+	-- A row the author added in the options UI and never filled in. Upstream
+	-- evaluates a check only once it names both halves (its walk falls to
+	-- `elseif (trigger and variable)` after the -2 and -1 cases), so this is not a
+	-- condition that failed to translate and must not be reported as one.
+	if trigger == nil or source.variable == nil then return nil, UNFILLED_CHECK end
 	local variable = source.variable
 	local renames = types and types[trigger] and GENERIC_VARIABLE_NAMES[types[trigger]]
 	if renames and renames[variable] then variable = renames[variable] end
@@ -491,25 +568,52 @@ local function translateConditionChanges(source, properties, report, label)
 	local changes = {}
 	for i = 1, table.getn(source) do
 		local change = source[i]
-		if type(change) ~= "table" or properties[change.property] == nil then
-			return nil, "unknown property " .. tostring(type(change) == "table" and change.property or nil)
+		if type(change) ~= "table" then
+			return nil, "invalid change"
 		end
-		local property = change.property
-		local value = WA.DeepCopy(change.value)
-		-- A property row the author added and never filled in. Upstream's code
-		-- generator skips it; ours would hand the nil straight to the property
-		-- setter, and a setter doing arithmetic on it takes the aura down.
-		if change.value == nil then
-			reportDrop(report, "condition change", label .. " " .. tostring(property) .. ": no value set")
-		elseif property == "customcode" then
-			local code = conditionCodeValue(value)
-			if code and validateConditionCode(code, label .. " " .. property, report, true) then
+		-- A property-less change is a row the author added and never filled in.
+		-- Upstream's code generator emits nothing for it, so skipping it is what
+		-- upstream does -- and refusing the whole condition over it would take
+		-- out the filled rows beside it.
+		if change.property ~= nil and properties[change.property] == nil then
+			return nil, "unknown property " .. tostring(change.property)
+		end
+		if change.property ~= nil then
+			local property = change.property
+			local value = WA.DeepCopy(change.value)
+			-- An absent value is not an unfilled row: upstream serializes the *off*
+			-- setting of a bool as no value at all, so a "turn the glow off" change
+			-- arrives looking identical to one the author never filled in. Its code
+			-- generator coerces nil per property type (formatValueForAssignment), and
+			-- dropping the change instead leaves the property latched on once any
+			-- condition has set it -- which is how a pack's glow never goes out.
+			--
+			-- Only the types upstream gives a nil a meaning are coerced. The rest --
+			-- list, icon, sound, chat, glowexternal -- generate `nil` there too, so
+			-- for those the row really is unset and still drops.
+			if change.value == nil then
+				local ptype = properties[property].type
+				if ptype == "bool" then value = false
+				elseif ptype == "number" then value = 0
+				elseif ptype == "color" then value = { 1, 1, 1, 1 }
+				elseif ptype == "string" or ptype == "texture" then value = ""
+				end
+				if value == nil then
+					reportDrop(report, "condition change",
+						label .. " " .. tostring(property) .. ": no value set")
+				else
+					table.insert(changes, { property = WA.DeepCopy(property), value = value })
+				end
+			elseif property == "customcode" then
+				local code = conditionCodeValue(value)
+				if code and validateConditionCode(code, label .. " " .. property, report, true) then
+					table.insert(changes, { property = WA.DeepCopy(property), value = value })
+				elseif not code then
+					reportDrop(report, "custom code", label .. " " .. property)
+				end
+			else
 				table.insert(changes, { property = WA.DeepCopy(property), value = value })
-			elseif not code then
-				reportDrop(report, "custom code", label .. " " .. property)
 			end
-		else
-			table.insert(changes, { property = WA.DeepCopy(property), value = value })
 		end
 	end
 	return changes
@@ -537,6 +641,8 @@ local function translateConditions(source, data, report)
 		if check then changes, changeDetail = translateConditionChanges(item and item.changes, properties, report, label) end
 		if check and changes then
 			table.insert(conditions, { check = check, changes = changes })
+		elseif checkDetail == UNFILLED_CHECK then
+			-- Nothing was asked for, so nothing was lost.
 		else
 			reportDrop(report, "condition", label .. ": " .. tostring(checkDetail or changeDetail))
 		end
@@ -602,6 +708,112 @@ local function translateLoadMultiselect(source, destination, field, report, data
 	reportDrop(report, "load constraint", loadLabel(data, field) .. " has an unsupported multi-select")
 end
 
+-- Upstream's "Class and Specialization" names a retail/MoP-Classic spec id;
+-- vanilla has no specs, so the class half is honoured and the narrowing within
+-- the class is the reported loss. Cata Classic hands out talent-tree ids
+-- instead of spec ids and only the druid triple (748/750/752) has been seen in
+-- the wild and verified; a wrong class here would hide the display for the
+-- class that owns it, which is worse than the report, so nothing else from that
+-- range is guessed at. Classes this client has never had (DEATHKNIGHT and
+-- later) keep their token: it can never match, which is exactly what a
+-- DK-only display loading on a vanilla realm should do.
+local SPEC_ID_CLASS = {
+	[62] = "MAGE", [63] = "MAGE", [64] = "MAGE",
+	[65] = "PALADIN", [66] = "PALADIN", [70] = "PALADIN",
+	[71] = "WARRIOR", [72] = "WARRIOR", [73] = "WARRIOR",
+	[102] = "DRUID", [103] = "DRUID", [104] = "DRUID", [105] = "DRUID",
+	[250] = "DEATHKNIGHT", [251] = "DEATHKNIGHT", [252] = "DEATHKNIGHT",
+	[253] = "HUNTER", [254] = "HUNTER", [255] = "HUNTER",
+	[256] = "PRIEST", [257] = "PRIEST", [258] = "PRIEST",
+	[259] = "ROGUE", [260] = "ROGUE", [261] = "ROGUE",
+	[262] = "SHAMAN", [263] = "SHAMAN", [264] = "SHAMAN",
+	[265] = "WARLOCK", [266] = "WARLOCK", [267] = "WARLOCK",
+	[268] = "MONK", [269] = "MONK", [270] = "MONK",
+	[577] = "DEMONHUNTER", [581] = "DEMONHUNTER",
+	[1467] = "EVOKER", [1468] = "EVOKER", [1473] = "EVOKER",
+	[748] = "DRUID", [750] = "DRUID", [752] = "DRUID",
+}
+
+local function translateLoadClassAndSpec(source, destination, report, data)
+	local use = source.use_class_and_spec
+	local block = source.class_and_spec
+	if use == nil or not loadValuePresent(block) then return end
+	local ids
+	if use == true then
+		local single = type(block) == "table" and block.single or nil
+		if single == nil then
+			local selected = selectedLoadValues(block)
+			single = table.getn(selected) == 1 and selected[1] or nil
+		end
+		ids = { single }
+	else
+		ids = selectedLoadValues(block)
+	end
+	local classes, n = {}, 0
+	for i = 1, table.getn(ids) do
+		local cls = SPEC_ID_CLASS[tonumber(ids[i]) or -1]
+		if cls and not classes[cls] then
+			classes[cls] = true
+			n = n + 1
+		end
+	end
+	if n == 0 then
+		reportDrop(report, "load constraint", loadLabel(data, "class_and_spec") .. " has no mappable class")
+		return
+	end
+	-- A source carrying both constraints already narrowed by class; layering the
+	-- widened copy over it would say nothing new.
+	if not destination.use_class then
+		destination.use_class = "multi"
+		destination.class_multi = classes
+	end
+	reportDrop(report, "load constraint", loadLabel(data, "class_and_spec") .. " kept as class only")
+end
+
+-- Upstream's Instance Size Type. This client cannot read an instance's size, so
+-- the values land on Load.lua's approximated `instancesize` buckets; the
+-- retail-and-later buckets this client can never be in are dropped from a set
+-- silently -- they can never match here, so unticking them loses nothing --
+-- and refuse a single, where the author's one chosen value is the whole
+-- constraint.
+local INSTANCE_SIZE_BUCKETS = {
+	none = true, party = true, ten = true, twenty = true,
+	twentyfive = true, fortyman = true, pvp = true,
+}
+
+local function translateLoadInstanceSize(source, destination, report, data)
+	local use = source.use_size
+	local block = source.size
+	if use == nil or not loadValuePresent(block) then return end
+	if use == true then
+		local single = type(block) == "table" and block.single or nil
+		if single == nil then
+			local selected = selectedLoadValues(block)
+			single = table.getn(selected) == 1 and selected[1] or nil
+		end
+		if single ~= nil and INSTANCE_SIZE_BUCKETS[single] then
+			destination.use_instancesize = "single"
+			destination.instancesize = WA.DeepCopy(single)
+			return
+		end
+	else
+		local selected = selectedLoadValues(block)
+		local set, n = {}, 0
+		for i = 1, table.getn(selected) do
+			if INSTANCE_SIZE_BUCKETS[selected[i]] then
+				set[selected[i]] = true
+				n = n + 1
+			end
+		end
+		if n > 0 then
+			destination.use_instancesize = "multi"
+			destination.instancesize_multi = set
+			return
+		end
+	end
+	reportDrop(report, "load constraint", loadLabel(data, "size") .. " has an unsupported value")
+end
+
 local function translateLoad(source, data, report)
 	if type(source) ~= "table" then return {} end
 	local destination = {}
@@ -609,6 +821,8 @@ local function translateLoad(source, data, report)
 	for _, field in ipairs({ "class", "race", "faction", "ingroup" }) do
 		translateLoadMultiselect(source, destination, field, report, data)
 	end
+	translateLoadClassAndSpec(source, destination, report, data)
+	translateLoadInstanceSize(source, destination, report, data)
 	local tristates = {
 		combat = { trueValue = "incombat", falseValue = "outofcombat" },
 		alive = { trueValue = "alive", falseValue = "dead" },
@@ -649,8 +863,17 @@ local function translateLoad(source, data, report)
 		stance = true, player = true, realm = true, guild = true, groupSize = true,
 		groupSize_operator = true, groupSizeOperator = true, spellknown = true, not_spellknown = true,
 		itemequiped = true, not_itemequiped = true,
+		class_and_spec = true, use_class_and_spec = true, size = true, use_size = true,
 	}
 	consumed.use_zoneIds = true
+	-- `spec` is a fossil, not a loss: the load option was Shadowlands-retail-only
+	-- (hidden and inert on every Classic flavor, whose clients have no
+	-- GetSpecialization) and upstream deleted it outright in late 2022. Every
+	-- pack observed carrying it is a Classic export whose own client ignores it
+	-- -- the warrior packs gate Mortal Strike, Bloodthirst and Shield Slam all on
+	-- "spec 1" -- so enforcing it would hide displays their authors see.
+	consumed.spec = true
+	consumed.use_spec = true
 	for _, field in ipairs(simple) do consumed[field .. "_operator"] = true end
 	for _, field in ipairs({ "combat", "alive", "mounted", "vehicle", "class", "race", "faction", "ingroup", "level", "zone", "stance", "player", "realm", "guild", "groupSize", "spellknown", "not_spellknown", "itemequiped", "not_itemequiped" }) do
 		consumed["use_" .. field] = true
@@ -727,8 +950,25 @@ local function translateAuraNamePattern(trigger, source, triggernum, report)
 	end
 end
 
+-- Upstream's group-wide match count -- `useGroup_count` plus an operator and a
+-- count, meaning "how many of the group matched". It is `match_count` wearing a
+-- different spelling, so the engine gap AURA_CLONE_KEYS refuses over is the same
+-- one; but it arrives on the trigger rather than in the clone block, and
+-- refusing over it would take out the whole raid-buff family.
+--
+-- The trigger imports and shows one clone per matching member. Naming the loss
+-- matters because the common value inverts what the display means: `== 0` is
+-- "nobody in the group has this buff", and what imports is "show per member who
+-- does".
+local function translateAuraGroupCount(source, triggernum, report)
+	if not source.useGroup_count then return end
+	reportDrop(report, "aura group match count",
+		"trigger " .. triggernum .. ": " .. tostring(source.group_countOperator or "==")
+			.. " " .. tostring(source.group_count))
+end
+
 local function translateAuraTrigger(source, triggernum, report)
-	if not isSupportedUnit(source.unit) then
+	if not isSupportedUnit(source.unit, WA.unit_tokens_aura) then
 		report.refused = "trigger " .. triggernum .. " uses unsupported unit " .. tostring(source.unit)
 		return nil
 	end
@@ -742,6 +982,7 @@ local function translateAuraTrigger(source, triggernum, report)
 	local trigger = {}
 	take(trigger, source, AURA_TRIGGER_KEYS)
 	trigger.type = "aura"
+	translateAuraGroupCount(source, triggernum, report)
 	translateAuraSpellIds(trigger, source)
 	translateAuraNamePattern(trigger, source, triggernum, report)
 	-- A trigger with the name filters off and nothing to match on never shows
@@ -762,6 +1003,12 @@ local function translateCustomTrigger(source, entry, triggernum, report)
 	local trigger = {}
 	take(trigger, source, CUSTOM_TRIGGER_KEYS)
 	trigger.type = "custom"
+	-- The event list travels as written -- including retail names like
+	-- UNIT_POWER_UPDATE and GROUP_ROSTER_UPDATE, which GenericTrigger's
+	-- EVENT_COMPAT registers and fires natively. Rewriting them here would make
+	-- an imported trigger's events box mean something different from a
+	-- hand-written one's, and would leave the author's own `event ==` tests
+	-- comparing against names the rewrite took away.
 	for i = 1, table.getn(CUSTOM_UNSUPPORTED_KEYS) do
 		local key = CUSTOM_UNSUPPORTED_KEYS[i]
 		if source[key] ~= nil then
@@ -892,12 +1139,11 @@ local GENERIC_UNSUPPORTED = {
 	conditions = { instance_type = "drop", instance_size = "drop",
 		instance_difficulty = "drop" },
 	crowdcontrol = { controlType = "drop", interruptSchool = "drop", spellName = "drop" },
-	equipslotcooldown = { testForCooldown = "drop" },
 	itemequipped = { itemSlot = "drop" },
 	itemset = { equipped = "drop" },
 	location = { zoneIds = "drop", instanceId = "drop", instanceSize = "drop",
 		instanceDifficulty = "drop" },
-	power = { requirePowerType = "drop", showCost = "drop",
+	power = { showCost = "drop",
 		powertype = function(value)
 			local index = selectNumber(value)
 			if index == nil or SUPPORTED_POWER_TYPES[index] then return nil end
@@ -905,7 +1151,9 @@ local GENERIC_UNSUPPORTED = {
 			return "refuse"
 		end },
 	-- The combo route inherits upstream's Power settings, and the resource-shaped
-	-- ones have no counterpart on a count out of five.
+	-- ones have no counterpart on a count out of five. `requirePowerType` stays a
+	-- drop here where the Power prototype now carries it: GetComboPoints is not a
+	-- power read, so there is no displayed-type test to hang it on.
 	combopoints = { requirePowerType = "drop", showCost = "drop",
 		percentpower = "drop", deficit = "drop" },
 	reputation = { factionID = "refuse", watched = "refuse" },
@@ -913,12 +1161,9 @@ local GENERIC_UNSUPPORTED = {
 	totem = { totemName = "refuse", totemNamePattern = "refuse", clones = "refuse" },
 	unitcharacteristics = { class = "drop", hostility = "drop", character = "drop",
 		unitisunit = "drop", npcId = "drop", dead = "drop" },
-	-- showOn travels on every Weapon Enchant export, its own default included;
-	-- only the two modes that invert what the trigger shows are refused.
-	weaponenchant = { enchant = "refuse", stacks = "drop",
-		showOn = function(value)
-			return (value ~= nil and value ~= "showOnActive") and "refuse" or nil
-		end },
+	-- showOn is spelled and valued as upstream spells it, so it lands with no
+	-- entry here at all.
+	weaponenchant = { enchant = "refuse", stacks = "drop" },
 }
 
 local GENERIC_CODE_DROPS = { "customDuration", "customName", "customIcon" }
@@ -1191,9 +1436,15 @@ local function translateGenericTrigger(source, triggernum, report)
 				-- A plain flag: upstream keeps it under `use_<name>` and leaves the
 				-- name itself for whatever the flag qualifies, where a toggle here is
 				-- the bare key and nothing else.
+				--
+				-- Written even when the source carries neither spelling. An absent
+				-- upstream toggle is off, and a prototype's `migrate` hook reads a
+				-- missing key as "saved before this toggle existed" -- Power's does,
+				-- to keep an old trigger's implicit narrowing -- so leaving it nil
+				-- would hand an import a migration meant for local data.
 				local flag = source["use_" .. srcKey]
 				if flag == nil then flag = value end
-				if flag ~= nil then trigger[base] = flag and true or false end
+				trigger[base] = flag and true or false
 			elseif value ~= nil then
 				trigger[base] = WA.DeepCopy(value)
 			end
@@ -1206,7 +1457,7 @@ local function translateGenericTrigger(source, triggernum, report)
 	end
 
 	local fansOut = (WA.triggerTypes[protoKey] or {}).statesParameter == "unit"
-	if defaults.unit ~= nil and not isSupportedUnit(trigger.unit, fansOut) then
+	if defaults.unit ~= nil and not isSupportedUnit(trigger.unit, fansOut and WA.unit_tokens_multi) then
 		report.refused = label .. " uses unsupported unit " .. tostring(trigger.unit)
 		return nil
 	end
@@ -1368,6 +1619,8 @@ local function translateFont(font)
 	-- into the box exports the path, and upstream's own faces are bundled here
 	-- under a different folder.
 	font = rewriteMedia(font) or font
+	local aliases = WA.textCore and WA.textCore.FONT_ALIASES
+	if aliases and aliases[font] then font = aliases[font] end
 	local fonts = WA.textCore and WA.textCore.FONTS or {}
 	for i = 1, table.getn(fonts) do
 		if fonts[i].path == font then return font, default end
@@ -1441,10 +1694,15 @@ local function translateSubtext(source, index, data, report)
 			reportDrop(report, "unsupported font", subDetail("subtext", index, tostring(source.text_font)))
 		end
 	end
-	for i = 1, table.getn(SUBTEXT_DROP_KEYS) do
-		local key = SUBTEXT_DROP_KEYS[i]
-		if source[key] ~= nil then
-			reportDrop(report, "unsupported subtext field", subDetail("subtext", index, key))
+	-- The three width fields are one setting, and the other two are inert while
+	-- the width is automatic -- which is upstream's default. Only a subtext that
+	-- asked for a fixed width has lost anything to report.
+	if source.text_automaticWidth == "Fixed" then
+		for i = 1, table.getn(SUBTEXT_DROP_KEYS) do
+			local key = SUBTEXT_DROP_KEYS[i]
+			if source[key] ~= nil then
+				reportDrop(report, "unsupported subtext field", subDetail("subtext", index, key))
+			end
 		end
 	end
 	translateTextFormats(source, destination, data, index, report)
@@ -1459,7 +1717,7 @@ local function translateSubborder(source, index, report)
 	if destination.anchor_area == nil and source.border_anchor ~= nil then
 		destination.anchor_area = WA.DeepCopy(source.border_anchor)
 	end
-	if source.border_edge ~= nil then
+	if source.border_edge ~= nil and not SOLID_BORDER_EDGES[source.border_edge] then
 		reportDrop(report, "unsupported border art", subDetail("subborder", index, "border_edge"))
 	end
 	return destination
@@ -1469,7 +1727,10 @@ local function translateSubglow(source, index, report)
 	local destination = {}
 	take(destination, source, SUBGLOW_KEYS)
 	destination.type = "subglow"
-	if source.glowDuration ~= nil then
+	-- glowDuration is the Proc glow's pulse period and 1 is upstream's default.
+	-- It only ever meant anything to Proc, whose substitution to Pixel is
+	-- reported just below on its own terms.
+	if source.glowDuration ~= nil and source.glowDuration ~= 1 then
 		reportDrop(report, "unsupported glow field", subDetail("subglow", index, "glowDuration"))
 	end
 	if destination.glowType == "Proc" then
@@ -1520,6 +1781,9 @@ local function translateSubRegion(source, index, parentType, data, report)
 		return nil
 	end
 	local kind = source.type
+	-- The bar's own fill under its pre-sub-region name; upstream's Modernize
+	-- does the same rename.
+	if kind == "aurabar_bar" then kind = "subforeground" end
 	if not SUBREGION_TYPES[kind] then
 		reportDrop(report, "unsupported sub-region", subDetail("sub-region", index, tostring(kind)))
 		return nil
@@ -1532,11 +1796,12 @@ local function translateSubRegion(source, index, parentType, data, report)
 	if kind == "subtext" then return translateSubtext(source, index, data, report) end
 	if kind == "subborder" then return translateSubborder(source, index, report) end
 	if kind == "subglow" then return translateSubglow(source, index, report) end
-	-- The placeholder standing for the region's own art carries no fields at
-	-- all, upstream included. Its position is the whole content: dropping it
+	-- The placeholders standing for the region's own art carry no fields at
+	-- all, upstream included. Their position is the whole content: dropping one
 	-- would pull every later effect down a slot, which is exactly the draw order
-	-- the aura's author arranged.
-	if kind == "subbackground" then return { type = "subbackground" } end
+	-- the aura's author arranged -- and the slot every `sub.<n>.*` condition
+	-- change on a later effect addresses.
+	if kind == "subbackground" or kind == "subforeground" then return { type = kind } end
 	return translateSubtick(source, index, report)
 end
 
@@ -1575,11 +1840,139 @@ local function keysFor(localType)
 	if localType == "text" then
 		for i = 1, table.getn(TEXT_KEYS) do add(TEXT_KEYS[i]) end
 	end
+	-- Not in the model defaults (nothing here reads it beyond a report), but an
+	-- aura that picked its model by display info must still say so on the trip
+	-- back to a client that can honour it.
+	if localType == "model" then add("modelDisplayInfo") end
 	return keys
+end
+
+-- Calls an author's Lua makes on the `WeakAuras` table that this addon does not
+-- answer. AuraEnv's shim covers the names it can honour faithfully; a call that
+-- misses it reads nil and errors where it stands, so it is named at import
+-- rather than discovered as a stack trace in the client.
+--
+-- Calls only -- `WeakAuras.Name(` -- because these authors also use that table
+-- as a scratch namespace (`WeakAuras.ComboFill1 = ...`), and those work: the
+-- shim is a real writable table. Reporting the stash keys would bury the two or
+-- three names that actually break under a list of twenty that do not.
+local function collectForeignApi(report, source)
+	if type(source) ~= "string" or not report then return end
+	for name in string.gfind(source, "WeakAuras[%.:]([%w_]+)%s*%(") do
+		if not (WA.ForeignApiNames and WA.ForeignApiNames[name]) then
+			report.foreignApi = report.foreignApi or {}
+			report.foreignApiOrder = report.foreignApiOrder or {}
+			if not report.foreignApi[name] then
+				report.foreignApi[name] = true
+				table.insert(report.foreignApiOrder, name)
+			end
+		end
+	end
+end
+
+-- The other half of the same question: upstream's `WA_` helpers are bare names
+-- in the environment an author's Lua runs in, not fields on the WeakAuras table,
+-- so the walk above cannot see them. AuraEnv answers the ones it can answer
+-- faithfully; the rest read nil and error at the call, and are named here.
+--
+-- A name the same chunk defines is the author's own helper, not upstream's, and
+-- is skipped -- these packs do write `WA_MyThing = function()`.
+local function collectForeignEnv(report, source)
+	if type(source) ~= "string" or not report then return end
+	for name in string.gfind(source, "(WA_[%w_]+)%s*%(") do
+		if not (WA.AuraEnvNames and WA.AuraEnvNames[name])
+			and not string.find(source, "function%s+" .. name .. "%s*%(")
+			and not string.find(source, name .. "%s*=%s*function") then
+			report.foreignEnv = report.foreignEnv or {}
+			report.foreignEnvOrder = report.foreignEnvOrder or {}
+			if not report.foreignEnv[name] then
+				report.foreignEnv[name] = true
+				table.insert(report.foreignEnvOrder, name)
+			end
+		end
+	end
+end
+
+-- `UnitClass`'s third return.
+--
+-- Retail's is (localized, token, classID) and every "is there a warlock in the
+-- group" check reads position 3. Vanilla's -- which is what this client has,
+-- since ClassicAPI does not hook it -- stops at two, so the comparison is
+-- `nil == 9` on every unit and the check is silently false forever. That is the
+-- worst shape a gap can take: no error, no report, and a display that simply
+-- never lights.
+--
+-- ClassicAPI does answer the question, under another name: `UnitClassBase(unit)`
+-- returns (token, classID), so position 2 there is position 3 here. The rewrite
+-- is exact for `select(3, UnitClass(x))`, which is how the corpus spells it
+-- every time but one; the multiple-assignment form takes a different number of
+-- names on each side, so it is reported rather than guessed at -- naming a
+-- thing it cannot do beats guessing and being quietly wrong.
+local function rewriteUnitClass(source)
+	local rewritten, count = string.gsub(source,
+		"select%s*%(%s*3%s*,%s*UnitClass%s*%(", "select(2, UnitClassBase(")
+	-- Three or more names taking a UnitClass call: the third is the classID that
+	-- is not there. Two is fine -- the localized name and the token both exist.
+	local assigned = string.find(rewritten, "[%w_]+%s*,%s*[%w_]+%s*,%s*[%w_]+%s*=%s*UnitClass%s*%(") ~= nil
+	return rewritten, count > 0, assigned
+end
+
+-- Whether a rewrite left the chunk as compilable as it found it. The source may
+-- be a function expression or a bare body, so both wrappings are tried and the
+-- comparison is on the pair -- a chunk that did not compile before is allowed
+-- not to compile after, which is the case where the author's own Lua is broken.
+local function sameCompileResult(before, after)
+	if type(WA.LoadFunction) ~= "function" then return true end
+	local function compiles(source, body)
+		return WA.LoadFunction(source, nil, body) ~= nil
+	end
+	return compiles(before, false) == compiles(after, false)
+		and compiles(before, true) == compiles(after, true)
+end
+
+-- Every key whose value is user Lua, wherever it sits. Walked recursively over
+-- the finished display for the same reason remapMedia is: a trigger, an
+-- untrigger, an action, a condition change, an animation and a custom-grow are
+-- all covered by one pass, and a key added later cannot be forgotten at some
+-- individual translation site.
+local CODE_KEYS = {
+	custom = true, untrigger = true, customText = true, customSort = true,
+	customAnchorPerUnit = true, customGrow = true, customTriggerLogic = true,
+	customDuration = true, customName = true, customIcon = true,
+	customTexture = true, customStacks = true, customVariables = true,
+	customOverlay1 = true, customOverlay2 = true, customOverlay3 = true,
+	translateFunc = true, alphaFunc = true, scaleFunc = true,
+	rotateFunc = true, colorFunc = true,
+}
+
+local function remapUnitClass(node, report, seen)
+	if type(node) ~= "table" then return end
+	seen = seen or {}
+	if seen[node] then return end
+	seen[node] = true
+	for key, value in pairs(node) do
+		if type(value) == "table" then
+			remapUnitClass(value, report, seen)
+		elseif CODE_KEYS[key] and type(value) == "string" then
+			local rewritten, classFixed, classAssigned = rewriteUnitClass(value)
+			-- The one outcome worse than leaving a call to error is corrupting the
+			-- chunk around it. Anything that stops compiling is discarded whole.
+			if rewritten ~= value and not sameCompileResult(value, rewritten) then
+				rewritten, classFixed = value, false
+				reportDrop(report, "custom code",
+					tostring(node.id or "code") .. ": code rewrite discarded")
+			end
+			if classFixed then report.unitClassFixed = true end
+			if classAssigned then report.unitClassAssigned = true end
+			if rewritten ~= value then node[key] = rewritten end
+		end
+	end
 end
 
 local function addCode(report, name, source, active)
 	if not hasSource(source) then return end
+	collectForeignApi(report, source)
+	collectForeignEnv(report, source)
 	table.insert(report.code, { name = name, source = source, active = active and true or false })
 end
 
@@ -1594,6 +1987,8 @@ function WA.CollectImportCode(data, report, prefix)
 		local active
 		if item.key == "customSort" then
 			active = data.sort == "custom"
+		elseif item.key == "customGrow" then
+			active = data.grow == "CUSTOM"
 		elseif item.key == "customAnchorPerUnit" then
 			active = data.useAnchorPerUnit and true or false
 		else
@@ -1850,10 +2245,17 @@ local function reportMediaOptions(options, report, seen)
 	end
 end
 
-local function reportTopLevelDrops(source, report)
-	for i = 1, table.getn(TOP_LEVEL_DROPS) do
-		local key = TOP_LEVEL_DROPS[i]
-		if source[key] ~= nil then reportDrop(report, "metadata", key) end
+local function noteWagoBookkeeping(source, report)
+	for i = 1, table.getn(WAGO_BOOKKEEPING_KEYS) do
+		local key = WAGO_BOOKKEEPING_KEYS[i]
+		if source[key] ~= nil then
+			report.wagoKeys = report.wagoKeys or {}
+			report.wagoKeyOrder = report.wagoKeyOrder or {}
+			if not report.wagoKeys[key] then
+				report.wagoKeys[key] = true
+				table.insert(report.wagoKeyOrder, key)
+			end
+		end
 	end
 end
 
@@ -1864,7 +2266,12 @@ end
 -- substitution is not a silent one.
 local TEXTURE_FIELDS = {
 	{ key = "groupIcon", label = "group icon" },
-	{ key = "displayIcon", label = "manual icon" },
+	-- `displayIcon` is the icon only under Manual. Everywhere else the display
+	-- asks its trigger first (WA.ResolveDisplayIcon) and reaches this value only
+	-- when no trigger names one, so calling it "the icon" overstates a loss the
+	-- user may never see. Upstream's default is Automatic, so nil is Automatic.
+	{ key = "displayIcon", label = "manual icon", autoLabel = "fallback icon",
+		autoWhen = function(source) return source.iconSource ~= 0 end },
 	{ key = "sparkTexture", label = "spark texture" },
 	{ key = "texture", label = "texture", only = "texture" },
 	{ key = "foregroundTexture", label = "foreground texture" },
@@ -1888,12 +2295,14 @@ local function reportUndrawableTextures(source, data, report)
 		local value = source[field.key]
 		if value ~= nil and value ~= ""
 			and (not field.only or source.regionType == field.only) then
+			local label = field.label
+			if field.autoWhen and field.autoWhen(source) then label = field.autoLabel end
 			if not WA.DrawableTexture(value) then
 				reportDrop(report, "texture this client cannot load",
-					tostring(source.id or "?") .. " " .. field.label .. ": " .. tostring(value))
+					tostring(source.id or "?") .. " " .. label .. ": " .. tostring(value))
 			elseif foreignAddonPath(data[field.key]) then
 				reportDrop(report, "texture from an addon that may not be installed",
-					tostring(source.id or "?") .. " " .. field.label .. ": " .. tostring(data[field.key]))
+					tostring(source.id or "?") .. " " .. label .. ": " .. tostring(data[field.key]))
 			end
 		end
 	end
@@ -1915,6 +2324,43 @@ local function translateBarTexture(data, source, report)
 	data.texture = alias or BAR_TEXTURE_DEFAULT
 	reportDrop(report, "bar texture substituted",
 		tostring(source.id or "?") .. ": " .. tostring(name) .. " -> " .. data.texture)
+end
+
+-- The model region renders only the legacy camera (SetPosition + SetFacing);
+-- an aura built with upstream's transform camera (api = SetTransform) has the
+-- transform's yaw folded into `rotation` here, once -- rz's rest value is 90,
+-- so the delta from it is the yaw the author meant. The st_* keys travel
+-- through untouched for the trip back to a retail client, which ignores
+-- `rotation` under api anyway.
+local function translateModel(data, source, report)
+	local label = tostring(source.id or "?")
+	-- Pinned to at least empty, or MergeDefaults seeds the fresh-aura default
+	-- model onto the import and an unloadable model silently becomes Ragnaros.
+	if data.model_path == nil then data.model_path = "" end
+	if source.api then
+		data.rotation = (tonumber(source.model_st_rz) or 90) - 90
+		if data.rotation < 0 then data.rotation = data.rotation + 360 end
+		reportDrop(report, "model camera transform approximated", label)
+	end
+	if source.modelDisplayInfo then
+		-- Honoured when the display id maps to a creature entry this client's
+		-- cache has answered for (SetCreature renders it); reported otherwise.
+		if not WA.ResolveDisplayCreature(source.model_fileId) then
+			reportDrop(report, "model picked by display info", label .. ": " .. tostring(source.model_fileId))
+		end
+	elseif source.modelIsUnit then
+		local unit = source.model_fileId
+		if type(unit) ~= "string" or unit == "" or unit == "focus"
+			or string.find(tostring(unit), "^soft") then
+			reportDrop(report, "unit this client does not have", label .. ": " .. tostring(unit))
+		end
+	else
+		local resolvable = WA.ResolveModelFile(source.model_fileId)
+			or (type(source.model_path) == "string" and source.model_path ~= "")
+		if not resolvable then
+			reportDrop(report, "model this client cannot load", label .. ": " .. tostring(source.model_fileId))
+		end
+	end
 end
 
 -- ---------------------------------------------------------------------------
@@ -1994,6 +2440,12 @@ local function translateGroup(data, source, report)
 	-- A grid is the one case where nothing is lost: upstream's options write
 	-- selfPoint from gridType (its gridSelfPoints table) whenever either is
 	-- touched, so the corner it names is one gridType already carries.
+	--
+	-- Under a custom grow it is worse than a shift: the author's own function
+	-- writes coordinates in whatever corner selfPoint names, and CENTER is what
+	-- picking CUSTOM sets it to upstream, so anything else means the aura was
+	-- hand-edited afterwards and its Lua will not mean here what it meant there.
+	-- The drop below is the only warning that gives.
 	if data.selfPoint ~= nil and data.selfPoint ~= "CENTER" and data.grow ~= "GRID" then
 		reportDrop(report, "group anchor point", label .. ": " .. tostring(data.selfPoint)
 			.. " -> CENTER")
@@ -2004,19 +2456,12 @@ local function translateGroup(data, source, report)
 	if source.alpha ~= nil and source.alpha ~= 1 then
 		reportDrop(report, "group alpha", label .. ": " .. tostring(source.alpha))
 	end
-	-- CUSTOM names no layout to keep, so it falls back to the region default
-	-- rather than to a direction. The grid and the two circles are not among
-	-- them: their geometry fields are ours by the same names, so `take` carries
-	-- them.
+	-- Every grow upstream names is ours under the same name, geometry fields
+	-- included, so `take` carries them; the guard is for a value from a future
+	-- version rather than for a known gap.
 	if data.grow ~= nil and not GROW_TYPES[data.grow] then
 		reportDrop(report, "unsupported grow direction", label .. ": " .. tostring(data.grow))
 		data.grow = nil
-	end
-	-- customGrow is refused rather than carried, so it is not this author's Lua
-	-- that runs: upstream's grow function writes control-point coordinates, and
-	-- there are no control points here to write.
-	if hasSource(source.customGrow) then
-		reportDrop(report, "custom grow", label)
 	end
 	for i = 1, table.getn(GROUP_DROP_KEYS) do
 		local key = GROUP_DROP_KEYS[i]
@@ -2049,8 +2494,10 @@ local function translateDisplay(source, report)
 	if type(source.url) == "string" then data.url = source.url end
 	take(data, source, keysFor(localType))
 	data.regionType = sourceType == "aurabar" and "progressbar" or sourceType
-	if sourceType == "model" or sourceType == "stopmotion" then
+	if sourceType == "stopmotion" then
 		reportDrop(report, "unsupported region type", sourceType)
+	elseif sourceType == "model" then
+		translateModel(data, source, report)
 	elseif sourceType == "progresstexture"
 		and (source.orientation == "CLOCKWISE" or source.orientation == "ANTICLOCKWISE")
 		and not WA.hasTextureTransforms then
@@ -2101,8 +2548,9 @@ local function translateDisplay(source, report)
 	reportMediaOptions(data.authorOptions, report)
 	WA.ValidateUserConfig(data)
 	remapMedia(data, report, tostring(source.id or "?"))
+	remapUnitClass(data, report)
 	reportUndrawableTextures(source, data, report)
-	reportTopLevelDrops(source, report)
+	noteWagoBookkeeping(source, report)
 
 	local codeSource = WA.DeepCopy(source)
 	codeSource.animation = data.animation
@@ -2111,6 +2559,12 @@ local function translateDisplay(source, report)
 	codeSource.conditions = data.conditions
 	codeSource.customSort = data.customSort
 	codeSource.customAnchorPerUnit = data.customAnchorPerUnit
+	-- The disclosure has to show what will run, not what the author sent, or the
+	-- listed source and the saved source disagree wherever a call was rewritten.
+	-- `codeSource` is a copy of the upstream payload, so it needs the same pass;
+	-- rewriting is idempotent, and the fields it shares by reference with `data`
+	-- have already been done.
+	remapUnitClass(codeSource, report)
 	WA.CollectImportCode(codeSource, report, tostring(source.id or "?") .. " - ")
 
 	-- Current-schema by construction -- fresh tables, current field names,
@@ -2295,6 +2749,35 @@ function WA.WA2Translate(payload)
 				for n = 1, table.getn(childReport.code) do
 					table.insert(report.code, childReport.code[n])
 				end
+				for n = 1, table.getn(childReport.foreignApiOrder or {}) do
+					local name = childReport.foreignApiOrder[n]
+					report.foreignApi = report.foreignApi or {}
+					report.foreignApiOrder = report.foreignApiOrder or {}
+					if not report.foreignApi[name] then
+						report.foreignApi[name] = true
+						table.insert(report.foreignApiOrder, name)
+					end
+				end
+				for n = 1, table.getn(childReport.wagoKeyOrder or {}) do
+					local name = childReport.wagoKeyOrder[n]
+					report.wagoKeys = report.wagoKeys or {}
+					report.wagoKeyOrder = report.wagoKeyOrder or {}
+					if not report.wagoKeys[name] then
+						report.wagoKeys[name] = true
+						table.insert(report.wagoKeyOrder, name)
+					end
+				end
+				for n = 1, table.getn(childReport.foreignEnvOrder or {}) do
+					local name = childReport.foreignEnvOrder[n]
+					report.foreignEnv = report.foreignEnv or {}
+					report.foreignEnvOrder = report.foreignEnvOrder or {}
+					if not report.foreignEnv[name] then
+						report.foreignEnv[name] = true
+						table.insert(report.foreignEnvOrder, name)
+					end
+				end
+				if childReport.unitClassFixed then report.unitClassFixed = true end
+				if childReport.unitClassAssigned then report.unitClassAssigned = true end
 			else
 				dropped[label] = true
 				reportDrop(report, "aura not imported",
@@ -2310,9 +2793,11 @@ function WA.WA2Translate(payload)
 	return { root = root, children = children }, report
 end
 
--- How many details one reason spells out before it just counts. A pack of
--- eighty children reports the same drop eighty times, and a summary nobody can
--- read to the end is a review step in name only.
+-- How many *distinct* details one reason spells out before it just counts. A
+-- pack of eighty children reports the same drop eighty times, and a summary
+-- nobody can read to the end is a review step in name only -- so identical
+-- details collapse to one entry carrying its repeat count, and the budget below
+-- buys that many separate problems rather than that many copies of the first.
 local DETAIL_LIMIT = 6
 
 function WA.ImportSummary(pending, report)
@@ -2345,34 +2830,83 @@ function WA.ImportSummary(pending, report)
 			table.insert(lines, "    " .. source)
 		end
 	end
+	if table.getn(report and report.foreignApiOrder or {}) > 0 then
+		table.insert(lines, "")
+		table.insert(lines, "That Lua calls WeakAuras functions this addon does not have. Each errors "
+			.. "where it stands; the rest of the aura is unaffected.")
+		for i = 1, table.getn(report.foreignApiOrder) do
+			table.insert(lines, "  WeakAuras." .. tostring(report.foreignApiOrder[i]))
+		end
+	end
+	if table.getn(report and report.foreignEnvOrder or {}) > 0 then
+		table.insert(lines, "")
+		table.insert(lines, "It also calls WeakAuras helpers that live in the environment rather than "
+			.. "on that table, and these are not provided. Each errors where it stands.")
+		for i = 1, table.getn(report.foreignEnvOrder) do
+			table.insert(lines, "  " .. tostring(report.foreignEnvOrder[i]) .. "()")
+		end
+	end
+	if report and report.unitClassFixed then
+		table.insert(lines, "")
+		table.insert(lines, "Rewrote UnitClass's class-id read. This client's UnitClass returns only "
+			.. "the localized name and the class token, so select(3, UnitClass(unit)) is nil on "
+			.. "every unit and the check it feeds is silently false; each was rewritten to "
+			.. "select(2, UnitClassBase(unit)), which answers the same id.")
+	end
+	if report and report.unitClassAssigned then
+		table.insert(lines, "")
+		table.insert(lines, "That Lua also reads UnitClass's third return by assignment, which this "
+			.. "client does not have and which takes a different number of names to rewrite. "
+			.. "UnitClassBase(unit) returns the token and the class id.")
+	end
 	if table.getn(report and report.dropped or {}) > 0 then
 		local groups, byReason = {}, {}
 		for i = 1, table.getn(report.dropped) do
 			local item = report.dropped[i]
 			local group = byReason[item.reason]
 			if not group then
-				group = { reason = item.reason, count = 0, details = {} }
+				group = { reason = item.reason, count = 0, details = {}, repeats = {}, seen = {} }
 				byReason[item.reason] = group
 				table.insert(groups, group)
 			end
 			group.count = group.count + 1
-			table.insert(group.details, item.detail)
+			local detail = tostring(item.detail)
+			local at = group.seen[detail]
+			if at then
+				group.repeats[at] = group.repeats[at] + 1
+			else
+				table.insert(group.details, detail)
+				at = table.getn(group.details)
+				group.seen[detail] = at
+				group.repeats[at] = 1
+			end
 		end
 		table.insert(lines, "")
 		table.insert(lines, "Not imported:")
 		for i = 1, table.getn(groups) do
 			local group = groups[i]
-			local shown = group.details
-			local hidden = group.count - DETAIL_LIMIT
-			if hidden > 0 then
-				shown = {}
-				for n = 1, DETAIL_LIMIT do shown[n] = group.details[n] end
+			local distinct = table.getn(group.details)
+			local shown = distinct
+			if shown > DETAIL_LIMIT then shown = DETAIL_LIMIT end
+			local parts = {}
+			for n = 1, shown do
+				parts[n] = group.details[n]
+				if group.repeats[n] > 1 then
+					parts[n] = parts[n] .. " (x" .. group.repeats[n] .. ")"
+				end
 			end
 			local line = "  " .. tostring(group.reason) .. " (" .. group.count .. ")  "
-				.. table.concat(shown, ", ")
-			if hidden > 0 then line = line .. ", and " .. hidden .. " more" end
+				.. table.concat(parts, ", ")
+			if distinct > shown then
+				line = line .. ", and " .. (distinct - shown) .. " more"
+			end
 			table.insert(lines, line)
 		end
+	end
+	if table.getn(report and report.wagoKeyOrder or {}) > 0 then
+		table.insert(lines, "")
+		table.insert(lines, "Wago bookkeeping (" .. table.concat(report.wagoKeyOrder, ", ")
+			.. ") is not carried.")
 	end
 	if report and report.sourceVersion then
 		table.insert(lines, "")

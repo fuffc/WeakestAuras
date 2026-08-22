@@ -38,3 +38,30 @@ WA.RegisterSubRegionType("subbackground", {
 		return {}
 	end,
 })
+
+-- The bar's fill and icon as their own row, mirroring WA2's Foreground: the
+-- level retargets the two frames the progressbar stacks above its own base, so
+-- moving the row decides whether effects draw above or below the fill. Not
+-- `enforced` -- imports carry it in the author's position, and stamping one
+-- onto every saved progressbar would reorder frame levels users already have.
+WA.RegisterSubRegionType("subforeground", {
+	displayName = "Foreground",
+	supports = function(regionType)
+		return regionType == "progressbar"
+	end,
+	default = { type = "subforeground" },
+	create = function(parent)
+		local region = { parent = parent }
+		function region:SetFrameLevel(level)
+			if self.parent.bar then self.parent.bar:SetFrameLevel(level) end
+			if self.parent.iconFrame then self.parent.iconFrame:SetFrameLevel(level + 1) end
+		end
+		return region
+	end,
+	modify = function(parent, region)
+		region.parent = parent
+	end,
+	options = function()
+		return {}
+	end,
+})

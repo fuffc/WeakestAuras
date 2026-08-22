@@ -21,6 +21,7 @@ WA.RegisterSubRegionType("subborder", {
 	supports = function(regionType)
 		return regionType == "icon" or regionType == "progressbar" or regionType == "text"
 			or regionType == "texture" or regionType == "progresstexture"
+			or regionType == "empty"
 	end,
 	default = {
 		type = "subborder",

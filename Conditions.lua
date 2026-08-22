@@ -44,6 +44,11 @@ WA.globalConditions = {
 		get = function() return UnitExists("target") and true or false end },
 	attackabletarget = { display = "Target Attackable", type = "bool",
 		get = function() return (UnitExists("target") and UnitCanAttack("player", "target")) and true or false end },
+	-- Its own type rather than a bool that happens to return true: the check
+	-- carries no operator and no value, so anything comparing them would read
+	-- an absent value as false and invert the one condition that cannot fail.
+	alwaystrue = { display = "Always True", type = "alwaystrue",
+		get = function() return true end },
 }
 local GLOBAL_EVENTS = { "PLAYER_REGEN_ENABLED", "PLAYER_REGEN_DISABLED", "PLAYER_TARGET_CHANGED" }
 
@@ -87,6 +92,11 @@ function WA.GetProperties(data)
 	return out
 end
 
+-- Whether the trigger is currently active. Every state carries `show`, whatever
+-- system produced it, so the variable is added over each system's own table
+-- rather than repeated inside all three -- which is where upstream puts it too.
+local SHOW_TEMPLATE = { display = "Active", type = "bool" }
+
 -- The checkable variable templates per trigger (§10): each trigger system's
 -- GetTriggerConditions. [triggernum] = { variable = { display, type, values } }.
 function WA.GetConditionTemplates(data)
@@ -95,11 +105,15 @@ function WA.GetConditionTemplates(data)
 	-- options window still reaches here for the conditions tab.
 	for triggernum = 1, table.getn(data.triggers or {}) do
 		local system = WA.GetTriggerSystem(data, triggernum)
-		if system and system.GetTriggerConditions then
-			out[triggernum] = system.GetTriggerConditions(data, triggernum) or {}
-		else
-			out[triggernum] = {}
-		end
+		local base = system and system.GetTriggerConditions
+			and system.GetTriggerConditions(data, triggernum) or {}
+		-- A system's table is shared across every display using that system --
+		-- TriggerAura returns one file-local constant -- so `show` goes onto a
+		-- copy. Writing into it would leak this display's entry into all of them.
+		local templates = {}
+		for name, template in pairs(base) do templates[name] = template end
+		templates.show = SHOW_TEMPLATE
+		out[triggernum] = templates
 	end
 	return out
 end
@@ -193,12 +207,21 @@ local function evalCheck(check, states, entry, now)
 	elseif trig == -1 then
 		local g = WA.globalConditions[check.variable]
 		if not g then return false end
+		if g.type == "alwaystrue" then return true end
 		return compareValue("bool", check.op, g.get(), check.value)
 	else
 		local state = states[trig]
-		if not state then return false end
 		local tmpl = entry.templates[trig] and entry.templates[trig][check.variable]
 		if not tmpl then return false end
+		if not state then
+			-- A trigger that has never produced a state has nothing to read a
+			-- variable off, so every check over it is false -- except `show`,
+			-- which that absence answers: the trigger is not active. Without
+			-- this, "trigger 2 is inactive" stays dark until trigger 2 first
+			-- fires, which is the wrong way round for a "missing buff" display.
+			if check.variable ~= "show" then return false end
+			return compareValue("bool", check.op, false, check.value)
+		end
 		local vtype = tmpl.type
 		if vtype == "timer" then
 			-- state[variable] holds an absolute expiration; compare *remaining*.

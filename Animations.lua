@@ -50,7 +50,7 @@ straightColor = [[function(progress, r1, g1, b1, a1, r2, g2, b2, a2)
 	return r1 + progress * (r2 - r1), g1 + progress * (g2 - g1), b1 + progress * (b2 - b1), a1 + progress * (a2 - a1)
 end]],
 straightHSV = [[function(progress, r1, g1, b1, a1, r2, g2, b2, a2)
-	return WeakAuras.GetHSVTransition(progress, r1, g1, b1, a1, r2, g2, b2, a2)
+	return WeakestAuras.GetHSVTransition(progress, r1, g1, b1, a1, r2, g2, b2, a2)
 end]],
 circle = [[function(progress, startX, startY, deltaX, deltaY)
 	local angle = progress * 2 * math.pi
@@ -110,7 +110,7 @@ pulseColor = [[function(progress, r1, g1, b1, a1, r2, g2, b2, a2)
 end]],
 pulseHSV = [[function(progress, r1, g1, b1, a1, r2, g2, b2, a2)
 	local p = (math.sin(progress * 2 * math.pi - math.pi / 2) + 1) / 2
-	return WeakAuras.GetHSVTransition(p, r1, g1, b1, a1, r2, g2, b2, a2)
+	return WeakestAuras.GetHSVTransition(p, r1, g1, b1, a1, r2, g2, b2, a2)
 end]],
 fauxspin = [[function(progress, startX, startY, scaleX, scaleY)
 	return math.cos(progress * 2 * math.pi) * scaleX, startY + progress * (scaleY - startY)

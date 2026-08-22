@@ -32,3 +32,25 @@ The seven bundled faces above carry the names WeakAuras2 registers them under
 with LibSharedMedia ("Fira Sans Medium", "PT Sans Narrow Bold", and so on),
 because a WeakAuras export stores that name and WA2Import.lua resolves it
 against textCore.FONTS. Renaming one there breaks every later import silently.
+
+
+Accidental Presidency.ttf, Expressway.ttf, Bazooka.ttf, FORCED SQUARE.ttf,
+Cabin.ttf
+--------------------------------------------------------------------------
+Faces that WeakAuras packs reach for through some *other* addon's
+LibSharedMedia registration rather than WeakAuras' own, which is why they are
+here: without them the five account for 149 of the 167 fonts the WA2 corpus
+asks for and cannot get.
+
+Accidental Presidency, by Fontourist. Freeware.
+Expressway, by Ray Larabie (Typodermic). Free release, as redistributed with
+  ElvUI and pfUI.
+Bazooka -- public domain, per SharedMedia's own font manifest (see
+  licenses/SharedMedia/font info.txt).
+FORCED SQUARE, by Vladimir Nikolic. Freeware.
+Cabin, by Pablo Impallari, Rodrigo Fuenzalida and Igino Marini.
+  Licensed under the SIL Open Font License, Version 1.1.
+
+Registered under the LibSharedMedia names their own registrars use, for the
+same reason the WeakAuras faces above keep theirs: that name is what an export
+stores.

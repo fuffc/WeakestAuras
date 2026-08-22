@@ -25,6 +25,188 @@ local customEnv = setmetatable({}, { __index = getfenv(0) })
 WA.customEnv = customEnv
 
 -- ---------------------------------------------------------------------------
+-- The `WeakAuras` name inside user code
+--
+-- An imported aura's Lua reaches for `WeakAuras`, and its authors also use that
+-- table as a scratch namespace (`WeakAuras.ComboFill1 = ...`), so it has to be
+-- a real writable table and not only a function set.
+--
+-- It lives in customEnv rather than in _G, and that is the load-bearing part:
+-- `if WeakAuras then` is how an addon probes for WeakAuras being loaded, so a
+-- global of this name tells every one of them that it is -- and they would then
+-- call the rest of an API this table answers a fraction of. Inside user code the
+-- name resolves here; outside, nothing changed.
+--
+-- Only calls this addon can answer *faithfully* are here. An upstream function
+-- given a lookalike that behaves differently is worse than an absent one: the
+-- absent one errors at the call, names itself, and is reported at import --
+-- WA.ForeignApiNames is what the import report reads to say so.
+-- ---------------------------------------------------------------------------
+
+-- Upstream's WeakAuras.regions[id] is a record whose `region` is the base
+-- clone's frame. One proxy per id, cached, so identity holds across reads the
+-- way a real table's would; `region` resolves on every read because ours are
+-- pooled and the frame for an id changes. Peek, not Ensure -- reading this must
+-- not conjure a frame for an aura nothing has drawn.
+--
+-- An id with no display answers **nil**, not an empty record. Upstream's is a
+-- real table, so `if WeakAuras.regions[id] then` is how code asks whether an
+-- aura exists at all; a metatable that manufactured a proxy for every key would
+-- answer yes to every id ever spelled, including a typo.
+local regionProxies = {}
+local regionsProxy = setmetatable({}, { __index = function(_, id)
+	if not (WeakestAurasDB and WeakestAurasDB.displays[id]) then return nil end
+	local proxy = regionProxies[id]
+	if not proxy then
+		proxy = setmetatable({}, { __index = function(_, key)
+			if key == "region" then return WA.PeekRegion and WA.PeekRegion(id, "") or nil end
+			if key == "regionType" then
+				local data = WeakestAurasDB and WeakestAurasDB.displays[id]
+				return data and data.regionType or nil
+			end
+			return nil
+		end })
+		regionProxies[id] = proxy
+	end
+	return proxy
+end })
+
+local weakAurasCompat = {
+	ScanEvents = function(...) return WA.ScanEvents(unpack(arg)) end,
+	GetRegion = function(id, cloneId) return WA.GetRegion(id, cloneId) end,
+	GetTriggerStateForTrigger = function(id, triggernum)
+		return WA.GetTriggerStateForTrigger(id, triggernum)
+	end,
+	GetData = function(id) return WeakestAurasDB and WeakestAurasDB.displays[id] or nil end,
+	IsOptionsOpen = function() return WA.optionsOpen and true or false end,
+	GetHSVTransition = function(p, r1, g1, b1, a1, r2, g2, b2, a2)
+		return WA.GetHSVTransition(p, r1, g1, b1, a1, r2, g2, b2, a2)
+	end,
+	-- Guards an author puts around retail-only branches. This client is neither,
+	-- and no import runs user code -- the importer writes data and WA.Add
+	-- compiles afterwards -- so both answers are the steady-state truth here
+	-- rather than a stand-in for something we do not track.
+	IsRetail = function() return false end,
+	IsImporting = function() return false end,
+	regions = regionsProxy,
+}
+
+-- The names above, for the import report to tell a call it will answer from one
+-- it will not. `regions` included: it is read as a table, not called; `myGUID`
+-- likewise, resolved by the metatable below.
+WA.ForeignApiNames = { myGUID = true }
+for name in pairs(weakAurasCompat) do WA.ForeignApiNames[name] = true end
+
+-- `myGUID` is a field upstream, not a call, and UnitGUID is not answerable at
+-- file scope -- SuperWoW fills it in once the player exists. Resolved on the
+-- miss so it is read at call time without a login hook of its own.
+customEnv.WeakAuras = setmetatable(weakAurasCompat, { __index = function(_, key)
+	if key == "myGUID" then return UnitGUID and UnitGUID("player") or nil end
+	return nil
+end })
+
+-- ---------------------------------------------------------------------------
+-- The `WA_` helpers
+--
+-- Not WoW globals and not part of the table above: upstream keeps them in the
+-- environment it runs an author's Lua in (AuraEnvironment.lua's `overridden`),
+-- so imported code calls them by bare name and they belong here for exactly the
+-- reason `WeakAuras` does.
+--
+-- Same rule, too -- only what can be answered faithfully. `WA_ClassColorName`
+-- cannot be: it reads `RAID_CLASS_COLORS[class].colorStr`, a field vanilla's
+-- table does not carry, on a table not confirmed to exist here at all. It stays
+-- absent and the import report names it instead (WA.AuraEnvNames is what tells
+-- the report which names are answered).
+-- ---------------------------------------------------------------------------
+
+-- Upstream's group iterator: in a party it yields `player` first and then
+-- party1..N, in a raid raid1..N and no player token, the raid roster already
+-- holding one. `reversed` counts down and `forceParty` reads the party roster
+-- while in a raid -- both are upstream's signature, and imported code passes
+-- them. A token is yielded whether or not the unit exists, as upstream's does:
+-- the caller's own UnitExists check is the one an author wrote.
+local function iterateGroupMembers(reversed, forceParty)
+	local raid = GetNumRaidMembers and (GetNumRaidMembers() or 0) or 0
+	if raid > 40 then raid = 40 end
+	local prefix = (not forceParty and raid > 0) and "raid" or "party"
+	local count = raid
+	if prefix == "party" then
+		count = GetNumPartyMembers and (GetNumPartyMembers() or 0) or 0
+		if count > 4 then count = 4 end
+	end
+	local i = reversed and count or (prefix == "party" and 0 or 1)
+	return function()
+		local unit
+		if i == 0 and prefix == "party" then unit = "player"
+		elseif i > 0 and i <= count then unit = prefix .. i end
+		i = i + (reversed and -1 or 1)
+		return unit
+	end
+end
+customEnv.WA_IterateGroupMembers = iterateGroupMembers
+
+-- Retail's aura tuple, which is what upstream's aura getters hand back:
+-- `UnitAura(unit, index, filter)`'s fifteen named returns, in that order.
+--
+-- The order is not inferred -- BuffTrigger2 reads it positionally (§5,
+-- `name, icon, stacks, debuffClass, duration, expirationTime, unitCaster,
+-- isStealable, _, spellId, _, isBossDebuff, isCastByPlayer, _, modRate`) and
+-- every position maps onto a named field of ClassicAPI's AuraData, the ones
+-- vanilla has no concept of included: those are documented as constant `false`
+-- (or `1` for timeMod) rather than absent, so an author reading position 8 gets
+-- the same answer they would on a retail client with nothing stealable.
+--
+-- `castByPlayer` (13) is derived rather than taken from its stub: AuraData
+-- carries `sourceUnit`, so the question is answerable, and a constant false
+-- would silently fail every "did I cast this" branch. It degrades the way
+-- ClassicAPI's own PLAYER filter does -- an aura already up before its cast was
+-- observed has no caster and reads false.
+--
+-- **Position 16 onward is the aura's `points` values, and this client has
+-- none.** A caller reading that far gets nothing back, which is the honest
+-- answer and the one the corpus's single such caller already guards with `or ""`.
+local function unpackAura(aura)
+	if not aura then return nil end
+	return aura.name, aura.icon, aura.applications, aura.dispelName,
+		aura.duration, aura.expirationTime, aura.sourceUnit, aura.isStealable,
+		aura.nameplateShowPersonal, aura.spellId, aura.canApplyAura, aura.isBossAura,
+		aura.sourceUnit == "player", aura.nameplateShowAll, aura.timeMod
+end
+
+-- Upstream's "the first aura on this unit matching a name or a spell id", with
+-- its filter argument passed through untouched: ClassicAPI takes the modern
+-- AuraFilters format -- `|`-separated tokens, `!` negation, HELPFUL/HARMFUL/
+-- PLAYER/DISPELLABLE/CROWD_CONTROL honoured and the rest accepted and ignored --
+-- which is the same string upstream builds. A filter naming neither polarity
+-- gets HELPFUL added, as upstream's does.
+local function getUnitAura(unit, spell, filter)
+	if filter and not string.find(string.upper(filter), "FUL") then
+		filter = filter .. "|HELPFUL"
+	end
+	for i = 1, 255 do
+		local aura = C_UnitAuras.GetAuraDataByIndex(unit, i, filter)
+		if not aura then return nil end
+		if spell == aura.spellId or spell == aura.name then return unpackAura(aura) end
+	end
+end
+customEnv.WA_GetUnitAura = getUnitAura
+customEnv.WA_GetUnitBuff = function(unit, spell, filter)
+	return getUnitAura(unit, spell, filter and (filter .. "|HELPFUL") or "HELPFUL")
+end
+customEnv.WA_GetUnitDebuff = function(unit, spell, filter)
+	return getUnitAura(unit, spell, filter and (filter .. "|HARMFUL") or "HARMFUL")
+end
+
+-- The `WA_` names above, for the import report. Anything else an author calls
+-- under that prefix is either one of upstream's this addon does not answer or
+-- their own helper, and the report says which by looking for a definition.
+WA.AuraEnvNames = {
+	WA_IterateGroupMembers = true,
+	WA_GetUnitAura = true, WA_GetUnitBuff = true, WA_GetUnitDebuff = true,
+}
+
+-- ---------------------------------------------------------------------------
 -- aura_env
 -- ---------------------------------------------------------------------------
 

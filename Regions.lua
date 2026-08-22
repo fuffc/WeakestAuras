@@ -21,13 +21,51 @@ local WA = WeakestAuras
 local GROUP_BORDER_EDGE = 12
 local GROUP_BORDER_PAD = GROUP_BORDER_EDGE / 2
 
--- One child's bounding box in its group's CENTER-relative coordinate space,
+-- One child's bounding box, in coordinates measured from its group's anchor and
 -- computed purely from data -- xOffset/yOffset is the child's anchor position,
 -- selfPoint says which of the child's own corners sits there (WA2's Group.lua
 -- getRect). No live frame coords, so it's stable regardless of layout timing.
-local function childRect(cdata)
+--
+-- A child group has no width/height of its own; its extent is its own box,
+-- offset by where it sits. Upstream reaches the same leaves by walking the whole
+-- subtree flat (Group.lua's TraverseLeafs), which loses each nested group's own
+-- offset on the way down -- recursing keeps it.
+local childRect
+
+-- A group's own bounding box, in coordinates measured from its own anchor, or
+-- nil when it encloses nothing. A static group's is the union of its children's
+-- rects and stays data-pure; a dynamic group's depends on which clones are up,
+-- so the box its last layout cached is the only thing that can answer, and an
+-- unrendered one contributes nothing.
+local function groupRect(gdata)
+	if gdata.regionType == "dynamicgroup" then
+		local region = WA.PeekRegion and WA.PeekRegion(gdata.id, "")
+		if region and region.blx then return region.blx, region.bly, region.trx, region.try end
+		return nil
+	end
+	local blx, bly, trx, try
+	local kids = gdata.controlledChildren or {}
+	for i = 1, table.getn(kids) do
+		local cd = WeakestAurasDB.displays[kids[i]]
+		if cd then
+			local a, b, c, d = childRect(cd)
+			if not blx or a < blx then blx = a end
+			if not bly or b < bly then bly = b end
+			if not trx or c > trx then trx = c end
+			if not try or d > try then try = d end
+		end
+	end
+	return blx, bly, trx, try
+end
+
+function childRect(cdata)
 	local blx = cdata.xOffset or 0
 	local bly = cdata.yOffset or 0
+	if WA.IsGroup(cdata) then
+		local a, b, c, d = groupRect(cdata)
+		if not a then return blx, bly, blx, bly end
+		return blx + a, bly + b, blx + c, bly + d
+	end
 	local w, h = cdata.width, cdata.height
 	if not w or not h then return blx, bly, blx, bly end
 	local sp = cdata.selfPoint or "CENTER"
@@ -41,7 +79,6 @@ local function childRect(cdata)
 	return blx, bly, trx, try
 end
 
--- Draws the group's border around the cached box (blx/bly/trx/try, in CENTER-
 -- True if any leaf under this group is currently shown (a live clone with
 -- toShow). The group frame is always shown (a transparent container children
 -- parent to), so its *border* is what tracks child visibility -- otherwise an
@@ -62,37 +99,64 @@ local function groupHasVisibleChild(data)
 	return false
 end
 
--- relative coords) and sizes the frame to it. Shared by the static and dynamic
--- paths, which each fill the box differently before calling this.
+-- Fits the group's frame to the box its caller computed (blx/bly/trx/try, in
+-- coordinates measured from the group's anchor) and draws the border round it.
+-- Shared by the static and dynamic paths, which each fill the box differently
+-- before calling this.
+--
+-- The box is rarely centred on the anchor -- a DOWN grow's hangs entirely below
+-- it -- so sizing the frame is only half of it: the box slot then slides the
+-- frame onto the box while the anchor goes on pinning the origin. That is what
+-- makes the frame's rectangle the content rectangle, which in turn is what lets
+-- the border, the mover and magnetism all read the frame instead of each
+-- re-deriving the box from the cached corners.
 local function drawGroupBox(region, data, blx, bly, trx, try)
+	local changed = region.blx ~= blx or region.bly ~= bly
+		or region.trx ~= trx or region.try ~= try
 	region.blx, region.bly, region.trx, region.try = blx, bly, trx, try
+	region:SetOffsetBox((blx + trx) / 2, (bly + try) / 2)
 	region:SetWidth(math.max(trx - blx, 8))
 	region:SetHeight(math.max(try - bly, 8))
 	local border = region.border
-	border:ClearAllPoints()
-	border:SetPoint("BOTTOMLEFT", region, "CENTER", blx - GROUP_BORDER_PAD, bly - GROUP_BORDER_PAD)
-	border:SetPoint("TOPRIGHT", region, "CENTER", trx + GROUP_BORDER_PAD, try + GROUP_BORDER_PAD)
+	WA.regionPrototype.AnchorArea(border, region, GROUP_BORDER_PAD)
 	local bc = data.borderColor or { 0, 0, 0, 1 }
 	border:SetBackdropBorderColor(bc[1], bc[2], bc[3], bc[4])
-	if data.border and groupHasVisibleChild(data) then border:Show() else border:Hide() end
+	-- Anchoring per unit puts every child on a frame of its own, so there is no
+	-- box left to wrap and the border would be a stray patch at the group's own
+	-- point (upstream's Resize suppresses it on the same test).
+	if data.border and not data.useAnchorPerUnit and groupHasVisibleChild(data) then
+		border:Show()
+	else
+		border:Hide()
+	end
+	-- A group's box is its parent's geometry too, and only this call knows it
+	-- moved. Strictly upward through `parent`, so it terminates; guarded on an
+	-- actual change so a dynamic group relaying out on every clone update doesn't
+	-- walk its ancestors each time.
+	if changed and data.parent then WA.RelayoutGroup(data.parent) end
 end
 
 -- Static group: the box is the union of children's data-defined rects (each
 -- child keeps its own anchor/offset, so this is stable without live coords).
+--
+-- The box wraps the children and nothing else. Upstream seeds its union at the
+-- origin, which drags the box back to the group's own point whenever the pack
+-- sits off to one side of it; a border is supposed to say where the children
+-- are.
 local function applyGroupBounds(region, data)
-	local blx, bly, trx, try = 0, 0, 0, 0
+	local blx, bly, trx, try = groupRect(data)
+	drawGroupBox(region, data, blx or 0, bly or 0, trx or 0, try or 0)
+	-- Fitting the frame to the box moved it under the children, so their offsets
+	-- into it moved by the same amount.
 	local kids = data.controlledChildren or {}
 	for i = 1, table.getn(kids) do
 		local cd = WeakestAurasDB.displays[kids[i]]
 		if cd then
-			local a, b, c, d = childRect(cd)
-			if a < blx then blx = a end
-			if b < bly then bly = b end
-			if c > trx then trx = c end
-			if d > try then try = d end
+			WA.ForEachClone(cd.id, function(frame)
+				frame:SetOffset(WA.regionPrototype.GroupChildOffset(region, cd))
+			end)
 		end
 	end
-	drawGroupBox(region, data, blx, bly, trx, try)
 end
 
 -- Deterministic clone ordering: the comparator algebra a dynamicgroup's `sort`
@@ -222,7 +286,11 @@ end
 -- The currently-shown child region frames of a dynamicgroup, in controlledChildren
 -- order, one entry per visible clone. Each carries its size (from data, falling
 -- back to the live frame) plus the fields WA2's regionData carries (id, cloneId,
--- dataIndex, region, data) so a customSort can read them.
+-- dataIndex, region, data, dimensions, parent) so a customSort or a customGrow
+-- can read them. The one field of upstream's shape deliberately absent is
+-- `controlPoint`: it names a frame this addon does not have, and it appears
+-- nowhere in upstream outside its own DynamicGroup.lua, so no code written
+-- against the documented contract reaches for it.
 --
 -- WA.ForEachClone walks entry.byClone with pairs(), a hash whose iteration order
 -- can differ between two passes over the same set -- without this stableSort, a
@@ -248,11 +316,19 @@ local function activeChildren(data)
 				if frame.toShow or frame.animatingFinish then
 					local w = cd.width or (frame:GetWidth() or 0)
 					local h = cd.height or (frame:GetHeight() or 0)
-					table.insert(list, {
+					local entry = {
 						region = frame, data = cd, id = childId, cloneId = cloneId,
 						dataIndex = dataIndex, cloneSeq = frame.cloneSeq or 0,
 						width = w, height = h,
-					})
+					}
+					-- WA2's regionData.dimensions is whichever table carries the
+					-- child's size; ours already is one, so pointing the field at
+					-- the entry gives an imported customGrow its
+					-- `regionData.dimensions.width` without a table per child per
+					-- layout.
+					entry.dimensions = entry
+					entry.parent = WA.PeekRegion and WA.PeekRegion(data.id, "") or nil
+					table.insert(list, entry)
 				end
 			end)
 		end
@@ -410,6 +486,36 @@ local function customAnchorFrames(region, data, list)
 	return frames
 end
 
+-- Orders a frame-keyed hash of runs so the layout never inherits `pairs` order,
+-- and lets the first run to claim an entry keep it. Shared by the custom
+-- anchorer and the custom grower, both of which hand back such a hash: `rank`
+-- is the entry's place in the ordered list, and a run is ranked by its earliest
+-- member. Returns an array of { frame, entries }.
+local function rankRuns(runs, list)
+	local total = table.getn(list)
+	local rank = {}
+	for i = 1, total do rank[list[i]] = i end
+	local ranked = {}
+	for frame, entries in pairs(runs) do
+		local first = total + 1
+		for i = 1, table.getn(entries) do
+			local at = rank[entries[i]]
+			if at and at < first then first = at end
+		end
+		table.insert(ranked, { frame = frame, entries = entries, first = first })
+	end
+	stableSort(ranked, WA.SortAscending({ "first" }))
+	local claimed = {}
+	for r = 1, table.getn(ranked) do
+		local entries = ranked[r].entries
+		for i = table.getn(entries), 1, -1 do
+			if claimed[entries[i]] then table.remove(entries, i)
+			else claimed[entries[i]] = true end
+		end
+	end
+	return ranked
+end
+
 -- Groups the ordered child list by the frame each clone anchors to. Returns an
 -- array of { frame, entries }, with `frame` nil for the run the group itself
 -- anchors. Partition order follows the first entry of each run, so the layout
@@ -435,31 +541,10 @@ local function anchorPartitions(region, data, list)
 		local frames = customAnchorFrames(region, data, list)
 		if not frames then return { { entries = list } } end
 		-- The custom anchorer hands back a frame-keyed hash, so the runs come out
-		-- in whatever order `pairs` feels like. Ordering them by their earliest
-		-- member, and letting the first run that claims a clone keep it, is what
-		-- makes a custom anchor that assigns one clone to two frames lay out the
-		-- same way twice running instead of flipping between them.
-		local rank = {}
-		for i = 1, total do rank[list[i]] = i end
-		local ranked = {}
-		for frame, entries in pairs(frames) do
-			local first = total + 1
-			for i = 1, table.getn(entries) do
-				local at = rank[entries[i]]
-				if at and at < first then first = at end
-			end
-			table.insert(ranked, { frame = frame, entries = entries, first = first })
-		end
-		stableSort(ranked, WA.SortAscending({ "first" }))
-		local claimed = {}
-		for r = 1, table.getn(ranked) do
-			local entries = ranked[r].entries
-			for i = table.getn(entries), 1, -1 do
-				if claimed[entries[i]] then table.remove(entries, i)
-				else claimed[entries[i]] = true end
-			end
-		end
-		return ranked
+		-- in whatever order `pairs` feels like. rankRuns is what makes a custom
+		-- anchor that assigns one clone to two frames lay out the same way twice
+		-- running instead of flipping between them.
+		return rankRuns(frames, list)
 	end
 
 	-- A clone whose unit has no frame right now still exists and still holds its
@@ -618,7 +703,7 @@ local function growRun(data, list)
 	local space = data.space or 0
 	local grow = data.grow or "DOWN"
 	local n = table.getn(list)
-	local blx, bly, trx, try = 0, 0, 0, 0
+	local blx, bly, trx, try
 
 	-- Cross-axis alignment for the vertical grows (UP/DOWN/VERTICAL): line up the
 	-- children's left/right edges (LEFT/RIGHT) or centers (CENTER) on x = 0.
@@ -683,14 +768,142 @@ local function growRun(data, list)
 		end
 	end
 
+	-- Seeded from the first child rather than from zero, as upstream's growers
+	-- are. Every grow here happens to leave one edge of the run on the origin --
+	-- the cursor starts there, and staggerCoefficient is what pins the
+	-- perpendicular end -- so the two seeds agree today; the union is the
+	-- children's either way, and a grower that ever cleared the origin would not
+	-- have to know about this.
 	for i = 1, n do
 		local c = list[i]
-		if c.x - c.width / 2 < blx then blx = c.x - c.width / 2 end
-		if c.x + c.width / 2 > trx then trx = c.x + c.width / 2 end
-		if c.y - c.height / 2 < bly then bly = c.y - c.height / 2 end
-		if c.y + c.height / 2 > try then try = c.y + c.height / 2 end
+		local l, r, b, t = c.x - c.width / 2, c.x + c.width / 2,
+			c.y - c.height / 2, c.y + c.height / 2
+		if not blx or l < blx then blx = l end
+		if not trx or r > trx then trx = r end
+		if not bly or b < bly then bly = b end
+		if not try or t > try then try = t end
 	end
-	return list, blx, bly, trx, try
+	return list, blx or 0, bly or 0, trx or 0, try or 0
+end
+
+-- Custom grow (WA2 DynamicGroup.lua's growers.CUSTOM): the whole ordered clone
+-- list goes to the user's function, which writes positions back rather than
+-- having them derived from a direction on `data`.
+--
+-- Upstream's coordinate contract is the child's `selfPoint` offset from the
+-- group's `selfPoint`, carried on a control point anchored selfPoint-to-selfPoint
+-- and sized to the child -- so the control point cancels out of the arithmetic
+-- and the numbers are the child's own. Picking CUSTOM there forces selfPoint to
+-- CENTER (its grow select has no direction to derive one from), which is what
+-- every group here anchors by, so an upstream grow function's numbers mean to
+-- layoutDynamicGroup exactly what they meant to upstream.
+local function customGrowPositions(region, data, list)
+	local source = data.customGrow
+	if not source or not string.find(source, "%S") then return nil end
+	local errTag = tostring(data.id) .. ": custom grow"
+	if not region.growFuncBuilt then
+		region.growFunc = WA.LoadFunction(source, errTag)
+		region.growFuncBuilt = true
+	end
+	if not region.growFunc then return nil end
+	local positions = {}
+	local ok = WA.RunAuraFunc(data.id, errTag, region.growFunc, positions, list)
+	if not ok then
+		-- Dropped for the rest of this compile, for customAnchorFrames' reason:
+		-- the layout re-runs on every state update of every child, so a grow that
+		-- throws would report on every one. Upstream wipes the positions table
+		-- instead, which is the same "nothing moves this pass" outcome without the
+		-- budget.
+		region.growFunc = nil
+		return nil
+	end
+	return positions
+end
+
+-- One { x, y, show } tuple, read as WA2's DoPositionChildrenPerFrame reads it: a
+-- non-number coordinate is 0, and anything but an explicit false shows.
+local function readGrowPosition(pos)
+	local x = type(pos[1]) == "number" and pos[1] or 0
+	local y = type(pos[2]) == "number" and pos[2] or 0
+	return x, y, pos[3] ~= false
+end
+
+-- Places the clones a custom grow returned. Both of upstream's return shapes are
+-- read: an array indexed by the sorted list, which can only mean the run the
+-- group itself anchors, or a hash of anchor frame -> (entry -> position) where
+-- `""` names the group. Returns the same tuple growRun does per run.
+--
+-- A clone the grow function does not place gives up its painted region without
+-- giving up its state -- the same SetLimited the visible-clone cap uses, and
+-- what upstream's un-shown control point amounts to. That covers a `show` of
+-- false, a grow that returns nothing, and one that threw.
+local function growCustom(region, data, list)
+	local positions = customGrowPositions(region, data, list)
+	local total = table.getn(list)
+	local placed, byFrame, runs = {}, nil, nil
+	local blx, bly, trx, try
+
+	if positions and table.getn(positions) > 0 then
+		local entries, pos = {}, {}
+		for i = 1, table.getn(positions) do
+			if type(positions[i]) == "table" then
+				local entry = list[i]
+				if entry then
+					table.insert(entries, entry)
+					pos[entry] = positions[i]
+				elseif WA.ReportForAura then
+					WA.ReportForAura(data.id, "runtime:custom grow", "error",
+						tostring(data.id) .. ": custom grow returned a position for slot "
+						.. i .. ", which holds no aura", true)
+				end
+			end
+		end
+		byFrame = { [""] = pos }
+		runs = { { frame = "", entries = entries } }
+	elseif positions then
+		byFrame = positions
+		local frames = {}
+		for frame, pos in pairs(positions) do
+			if type(pos) == "table" then
+				local entries = {}
+				for i = 1, total do
+					if type(pos[list[i]]) == "table" then table.insert(entries, list[i]) end
+				end
+				frames[frame] = entries
+			end
+		end
+		-- Frame-keyed positions arrive in `pairs` order, and a grow that puts one
+		-- clone under two frames would otherwise land wherever the hash fell that
+		-- pass -- the custom anchorer's problem, and its answer.
+		runs = rankRuns(frames, list)
+	end
+
+	local held = {}
+	for r = 1, table.getn(runs or {}) do
+		local run = runs[r]
+		local pos = byFrame[run.frame]
+		local frame = run.frame ~= "" and run.frame or nil
+		for i = 1, table.getn(run.entries) do
+			local entry = run.entries[i]
+			local x, y, show = readGrowPosition(pos[entry])
+			entry.x, entry.y, entry.anchorFrame = x, y, frame
+			entry.region:SetLimited(not show)
+			held[entry] = true
+			table.insert(placed, entry)
+			if show and not frame then
+				local l, r2, b, t = x - entry.width / 2, x + entry.width / 2,
+					y - entry.height / 2, y + entry.height / 2
+				if not blx or l < blx then blx = l end
+				if not trx or r2 > trx then trx = r2 end
+				if not bly or b < bly then bly = b end
+				if not try or t > try then try = t end
+			end
+		end
+	end
+	for i = 1, total do
+		if not held[list[i]] then list[i].region:SetLimited(true) end
+	end
+	return placed, blx or 0, bly or 0, trx or 0, try or 0
 end
 
 -- Orders the group's clones, splits them into anchor runs, and grows each run
@@ -708,6 +921,10 @@ local function growChildren(region, data)
 	if region.sortBeginPass then region.sortBeginPass() end
 	stableSort(list, region.sortFunc)
 
+	-- A custom grow decides its own runs, so it replaces the anchor partition and
+	-- the grower both.
+	if data.grow == "CUSTOM" then return growCustom(region, data, list) end
+
 	local placed = {}
 	local blx, bly, trx, try = 0, 0, 0, 0
 	local runs = anchorPartitions(region, data, list)
@@ -723,15 +940,158 @@ local function growChildren(region, data)
 	return placed, blx, bly, trx, try
 end
 
+local LAYOUT_SLIDE_DURATION = 0.2
+local TWO_PI = math.pi * 2
+
+-- Animated expand and collapse (WA2's `data.animate`): a surviving child slides
+-- to its new slot rather than snapping there when one of its siblings comes,
+-- goes or re-sorts.
+--
+-- The group owns this tween outright and never calls WA.Animate. That is not
+-- thrift: the animation registry holds one animation per frame, so a child that
+-- both pulses and slides would have the two fighting over the same slot --
+-- which is the whole reason upstream gives every child a second frame (its
+-- control point) to slide instead. Here the fourth offset slot plays that part,
+-- and a child's own translate animation composes on top exactly as upstream's
+-- does.
+--
+-- The layout writes the child's *new* position into its config slot as it always
+-- has; all that moves is the layout slot, decaying the old-minus-new delta to
+-- zero.
+local slides, slidesRunning = {}, false
+local slideFrame = CreateFrame("Frame")
+local slideLast = GetTime()
+
+-- Ends a slide where the child stands rather than where it was headed: dropping
+-- the layout slot leaves the config slot, which already holds the position the
+-- last layout gave it.
+local function stopSlide(region)
+	if not slides[region] then return end
+	slides[region] = nil
+	region:SetOffsetLayout(0, 0)
+end
+WA.StopLayoutSlide = stopSlide
+
+-- Split from the OnUpdate script so the headless harness can drive it: this
+-- client's frames tick against a clock nothing offline has.
+local function advanceSlides(elapsed)
+	local live = false
+	for region, s in pairs(slides) do
+		s.elapsed = s.elapsed + elapsed
+		local t = s.elapsed / LAYOUT_SLIDE_DURATION
+		if t >= 1 then
+			slides[region] = nil
+			region:SetOffsetLayout(0, 0)
+		else
+			live = true
+			if s.radius then
+				local r = s.radius + t * s.dRadius
+				local a = s.angle + t * s.dAngle
+				region:SetOffsetLayout(math.cos(a) * r - s.x, math.sin(a) * r - s.y)
+			else
+				region:SetOffsetLayout(s.dx * (1 - t), s.dy * (1 - t))
+			end
+		end
+	end
+	if not live then
+		slidesRunning = false
+		slideFrame:SetScript("OnUpdate", nil)
+	end
+end
+WA.AdvanceLayoutSlides = advanceSlides
+
+local function slideTick()
+	local now = GetTime()
+	local elapsed = now - slideLast
+	slideLast = now
+	advanceSlides(elapsed)
+end
+
+-- `x`/`y` are the child's position in the group's own coordinates -- before any
+-- per-frame nudge -- because the polar path measures its origin from them, and
+-- the offsets cancel out of a delta anyway.
+local function startSlide(region, dx, dy, x, y, grow)
+	if dx * dx + dy * dy < 0.0001 then stopSlide(region) return end
+	local s = { elapsed = 0, dx = dx, dy = dy }
+	if grow == "CIRCLE" or grow == "COUNTERCIRCLE" then
+		-- On a ring, travel along it rather than chording across it: interpolate
+		-- the two slots' polar coordinates about the group's centre, the short way
+		-- round. Upstream builds the same curve as a custom translateFunc.
+		local fromX, fromY = x + dx, y + dy
+		local r1 = math.sqrt(fromX * fromX + fromY * fromY)
+		local a1 = math.atan2(fromY, fromX)
+		local dA = math.atan2(y, x) - a1
+		while dA > math.pi do dA = dA - TWO_PI end
+		while dA < -math.pi do dA = dA + TWO_PI end
+		s.radius, s.dRadius = r1, math.sqrt(x * x + y * y) - r1
+		s.angle, s.dAngle, s.x, s.y = a1, dA, x, y
+	end
+	slides[region] = s
+	region:SetOffsetLayout(dx, dy)
+	if not slidesRunning then
+		slidesRunning = true
+		slideLast = GetTime()
+		slideFrame:SetScript("OnUpdate", slideTick)
+	end
+end
+
 -- Dynamic group: run the grower, push each visible child's computed position
 -- onto its region (CENTER-to-CENTER + offset, via the region's own offset slot
 -- so UpdatePosition stays authoritative), then draw the box around the result.
+--
+-- A run anchored to a foreign frame takes the group's own anchor tuple as the
+-- nudge off that frame -- `anchorPoint` for which of its corners, `xOffset`/
+-- `yOffset` for how far -- which is upstream's DoPositionChildrenPerFrame and the
+-- only way to sit an icon *above* a nameplate rather than on top of it. The
+-- group's own screen position means nothing to such a run, so the tuple is free
+-- to say something else.
 local function layoutDynamicGroup(region, data)
 	local list, blx, bly, trx, try = growChildren(region, data)
+	local anchorPoint = WA.regionPrototype.ResolveAnchorPoint(data.anchorPoint, "CENTER")
+	local xOff, yOff = data.xOffset or 0, data.yOffset or 0
+	-- The grower works from the group's anchor, but drawGroupBox will fit the
+	-- frame to the box the run actually filled -- so a child anchored to the group
+	-- owes back the difference between the two origins. A run on a foreign frame
+	-- measures from that frame and owes nothing. The *previous* centre is what the
+	-- live offsets below are still measured against.
+	local cx, cy = (blx + trx) / 2, (bly + try) / 2
+	local wasCx, wasCy = region.xOffsetBox or 0, region.yOffsetBox or 0
 	for i = 1, table.getn(list) do
 		local c = list[i]
-		c.region:SetAnchor("CENTER", c.anchorFrame or region, "CENTER")
-		c.region:SetOffset(c.x, c.y)
+		local r = c.region
+		local frame = c.anchorFrame or region
+		local point = c.anchorFrame and anchorPoint or "CENTER"
+		local x = c.anchorFrame and (c.x + xOff) or c.x
+		local y = c.anchorFrame and (c.y + yOff) or c.y
+		-- Two cases have no delta worth animating, whatever the toggle says. A
+		-- child this layout has never placed has no old position, only a default
+		-- zero; and one that changed anchor frame -- a clone handed from one
+		-- nameplate to another -- has an old position measured in a coordinate
+		-- space the new one knows nothing about. Both snap.
+		local slide = data.animate and r.layoutPlaced
+			and r.anchorFrame == frame and r.anchorPoint == point
+		local fromX, fromY
+		if slide then
+			-- The live visual position, not the last one the layout wrote: a
+			-- relayout landing mid-slide continues from where the child actually
+			-- is, so a group churning children glides instead of stuttering.
+			-- Upstream measures from its last layout position and stutters.
+			--
+			-- Read back into the coordinates `x`/`y` are in, so a box centre that
+			-- moved between the two layouts cancels: the frame carries that shift
+			-- itself, and counting it again would slide every surviving child by a
+			-- distance it never travelled.
+			fromX = (r.xOffset or 0) + (r.xOffsetLayout or 0) + (c.anchorFrame and 0 or wasCx)
+			fromY = (r.yOffset or 0) + (r.yOffsetLayout or 0) + (c.anchorFrame and 0 or wasCy)
+		end
+		r:SetAnchor("CENTER", frame, point)
+		if c.anchorFrame then r:SetOffset(x, y) else r:SetOffset(x - cx, y - cy) end
+		r.layoutPlaced = true
+		if slide then
+			startSlide(r, fromX - x, fromY - y, c.x, c.y, data.grow)
+		else
+			stopSlide(r)
+		end
 	end
 	drawGroupBox(region, data, blx, bly, trx, try)
 end
@@ -785,12 +1145,20 @@ local function groupCreate(parent, data)
 end
 
 local function groupModify(region, data)
+	-- Which corner of a group is pinned is not the free choice it is for a leaf:
+	-- the frame is fitted to a box whose size and offset both move as children
+	-- come and go, so only the centre -- the point the box slot is measured from,
+	-- and the one the children's own offsets are measured from -- holds still.
+	-- Upstream's Group.lua overwrites the field on every modify for the same
+	-- reason, and a stale saved value heals here rather than displacing the pack.
+	data.selfPoint = "CENTER"
 	region:SetScale(data.scale and data.scale > 0 and data.scale or 1)
 	WA.regionPrototype.ApplyPosition(region, data)
 	if data.regionType == "dynamicgroup" then
 		region.sortFunc, region.sortBeginPass = createSortFunc(data)
 		region.sortFuncBuilt = true
 		region.anchorFunc, region.anchorFuncBuilt = nil, false
+		region.growFunc, region.growFuncBuilt = nil, false
 		layoutDynamicGroup(region, data)
 	else
 		applyGroupBounds(region, data)
@@ -938,17 +1306,18 @@ local GRID_TYPE_LABELS = {
 	VH = "Centered Vertical, then Centered Horizontal",
 }
 
--- Upstream's grow_types, minus CUSTOM. CIRCLE reads as "Counter Clockwise" and
--- COUNTERCIRCLE as "Clockwise" on purpose: the labels describe the direction the
--- grower actually turns, and it is the internal names that are backwards.
+-- Upstream's grow_types. CIRCLE reads as "Counter Clockwise" and COUNTERCIRCLE
+-- as "Clockwise" on purpose: the labels describe the direction the grower
+-- actually turns, and it is the internal names that are backwards.
 local GROW_TYPES = {
 	"UP", "DOWN", "LEFT", "RIGHT", "HORIZONTAL", "VERTICAL",
-	"CIRCLE", "COUNTERCIRCLE", "GRID",
+	"CIRCLE", "COUNTERCIRCLE", "GRID", "CUSTOM",
 }
 local GROW_TYPE_LABELS = {
 	UP = "Up", DOWN = "Down", LEFT = "Left", RIGHT = "Right",
 	HORIZONTAL = "Centered Horizontal", VERTICAL = "Centered Vertical",
 	CIRCLE = "Counter Clockwise", COUNTERCIRCLE = "Clockwise", GRID = "Grid",
+	CUSTOM = "Custom",
 }
 
 local CONSTANT_FACTOR_LABELS = {
@@ -976,6 +1345,8 @@ WA.RegisterRegionType("dynamicgroup", {
 		borderColor = { 0, 0, 0, 1 },
 		scale = 1,
 		grow = "DOWN",
+		customGrow = "",
+		animate = false,
 		sort = "none",
 		space = 2,
 		align = "CENTER",
@@ -1011,21 +1382,43 @@ WA.RegisterRegionType("dynamicgroup", {
 				get = function() return data.grow end,
 				set = function(v) data.grow = v; WA.Add(data); WA.RefreshOptions() end,
 			},
-			{
-				type = "select", name = "Sort", key = "sort",
-				values = { "none", "ascending", "descending", "hybrid", "custom" },
-				labels = { none = "None", ascending = "Ascending", descending = "Descending",
-					hybrid = "Hybrid", custom = "Custom" },
-				get = function() return data.sort end,
-				set = function(v) data.sort = v; WA.Add(data); WA.RefreshOptions() end,
-			},
 		}
+		local isCustom = data.grow == "CUSTOM"
+		if isCustom then
+			table.insert(fields, {
+				type = "code", name = "Custom Grow", key = "customGrow", height = 160,
+				get = function() return data.customGrow end,
+				set = function(v) data.customGrow = v; WA.Add(data) end,
+				-- Seeded in the array form -- one { x, y } per slot of the sorted
+				-- list -- because it is the shape with nothing to look up: the
+				-- frame-keyed form needs the entry tables themselves as keys.
+				default = "function(positions, activeRegions)\n"
+					.. "    for i = 1, table.getn(activeRegions) do\n"
+					.. "        positions[i] = { 0, -(i - 1) * 32 }\n"
+					.. "    end\nend",
+				validate = function(txt)
+					return WA.Widgets.LuaSyntaxError(WA.WrapFunctionSource(txt), "custom grow")
+				end,
+			})
+		end
+		table.insert(fields, {
+			type = "select", name = "Sort", key = "sort",
+			values = { "none", "ascending", "descending", "hybrid", "custom" },
+			labels = { none = "None", ascending = "Ascending", descending = "Descending",
+				hybrid = "Hybrid", custom = "Custom" },
+			get = function() return data.sort end,
+			set = function(v) data.sort = v; WA.Add(data); WA.RefreshOptions() end,
+		})
 		-- A grid spaces its two axes separately and reads neither `space` nor
 		-- `align`, so it offers its own pair and withholds both -- upstream hides
 		-- the same three fields, `stagger` included, for the same reason. A circle
 		-- withholds the same three, and reads `space` only under SPACING, where it
-		-- sets the radius rather than a gap.
-		if data.grow == "GRID" then
+		-- sets the radius rather than a gap. A custom grow reads none of the
+		-- layout fields at all: it is handed the ordered list and answers with
+		-- coordinates, so spacing, alignment, the clone cap and the per-unit
+		-- anchor are all its own business.
+		if isCustom then -- no layout fields of ours
+		elseif data.grow == "GRID" then
 			table.insert(fields, {
 				type = "select", name = "Grid direction", key = "gridType",
 				values = GRID_TYPES, labels = GRID_TYPE_LABELS,
@@ -1162,19 +1555,21 @@ WA.RegisterRegionType("dynamicgroup", {
 				end,
 			})
 		end
-		if data.grow ~= "GRID" and not isCircle(data) then
+		if not isCustom and data.grow ~= "GRID" and not isCircle(data) then
 			table.insert(fields, {
 				type = "range", name = "Stagger", key = "stagger", min = -50, max = 50, step = 1,
 				get = function() return data.stagger end,
 				set = function(v) data.stagger = v; WA.Add(data) end,
 			})
 		end
-		table.insert(fields, {
-			type = "toggle", name = "Limit visible clones", key = "useLimit",
-			get = function() return data.useLimit end,
-			set = function(v) data.useLimit = v; WA.Add(data); WA.RefreshOptions() end,
-		})
-		if data.useLimit then
+		if not isCustom then
+			table.insert(fields, {
+				type = "toggle", name = "Limit visible clones", key = "useLimit",
+				get = function() return data.useLimit end,
+				set = function(v) data.useLimit = v; WA.Add(data); WA.RefreshOptions() end,
+			})
+		end
+		if data.useLimit and not isCustom then
 			table.insert(fields, {
 				type = "range", name = "Limit", key = "limit", min = 0, max = 20, step = 1,
 				get = function() return data.limit end,
@@ -1182,11 +1577,18 @@ WA.RegisterRegionType("dynamicgroup", {
 			})
 		end
 		table.insert(fields, {
-			type = "toggle", name = "Anchor per unit", key = "useAnchorPerUnit",
-			get = function() return data.useAnchorPerUnit end,
-			set = function(v) data.useAnchorPerUnit = v; WA.Add(data); WA.RefreshOptions() end,
+			type = "toggle", name = "Animated expand and collapse", key = "animate",
+			get = function() return data.animate end,
+			set = function(v) data.animate = v; WA.Add(data) end,
 		})
-		if data.useAnchorPerUnit then
+		if not isCustom then
+			table.insert(fields, {
+				type = "toggle", name = "Anchor per unit", key = "useAnchorPerUnit",
+				get = function() return data.useAnchorPerUnit end,
+				set = function(v) data.useAnchorPerUnit = v; WA.Add(data); WA.RefreshOptions() end,
+			})
+		end
+		if data.useAnchorPerUnit and not isCustom then
 			table.insert(fields, {
 				type = "select", name = "Anchor each clone to", key = "anchorPerUnit",
 				values = { "NAMEPLATE", "UNITFRAME", "CUSTOM" },
@@ -1421,6 +1823,462 @@ WA.RegisterRegionType("texture", {
 		region:SetRotation(data.rotation)
 		WA.regionPrototype.ApplyPosition(region, data)
 		WA.regionPrototype.modifyFinish(region, data)
+	end,
+})
+
+-- Model region -- a 3D model in a frame, WA2's Model.lua (§6) rendered through
+-- this client's PlayerModel widget. Only the legacy camera exists here
+-- (SetPosition + SetFacing); an aura imported with upstream's transform camera
+-- has its yaw folded into `rotation` at import and keeps its st_* keys
+-- untouched for the trip back.
+
+-- PlayerModel frames are pooled across model regions, acquired on show and
+-- released on hide: they cannot be destroyed, and this client drops a hidden
+-- model's geometry anyway, so every show re-applies the config regardless --
+-- pooling by visibility keeps the frame count at the number of models on
+-- screen rather than the number defined.
+local modelFramePool = {}
+
+-- Everything a paint needs lives on wa* fields of the model frame itself, so
+-- the OnShow and OnEvent handlers (globals `this`/`event`/`arg1` on this
+-- client) can re-apply without reaching back into a region or its data.
+local modelApply
+
+-- One delayed re-apply after a SetCreature: an entry the client's cache has
+-- purged renders nothing until the server answers the query the call fired,
+-- and the answer is back well inside the delay. Once per configure, or a
+-- permanently unanswerable entry would re-apply forever.
+local function modelRequery(model)
+	if model.waModelRequeried then return end
+	model.waModelRequeried = true
+	C_Timer.After(1.5, function()
+		if model.waModelCreature and model:IsShown() then modelApply(model) end
+	end)
+end
+
+modelApply = function(model)
+	if model.waModelKind == "unit" then
+		pcall(model.SetUnit, model, model.waModelValue)
+		if model.waModelZoom then pcall(model.SetCamera, model, 0) end
+	elseif model.waModelKind == "path" or model.waModelKind == "creature" then
+		-- A creature entry textures the model (skins live in
+		-- CreatureDisplayInfo, which SetModel never consults); the raw path is
+		-- the fallback, drawn white.
+		if model.waModelCreature and model.SetCreature then
+			pcall(model.SetCreature, model, model.waModelCreature)
+			modelRequery(model)
+		elseif model.waModelKind == "path" then
+			pcall(model.SetModel, model, model.waModelValue)
+		else
+			pcall(model.ClearModel, model)
+			return
+		end
+	else
+		pcall(model.ClearModel, model)
+		return
+	end
+	pcall(model.SetModelScale, model, model.waModelScale or 1)
+	pcall(model.SetPosition, model, model.waModelZ or 0, model.waModelX or 0, model.waModelY or 0)
+	pcall(model.SetFacing, model, math.rad(model.waModelFacing or 0))
+	-- SetSequence indexes this model's own sequence list; retail's SetAnimation
+	-- ids do not map onto it, so an imported `sequence` is best-effort.
+	if model.waModelSequence then pcall(model.SetSequence, model, model.waModelSequence) end
+end
+
+local function modelOnShow()
+	modelApply(this)
+end
+
+-- The client projects a model where its frame sat when the model was applied;
+-- moving the frame afterwards moves the frame alone, and no event announces the
+-- move. A thumbnail is anchored only after AcquireThumbnail has already
+-- applied, and dragging the options window carries every thumbnail in it, so
+-- each model frame watches its own screen rect and re-applies when the rect
+-- settles after a change -- settle, not per move, or a drag would reload
+-- geometry every tick.
+local function modelOnUpdate()
+	local left, top = this:GetLeft(), this:GetTop()
+	if left ~= this.waModelLeft or top ~= this.waModelTop then
+		this.waModelLeft, this.waModelTop = left, top
+		this.waModelMoved = left and true or nil
+	elseif this.waModelMoved then
+		this.waModelMoved = nil
+		modelApply(this)
+	end
+end
+
+local function modelOnEvent()
+	if event == "PLAYER_TARGET_CHANGED"
+		or (event == "UNIT_MODEL_CHANGED" and arg1 and this.waModelValue
+			and UnitIsUnit(arg1, this.waModelValue)) then
+		modelApply(this)
+	end
+end
+
+local function acquireModelFrame()
+	local model = table.remove(modelFramePool)
+	if not model then
+		local ok, frame = pcall(CreateFrame, "PlayerModel", nil, UIParent)
+		if not ok or not frame then return nil end
+		model = frame
+	end
+	return model
+end
+
+local function releaseModelFrame(model)
+	model:UnregisterAllEvents()
+	model:SetScript("OnEvent", nil)
+	model:SetScript("OnShow", nil)
+	model:SetScript("OnUpdate", nil)
+	model.waModelLeft, model.waModelTop, model.waModelMoved = nil, nil, nil
+	pcall(model.ClearModel, model)
+	model:Hide()
+	model:ClearAllPoints()
+	model:SetParent(UIParent)
+	table.insert(modelFramePool, model)
+end
+
+-- The three forms a model aura can carry, in the order that finds a loadable
+-- one: a unit (modelIsUnit reuses model_fileId for the unit token, upstream's
+-- layout), a retail fileDataID resolved through WA2ModelIDs.lua, then a literal
+-- path (pre-fileID exports, and auras authored here). A literal path is
+-- re-spelled `\\` + `.mdx`, the form this client's SetModel provably takes.
+-- modelDisplayInfo puts a *display* id in model_fileId -- a different id space
+-- entirely, never a file to resolve.
+local function modelSource(data)
+	if data.modelDisplayInfo then
+		-- model_fileId holds a *display* id here -- resolvable to a creature
+		-- entry wearing it, never to a file.
+		local entry = WA.ResolveDisplayCreature(data.model_fileId)
+		if entry then return "creature", entry end
+		return nil
+	end
+	if data.modelIsUnit then
+		local unit = data.model_fileId
+		if type(unit) == "string" and unit ~= "" then return "unit", unit end
+		return nil
+	end
+	local resolved = WA.ResolveModelFile(data.model_fileId)
+	if resolved then return "path", resolved end
+	local literal = data.model_path
+	if type(literal) ~= "string" or literal == "" then return nil end
+	literal = string.gsub(literal, "/", "\\")
+	local low = string.lower(literal)
+	if string.find(low, "%.m2$") then
+		literal = string.sub(literal, 1, -4)
+	elseif string.find(low, "%.md[xl]$") then
+		literal = string.sub(literal, 1, -5)
+	end
+	return "path", literal .. ".mdx"
+end
+
+WA.RegisterRegionType("model", {
+	displayName = "Model",
+	description = "A 3D model, from the game's files or a live unit.",
+	icon = "Interface\\Icons\\INV_Misc_Idol_02",
+	-- A PlayerModel inside a real ScrollFrame's scroll child renders at the
+	-- child's untranslated coordinates -- from the screen origin, not the row
+	-- (gotchas.md) -- so a scrolling pane paints the static icon instead. The
+	-- aura list's faux scroll is plain repositioned frames and keeps the live
+	-- miniature.
+	thumbnailNoScroll = true,
+	defaults = {
+		-- A looping ambient effect with its own textures: creature models
+		-- fetch their skins from display info this client cannot apply, so a
+		-- creature default would greet the user with untextured white.
+		model_path = "Spells\\Cyclone_State.mdx",
+		model_fileId = "",
+		modelIsUnit = false,
+		portraitZoom = false,
+		advance = false,
+		sequence = 1,
+		rotation = 0,
+		-- Local key, no upstream counterpart: with only the legacy camera,
+		-- SetModelScale is half of how a model is fitted to its frame.
+		modelScale = 1,
+		model_x = 0,
+		model_y = 0,
+		model_z = 0,
+		-- Upstream's transform camera, carried for the round trip and never
+		-- rendered here (api = SetTransform on a retail client).
+		api = false,
+		model_st_tx = 40,
+		model_st_ty = 0,
+		model_st_tz = 0,
+		model_st_rx = 90,
+		model_st_ry = 0,
+		model_st_rz = 90,
+		model_st_us = 40,
+		width = 200,
+		height = 200,
+		alpha = 1,
+		anchorFrameType = "SCREEN",
+		selfPoint = "CENTER",
+		anchorPoint = "CENTER",
+		xOffset = 0,
+		yOffset = 0,
+		frameStrata = 1,
+	},
+	getSubRegionAnchors = function() return TEXTURE_SUB_ANCHORS end,
+	properties = WA.regionPrototype.AddProperties({
+		width = { display = "Width", setter = "SetRegionWidth", type = "number", min = 8, max = 512, step = 1 },
+		height = { display = "Height", setter = "SetRegionHeight", type = "number", min = 8, max = 512, step = 1 },
+	}),
+	-- Upstream's list thumbnail: a quickslot border with a live miniature of
+	-- the aura's own model. The model frame is created once with the pooled
+	-- thumbnail and reconfigured per row; its OnShow re-applies, because a
+	-- hidden model drops its geometry.
+	createThumbnail = function(parent)
+		local frame = CreateFrame("Frame", nil, parent)
+		local border = frame:CreateTexture(nil, "OVERLAY")
+		border:SetAllPoints(frame)
+		border:SetTexture("Interface\\Buttons\\UI-Quickslot2")
+		border:SetTexCoord(0.2, 0.8, 0.2, 0.8)
+		local ok, model = pcall(CreateFrame, "PlayerModel", nil, frame)
+		if ok and model then
+			model:SetPoint("TOPLEFT", frame, "TOPLEFT", 2, -2)
+			model:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -2, 2)
+			model:SetScript("OnShow", modelOnShow)
+			model:SetScript("OnUpdate", modelOnUpdate)
+			frame.model = model
+		end
+		return frame
+	end,
+	modifyThumbnail = function(frame, data)
+		local model = frame.model
+		if not model then return end
+		local kind, value = modelSource(data)
+		model.waModelKind, model.waModelValue = kind, value
+		model.waModelCreature = (kind == "creature" and value)
+			or (kind == "path" and WA.ResolveCreatureEntry(value)) or nil
+		model.waModelRequeried = nil
+		model.waModelZoom = data.portraitZoom and true or false
+		model.waModelScale = data.modelScale or 1
+		model.waModelX = data.model_x or 0
+		model.waModelY = data.model_y or 0
+		model.waModelZ = data.model_z or 0
+		model.waModelFacing = data.rotation or 0
+		-- A list row holds still and watches no unit events; a stale portrait
+		-- beats per-row event wiring.
+		model.waModelSequence = nil
+		modelApply(model)
+	end,
+	options = function(data)
+		local fields = {
+			{ type = "header", name = "Model" },
+			{
+				type = "toggle", name = "Show a unit", key = "modelIsUnit",
+				get = function() return data.modelIsUnit end,
+				set = function(v)
+					data.modelIsUnit = v and true or false
+					-- model_fileId is the unit token in unit mode and a retail
+					-- file id otherwise; a leftover from the other mode would
+					-- be read in the wrong id space.
+					data.model_fileId = ""
+					WA.Add(data, true)
+					-- Repaints the tab: the field set below swaps between the
+					-- unit token and the model path + browser.
+					WA.RefreshOptions()
+				end,
+			},
+		}
+		if data.modelIsUnit then
+			table.insert(fields, {
+				type = "input", name = "Unit (player, target, party1 ...)", key = "model_fileId",
+				get = function() return data.model_fileId end,
+				set = function(v) data.model_fileId = v; WA.Add(data, true) end,
+			})
+			table.insert(fields, {
+				type = "toggle", name = "Portrait camera", key = "portraitZoom", half = true,
+				get = function() return data.portraitZoom end,
+				set = function(v) data.portraitZoom = v and true or false; WA.Add(data, true) end,
+			})
+		else
+			table.insert(fields, {
+				type = "input", name = "Model path", key = "model_path",
+				get = function()
+					if data.model_path and data.model_path ~= "" then return data.model_path end
+					return WA.ResolveModelFile(data.model_fileId) or ""
+				end,
+				-- A typed path wins over an imported file id from then on.
+				set = function(v) data.model_path = v; data.model_fileId = ""; WA.Add(data, true) end,
+			})
+			table.insert(fields, {
+				type = "button", name = "Browse models...", key = "modelBrowse",
+				onClick = function()
+					WA.Widgets.OpenModelPicker(data.model_path, function(path)
+						data.model_path = path
+						data.model_fileId = ""
+						WA.Add(data, true)
+						WA.RefreshOptions()
+						WA.RefreshList()
+					end)
+				end,
+			})
+			local unresolved = data.model_fileId and data.model_fileId ~= ""
+				and not WA.ResolveModelFile(data.model_fileId)
+				and not (data.model_path and data.model_path ~= "")
+			if unresolved then
+				table.insert(fields, {
+					type = "description",
+					name = "This aura names retail model file " .. tostring(data.model_fileId)
+						.. ", which this client's files do not contain.",
+				})
+			end
+		end
+		if data.modelDisplayInfo then
+			table.insert(fields, {
+				type = "description",
+				name = "This aura picks its model by creature display info, which this client cannot look up -- set a model path or unit instead.",
+			})
+		end
+		local extra = {
+			{
+				type = "range", name = "Rotation", key = "rotation", min = 0, max = 360, step = 1, half = true,
+				get = function() return data.rotation or 0 end,
+				set = function(v) data.rotation = v; WA.Add(data, true) end,
+			},
+			{
+				type = "toggle", name = "Play animation", key = "advance", half = true,
+				get = function() return data.advance end,
+				set = function(v)
+					data.advance = v and true or false
+					WA.Add(data, true)
+					-- Repaints the tab: the sequence slider follows the toggle.
+					WA.RefreshOptions()
+				end,
+			},
+		}
+		if data.advance then
+			table.insert(extra, {
+				type = "range", name = "Sequence (varies per model)", key = "sequence", min = 0, max = 150, step = 1, half = true,
+				get = function() return data.sequence or 0 end,
+				set = function(v) data.sequence = v; WA.Add(data, true) end,
+			})
+		end
+		for _, f in ipairs(extra) do table.insert(fields, f) end
+		table.insert(fields, { type = "header", name = "Camera" })
+		table.insert(fields, {
+			type = "range", name = "Zoom (camera Z)", key = "model_z", min = -50, max = 50, step = 0.5, half = true,
+			get = function() return data.model_z or 0 end,
+			set = function(v) data.model_z = v; WA.Add(data, true) end,
+		})
+		table.insert(fields, {
+			type = "range", name = "Model scale", key = "modelScale", min = 0.1, max = 10, step = 0.1, half = true,
+			get = function() return data.modelScale or 1 end,
+			set = function(v) data.modelScale = v; WA.Add(data, true) end,
+		})
+		local axes = { { "model_x", "Camera X" }, { "model_y", "Camera Y" } }
+		for _, axis in ipairs(axes) do
+			local key = axis[1]
+			table.insert(fields, {
+				type = "range", name = axis[2], key = key, min = -50, max = 50, step = 0.5, half = true,
+				get = function() return data[key] or 0 end,
+				set = function(v) data[key] = v; WA.Add(data, true) end,
+			})
+		end
+		table.insert(fields, { type = "header", name = "Size" })
+		table.insert(fields, {
+			type = "range", name = "Width", key = "width", min = 8, max = 512, step = 1, half = true,
+			get = function() return data.width end,
+			set = function(v) data.width = v; WA.Add(data, true) end,
+		})
+		table.insert(fields, {
+			type = "range", name = "Height", key = "height", min = 8, max = 512, step = 1, half = true,
+			get = function() return data.height end,
+			set = function(v) data.height = v; WA.Add(data, true) end,
+		})
+		for _, field in ipairs(WA.regionPrototype.PositionOptions(data)) do table.insert(fields, field) end
+		return fields
+	end,
+	create = function(parent)
+		local region = CreateFrame("Frame", nil, parent)
+		WA.regionPrototype.create(region)
+		-- Frame alpha does not reach child frames on this client, so the model
+		-- frame's is mirrored on every write -- config, conditions and
+		-- animations all funnel through SetAlpha.
+		local frameSetAlpha = region.SetAlpha
+		function region:SetAlpha(a)
+			frameSetAlpha(self, a)
+			if self.model then self.model:SetAlpha(a) end
+		end
+		function region:Update() end
+		region:Hide()
+		return region
+	end,
+	modify = function(region, data)
+		function region:SetRegionWidth(width) self:SetWidth(width) end
+		function region:SetRegionHeight(height) self:SetHeight(height) end
+
+		local function configure()
+			local model = region.model
+			if not model then return end
+			model:SetParent(region)
+			model:ClearAllPoints()
+			model:SetPoint("TOPLEFT", region, "TOPLEFT", 0, 0)
+			model:SetPoint("BOTTOMRIGHT", region, "BOTTOMRIGHT", 0, 0)
+			model:SetFrameLevel(region:GetFrameLevel() + 1)
+			local kind, value = modelSource(data)
+			model.waModelKind, model.waModelValue = kind, value
+			model.waModelCreature = (kind == "creature" and value)
+				or (kind == "path" and WA.ResolveCreatureEntry(value)) or nil
+			model.waModelRequeried = nil
+			model.waModelZoom = data.portraitZoom and true or false
+			model.waModelScale = data.modelScale or 1
+			model.waModelX = data.model_x or 0
+			model.waModelY = data.model_y or 0
+			model.waModelZ = data.model_z or 0
+			model.waModelFacing = region.animRotation or region.rotation or 0
+			model.waModelSequence = data.advance and (tonumber(data.sequence) or 0) or nil
+			model:SetScript("OnShow", modelOnShow)
+			model:SetScript("OnUpdate", modelOnUpdate)
+			if kind == "unit" then
+				model:RegisterEvent("UNIT_MODEL_CHANGED")
+				if value == "target" then model:RegisterEvent("PLAYER_TARGET_CHANGED") end
+				model:SetScript("OnEvent", modelOnEvent)
+			else
+				model:UnregisterAllEvents()
+				model:SetScript("OnEvent", nil)
+			end
+			model:SetAlpha(region:GetAlpha() or 1)
+			model:Show()
+			modelApply(model)
+		end
+
+		local function applyFacing()
+			local model = region.model
+			if not model then return end
+			model.waModelFacing = region.animRotation or region.rotation or 0
+			pcall(model.SetFacing, model, math.rad(model.waModelFacing))
+		end
+		function region:SetRotation(degrees) self.rotation = degrees or 0; applyFacing() end
+		function region:SetAnimRotation(degrees) self.animRotation = degrees; applyFacing() end
+		function region:GetBaseRotation() return self.rotation or 0 end
+
+		region.rotation = data.rotation or 0
+		region.animRotation = nil
+		region:SetRegionWidth(data.width)
+		region:SetRegionHeight(data.height)
+		region:SetRegionAlpha(data.alpha)
+		WA.regionPrototype.ApplyPosition(region, data)
+		WA.regionPrototype.modifyFinish(region, data)
+		-- After modifyFinish: it clears the subscriber list it is about to
+		-- rebuild, and these must survive until the next modify.
+		region.subRegionEvents:AddSubscriber("PreShow", function()
+			if not region.model then region.model = acquireModelFrame() end
+			configure()
+		end)
+		region.subRegionEvents:AddSubscriber("PreHide", function()
+			if region.model then
+				releaseModelFrame(region.model)
+				region.model = nil
+			end
+		end)
+		-- A repaint while shown (options edits) re-fires no PreShow.
+		if region.shown then
+			if not region.model then region.model = acquireModelFrame() end
+			configure()
+		end
 	end,
 })
 
@@ -3854,6 +4712,100 @@ WA.RegisterRegionType("text", {
 			table.insert(fields, f)
 		end
 		return fields
+	end,
+})
+
+-- Upstream's Empty.lua: a frame that draws nothing of its own and exists to
+-- carry sub-regions (§7). thumbnailIcon dresses the list row only -- the region
+-- itself stays invisible whatever it holds.
+WA.RegisterRegionType("empty", {
+	displayName = "Empty Base Region",
+	description = "Shows nothing itself; a bare frame that sub elements draw on.",
+	icon = "Interface\\Buttons\\UI-Quickslot2",
+	defaults = {
+		width = 200,
+		height = 200,
+		alpha = 1,
+		thumbnailIcon = "",
+		anchorFrameType = "SCREEN",
+		selfPoint = "CENTER",
+		anchorPoint = "CENTER",
+		xOffset = 0,
+		yOffset = 0,
+		frameStrata = 1,
+	},
+	-- Only the prototype set, matching upstream: with nothing drawn there is no
+	-- color, texture or size worth a condition.
+	properties = WA.regionPrototype.AddProperties({}),
+	getSubRegionAnchors = function() return TEXTURE_SUB_ANCHORS end,
+	-- Upstream's thumbnail: a quickslot border around whatever icon the author
+	-- picked to stand for the aura in the list.
+	-- Upstream stacks both textures on OVERLAY and relies on creation order to
+	-- put the icon over the border; two layers say the same thing without
+	-- leaning on same-layer ordering this client does not promise.
+	createThumbnail = function(parent)
+		local frame = CreateFrame("Frame", nil, parent)
+		local border = frame:CreateTexture(nil, "ARTWORK")
+		border:SetAllPoints(frame)
+		border:SetTexture("Interface\\Buttons\\UI-Quickslot2")
+		border:SetTexCoord(0.2, 0.8, 0.2, 0.8)
+		local icon = frame:CreateTexture(nil, "OVERLAY")
+		icon:SetAllPoints(frame)
+		frame.icon = icon
+		return frame
+	end,
+	modifyThumbnail = function(frame, data)
+		local path = WA.DrawableTexture(data.thumbnailIcon)
+		if path then
+			frame.icon:SetTexture(path)
+			frame.icon:Show()
+		else
+			frame.icon:Hide()
+		end
+	end,
+	options = function(data)
+		local fields = {
+			{ type = "header", name = "Settings" },
+			{
+				type = "range", name = "Alpha", key = "alpha", min = 0, max = 1, step = 0.05, half = true,
+				get = function() return data.alpha or 1 end,
+				set = function(v) data.alpha = v; WA.Add(data, true) end,
+			},
+			{
+				type = "icon", name = "Thumbnail icon", key = "thumbnailIcon",
+				get = function() return data.thumbnailIcon end,
+				set = function(v) data.thumbnailIcon = v; WA.Add(data, true); WA.RefreshList() end,
+			},
+			{ type = "header", name = "Size" },
+			{
+				type = "range", name = "Width", key = "width", min = 8, max = 512, step = 1, half = true,
+				get = function() return data.width end,
+				set = function(v) data.width = v; WA.Add(data, true) end,
+			},
+			{
+				type = "range", name = "Height", key = "height", min = 8, max = 512, step = 1, half = true,
+				get = function() return data.height end,
+				set = function(v) data.height = v; WA.Add(data, true) end,
+			},
+		}
+		for _, field in ipairs(WA.regionPrototype.PositionOptions(data)) do table.insert(fields, field) end
+		return fields
+	end,
+	create = function(parent)
+		local region = CreateFrame("Frame", nil, parent)
+		WA.regionPrototype.create(region)
+		function region:Update() end
+		region:Hide()
+		return region
+	end,
+	modify = function(region, data)
+		function region:SetRegionWidth(width) self:SetWidth(width) end
+		function region:SetRegionHeight(height) self:SetHeight(height) end
+		region:SetRegionWidth(data.width)
+		region:SetRegionHeight(data.height)
+		region:SetRegionAlpha(data.alpha)
+		WA.regionPrototype.ApplyPosition(region, data)
+		WA.regionPrototype.modifyFinish(region, data)
 	end,
 })
 

@@ -220,6 +220,20 @@ WeakestAuras.FEATURE_GATES = {
 		mod = "ClassicAPI", minVersion = 11000,
 		label = "Icons inside text (%i, coin art, raid markers) and rotated text",
 	},
+	-- ClassicAPI 1.11.0's Lua 5.1 backports. Two halves: a source-level rewrite
+	-- of the three constructs 5.0 cannot parse -- `#x`, `a % b`, and `...` read
+	-- as an expression -- co-hooking luaL_loadbuffer so loadstring gets it too,
+	-- which is the whole of how user Lua reaches the compiler here; and a
+	-- runtime hook resolving string methods (`s:gsub(...)`) through the string
+	-- table. What reads the gate is the WeakAuras2 import: a third of upstream's
+	-- custom code uses at least one of these forms. Only the parse-level
+	-- constructs can be filtered on a failing client -- a string-method call
+	-- parses on 5.0 and cannot be told from a table method by reading, so behind
+	-- this release it imports and errors where it stands.
+	luaSyntax51 = {
+		mod = "ClassicAPI", minVersion = 11100,
+		label = "Imported Lua using 5.1 syntax and string methods",
+	},
 }
 
 -- The version a gate names, as the footer shows it.
@@ -255,9 +269,14 @@ end
 
 -- Records every failing gate up front. recordDegraded dedupes by label, so a
 -- Require* call later naming the same feature adds nothing.
+--
+-- A gate naming the dev sentinel is skipped: the degraded list is what tells a
+-- user their client is behind this addon, and no release carries the feature
+-- yet, so listing it would tell every user to go and get a build that does not
+-- exist. It comes back the moment its minVersion names a real release.
 function WeakestAuras.EvaluateFeatureGates()
 	for _, gate in pairs(WeakestAuras.FEATURE_GATES) do
-		if not gateMet(gate) then
+		if not gateMet(gate) and gate.minVersion ~= CLASSICAPI_DEV then
 			recordDegraded(gate.mod, WeakestAuras.FeatureGateNeeds(gate), gate.label)
 		end
 	end
@@ -367,6 +386,23 @@ for i = 1, table.getn(WeakestAuras.multi_unit_tokens) do
 	table.insert(WeakestAuras.unit_tokens_multi, family)
 	WeakestAuras.unit_labels_multi[family] = WeakestAuras.multi_unit_labels[family]
 end
+
+-- The aura trigger's own dropdown: the families above, plus upstream's `multi`.
+-- `multi` is not a family and ForEachMultiUnit cannot iterate it -- it names the
+-- units the aura cache is tracking, whether or not a token points at any of
+-- them, so only a trigger system with a GUID-keyed producer may offer it. That
+-- is TriggerAura and nothing else, which is why the generic prototypes keep
+-- unit_tokens_multi.
+WeakestAuras.unit_tokens_aura = {}
+WeakestAuras.unit_labels_aura = {}
+for i = 1, table.getn(WeakestAuras.unit_tokens_multi) do
+	table.insert(WeakestAuras.unit_tokens_aura, WeakestAuras.unit_tokens_multi[i])
+end
+for key, label in pairs(WeakestAuras.unit_labels_multi) do
+	WeakestAuras.unit_labels_aura[key] = label
+end
+table.insert(WeakestAuras.unit_tokens_aura, "multi")
+WeakestAuras.unit_labels_aura.multi = "Multi-target"
 
 -- The family a trigger's saved `unit` selects, or nil for a single token.
 function WeakestAuras.MultiUnitFamily(trigger)

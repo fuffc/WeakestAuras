@@ -36,6 +36,11 @@ textCore.FONTS = {
 	{ name = "PT Sans Narrow Regular", path = "Interface\\AddOns\\WeakestAuras\\fonts\\PTSansNarrow-Regular.ttf" },
 	{ name = "PT Sans Narrow Bold", path = "Interface\\AddOns\\WeakestAuras\\fonts\\PTSansNarrow-Bold.ttf" },
 	{ name = "Oswald", path = "Interface\\AddOns\\WeakestAuras\\fonts\\Oswald-Regular.ttf" },
+	{ name = "Accidental Presidency", path = "Interface\\AddOns\\WeakestAuras\\fonts\\Accidental Presidency.ttf" },
+	{ name = "Expressway", path = "Interface\\AddOns\\WeakestAuras\\fonts\\Expressway.ttf" },
+	{ name = "Bazooka", path = "Interface\\AddOns\\WeakestAuras\\fonts\\Bazooka.ttf" },
+	{ name = "FORCED SQUARE", path = "Interface\\AddOns\\WeakestAuras\\fonts\\FORCED SQUARE.ttf" },
+	{ name = "Cabin", path = "Interface\\AddOns\\WeakestAuras\\fonts\\Cabin.ttf" },
 	{ name = "Celestia Medium Redux", path = "Interface\\AddOns\\WeakestAuras\\fonts\\CelestiaMediumRedux1.55.ttf" },
 	{ name = "DejaVu Sans", path = "Interface\\AddOns\\WeakestAuras\\fonts\\DejaVuLGCSans.ttf" },
 	{ name = "DejaVu Serif", path = "Interface\\AddOns\\WeakestAuras\\fonts\\DejaVuLGCSerif.ttf" },
@@ -46,6 +51,19 @@ textCore.FONTS = {
 	{ name = "Liberation Serif", path = "Interface\\AddOns\\WeakestAuras\\fonts\\LiberationSerif-Regular.ttf" },
 	{ name = "swf!t", path = "Interface\\AddOns\\WeakestAuras\\fonts\\SWF!T___.TTF" },
 	{ name = "Yellowjacket", path = "Interface\\AddOns\\WeakestAuras\\fonts\\yellow.ttf" },
+}
+
+-- Other registrars' LibSharedMedia names for a face FONTS already carries, so an
+-- import resolves it instead of falling back to the default. Not a FONTS entry:
+-- two rows sharing a path would put the same face in the picker twice and leave
+-- FONT_LABELS holding whichever name was registered last.
+--
+-- "PT Sans Narrow" is ElvUI's name for the face WeakAuras registers as
+-- "PT Sans Narrow Regular". Both spellings travel in exports, because what a
+-- pack stores is whatever its author's registry called it -- so the FONTS name
+-- has to stay upstream's and the other spelling has to land here.
+textCore.FONT_ALIASES = {
+	["PT Sans Narrow"] = "PT Sans Narrow Regular",
 }
 
 -- Stored as "None" rather than "" so the picker has no empty value; Apply maps

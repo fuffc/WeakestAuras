@@ -216,10 +216,12 @@ end
 --
 -- Two forms reach us from a WeakAuras export and neither is a file here:
 --
--- * A **fileID** (a bare number, e.g. 135274). Modern clients keep a numeric
---   handle per texture and `SetTexture` accepts it; this one has no such table
---   and nothing can map it back to a path. 125 of the 160 manual icons in the
---   corpus are fileIDs, so this is the common case, not an edge one.
+-- * A **fileID** (135274, or the string "135274" -- upstream writes both).
+--   Modern clients keep a numeric handle per texture and `SetTexture` accepts
+--   it; this one has no such table, so WA2FileIDs.lua ships the offline half of
+--   one -- the icons the client's own MPQs contain, keyed by the fileID retail
+--   gave them. An ID outside that table names an icon added after 1.12 and is
+--   genuinely undrawable.
 -- * An **atlas name** (`Legionfall_BarSpark`, `GarrMission_EncounterBar-Spark`).
 --   Atlases are a retail concept with no 1.12 equivalent, and they are
 --   recognisable by having no path separator -- a real texture path here always
@@ -228,13 +230,109 @@ end
 -- A path we *can* form may still be missing (someone else's addon folder), and
 -- nothing offline can tell: `SetTexture` reports nothing and `GetTexture` hands
 -- back whatever string it was given. That case still draws the block.
+--
+-- This is on the paint path -- Regions.lua calls it for icon, texture,
+-- progresstexture, spark and group art -- so the fileID table is built on the
+-- first numeric value and never again. A session that pastes no import string
+-- pays for WA2FileIDs.lua's string constant and nothing more.
+local fileIDs
+local function fileIDPath(id)
+	if not fileIDs then
+		-- WA2FileIDs.lua loads after this file, so the string can legitimately
+		-- be absent -- caching an empty table for the session would be wrong.
+		if not WA.wa2FileIDs then return nil end
+		fileIDs = {}
+		for num, name in string.gfind(WA.wa2FileIDs, "(%d+),([^;]+)") do
+			fileIDs[tonumber(num)] = name
+		end
+	end
+	local name = fileIDs[id]
+	return name and ("Interface\\Icons\\" .. name) or nil
+end
+
 function WA.DrawableTexture(value)
-	if type(value) == "number" then return nil end
+	if type(value) == "number" then return fileIDPath(value) end
 	if type(value) ~= "string" or value == "" then return nil end
 	if not string.find(value, "\\", 1, true) and not string.find(value, "/", 1, true) then
+		-- Upstream writes a fileID as a number or as its digits, and the digit
+		-- form is unambiguous here: no texture path lacks a separator, and no
+		-- atlas name is all digits.
+		if string.find(value, "^%d+$") then return fileIDPath(tonumber(value)) end
 		return nil
 	end
 	return value
+end
+
+-- A model path this client's SetModel can load, or nil. Takes the fileDataID a
+-- WeakAuras export stores (number or digit string); WA2ModelIDs.lua ships the
+-- resolvable subset, ";fileID,path;"-delimited. Unlike the icon table this one
+-- is searched in place per lookup rather than parsed whole: model auras are
+-- rare, and the string is several times the icon table's size. Hits and misses
+-- are memoised, so a shown model costs one scan per session.
+--
+-- The '.mdx' spelling is deliberate: it is the form this client's SetModel
+-- provably takes (pfUI), and the engine maps it onto the archives' .m2 itself.
+local function packedLookup(s, key)
+	if not s then return nil end
+	local _, stop = string.find(s, ";" .. key .. ",", 1, true)
+	if not stop then return nil end
+	local semi = string.find(s, ";", stop + 1, true)
+	if not semi then return nil end
+	return string.sub(s, stop + 1, semi - 1)
+end
+
+local modelFiles
+function WA.ResolveModelFile(value)
+	local id = tonumber(value)
+	if not id then return nil end
+	modelFiles = modelFiles or {}
+	local hit = modelFiles[id]
+	if hit ~= nil then
+		if hit == false then return nil end
+		return hit
+	end
+	local path = packedLookup(WA.wa2ModelIDs, id)
+	if path then path = string.gsub(path, "/", "\\") .. ".mdx" end
+	modelFiles[id] = path or false
+	return path
+end
+
+-- A creature entry known to wear this model path, or nil -- SetCreature with
+-- it renders the model textured where SetModel renders it white (skins live
+-- in CreatureDisplayInfo, which SetModel never consults). Table shipped by
+-- tools/mkcreatureids.py from this client's own creature cache.
+local creaturePaths
+function WA.ResolveCreatureEntry(path)
+	if type(path) ~= "string" or path == "" then return nil end
+	creaturePaths = creaturePaths or {}
+	local hit = creaturePaths[path]
+	if hit ~= nil then
+		if hit == false then return nil end
+		return hit
+	end
+	local key = string.lower(string.gsub(path, "\\", "/"))
+	key = string.gsub(key, "%.md[xl]$", "")
+	key = string.gsub(key, "%.m2$", "")
+	local entry = tonumber(packedLookup(WA.wa2CreaturePaths, key))
+	creaturePaths[path] = entry or false
+	return entry
+end
+
+-- A creature entry the server shows as this display id, or nil -- the id
+-- space WeakAuras' modelDisplayInfo carries, honoured through SetCreature.
+local creatureDisplays
+function WA.ResolveDisplayCreature(value)
+	local id = tonumber(value)
+	if not id then return nil end
+	creatureDisplays = creatureDisplays or {}
+	local hit = creatureDisplays[id]
+	if hit ~= nil then
+		if hit == false then return nil end
+		return hit
+	end
+	local entry = tonumber(packedLookup(WA.wa2CreatureDisplays, id))
+	creatureDisplays[id] = entry or false
+	return entry
 end
 
 -- Resolves the icon a leaf display currently shows: Manual mode uses
