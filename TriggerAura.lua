@@ -580,6 +580,10 @@ end
 -- totalStacks (§5): every matching aura instance on this unit counted once (an
 -- aura matching two entries is one aura), and their stacks summed. The second
 -- walk re-reads scanUnit's pooled list, so it costs no second descriptor scan.
+--
+-- The winner is written into a record the ti keeps, not a fresh table: this
+-- runs per matched trigger per scan. Every caller hands it to
+-- updateTriggerInfoState before asking this ti for its next match.
 local function findMatch(ti, unit)
 	local best
 	for e = 1, #ti.entries do
@@ -593,7 +597,12 @@ local function findMatch(ti, unit)
 				if entry.id then ok = aura.spellId == entry.id
 				else ok = aura.name == entry.raw end
 				if ok and passesMatch(ti, aura) then
-					best = { aura = aura, index = i, filter = filter }
+					best = ti.match
+					if not best then
+						best = { aura = false, index = 0, filter = false, count = 0, stacksTotal = 0 }
+						ti.match = best
+					end
+					best.aura, best.index, best.filter = aura, i, filter
 					break
 				end
 			end
@@ -767,29 +776,42 @@ local function applyFamilyTotals(states, total, totalStacks)
 	return dirty
 end
 
+-- The member callback shares its running totals through upvalues rather than
+-- being a fresh closure per scan. Safe for the reason `set` above is: nothing
+-- it calls runs user code, so no second family scan can start inside one.
+local famTi, famSeen, famDirty, famTotal, famStacks
+local function scanFamilyMember(unit, cloneId)
+	famSeen[cloneId] = true
+	local match = findMatch(famTi, unit)
+	if match then
+		famTotal = famTotal + (match.count or 1)
+		famStacks = famStacks + (match.stacksTotal or 0)
+	end
+	if updateTriggerInfoState(famTi, unit, cloneId, match) then famDirty = true end
+end
+
+-- Drops every non-base state no member claimed this scan. Clearing a field
+-- mid-traversal is the one table edit `pairs` permits.
+local function dropUnseen(states, seen)
+	local dropped = false
+	for cloneId in pairs(states) do
+		if cloneId ~= "" and not seen[cloneId] then
+			states[cloneId] = nil
+			dropped = true
+		end
+	end
+	return dropped
+end
+
 local function scanMultiUnit(ti)
 	local states = WA.GetTriggerStateForTrigger(ti.id, ti.triggernum)
 	if not states then return false end
-	local seen = {}
-	local dirty = false
-	local total, totalStacks = 0, 0
-	WA.ForEachMultiUnit(ti.multiUnit, function(unit, cloneId)
-		seen[cloneId] = true
-		local match = findMatch(ti, unit)
-		if match then
-			total = total + (match.count or 1)
-			totalStacks = totalStacks + (match.stacksTotal or 0)
-		end
-		if updateTriggerInfoState(ti, unit, cloneId, match) then dirty = true end
-	end)
-	local stale = {}
-	for cloneId in pairs(states) do
-		if cloneId ~= "" and not seen[cloneId] then table.insert(stale, cloneId) end
-	end
-	for i = 1, #stale do
-		states[stale[i]] = nil
-		dirty = true
-	end
+	famTi, famSeen, famDirty, famTotal, famStacks = ti, WA.AcquireScratch(), false, 0, 0
+	WA.ForEachMultiUnit(ti.multiUnit, scanFamilyMember)
+	local seen, dirty, total, totalStacks = famSeen, famDirty, famTotal, famStacks
+	famTi, famSeen = nil, nil
+	if dropUnseen(states, seen) then dirty = true end
+	WA.ReleaseScratch(seen)
 	if applyFamilyTotals(states, total, totalStacks) then dirty = true end
 	return dirty
 end
@@ -809,12 +831,12 @@ local MULTI_CLONE_LIMIT = 40
 local function scanMultiGuid(ti)
 	local states = WA.GetTriggerStateForTrigger(ti.id, ti.triggernum)
 	if not states then return false end
-	local guids = {}
+	local guids = WA.AcquireScratch()
 	for guid in pairs(multiGuids) do
 		if UnitExists(guid) then table.insert(guids, guid) else multiGuids[guid] = nil end
 	end
 	table.sort(guids)
-	local seen, dirty, clones = {}, false, 0
+	local seen, dirty, clones = WA.AcquireScratch(), false, 0
 	local total, totalStacks = 0, 0
 	for i = 1, #guids do
 		if clones >= MULTI_CLONE_LIMIT then break end
@@ -828,17 +850,16 @@ local function scanMultiGuid(ti)
 			if updateTriggerInfoState(ti, guid, guid, match) then dirty = true end
 		end
 	end
+	WA.ReleaseScratch(guids)
 
-	local stale = {}
-	for cloneId in pairs(states) do
-		if cloneId ~= "" and not seen[cloneId] then table.insert(stale, cloneId) end
-	end
-	for i = 1, #stale do
-		states[stale[i]] = nil
-		dirty = true
-	end
+	if dropUnseen(states, seen) then dirty = true end
+	WA.ReleaseScratch(seen)
 	if applyFamilyTotals(states, total, totalStacks) then dirty = true end
 	return dirty
+end
+
+local function updateDirty(dirty)
+	for id in pairs(dirty) do WA.UpdatedTriggerState(id) end
 end
 
 local lastScan
@@ -847,7 +868,7 @@ local function scanTick()
 	lastScan = GetTime()
 	-- A new generation is what invalidates the pool; its tables are kept.
 	scanGen = scanGen + 1
-	local dirty = {}
+	local dirty
 	for _, tis in pairs(scanIndex) do
 		for j = 1, #tis do
 			local ti = tis[j]
@@ -860,7 +881,10 @@ local function scanTick()
 				else
 					changed = updateTriggerInfoState(ti, ti.unit, "", findMatch(ti, ti.unit))
 				end
-				if changed then dirty[ti.id] = true end
+				if changed then
+					dirty = dirty or WA.AcquireScratch()
+					dirty[ti.id] = true
+				end
 			end
 		end
 	end
@@ -873,7 +897,10 @@ local function scanTick()
 			poolSeen[unit] = nil
 		end
 	end
-	for id in pairs(dirty) do WA.UpdatedTriggerState(id) end
+	if dirty then
+		WA.RunRelayoutBatch(updateDirty, dirty)
+		WA.ReleaseScratch(dirty)
+	end
 	WA.ProfEnd("aura scan")
 end
 TriggerAura.scanTick = scanTick

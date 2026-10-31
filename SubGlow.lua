@@ -166,6 +166,8 @@ local function tintOverlay(overlay, color)
 	end
 end
 
+local ACSHINE_SIZES = { 7, 6, 5, 4 }
+
 local function applyACShine(overlay, now)
 	overlay.bgFrame:Hide()
 	overlay.antTex:Hide()
@@ -176,7 +178,6 @@ local function applyACShine(overlay, now)
 	local width = overlay:GetWidth() or 0
 	local height = overlay:GetHeight() or 0
 	if p.shape ~= "circular" then
-		local sizes = { 7, 6, 5, 4 }
 		local perimeter = 2 * (width + height)
 		if perimeter <= 0 then return end
 		local textureIndex = 0
@@ -197,7 +198,7 @@ local function applyACShine(overlay, now)
 					x, y = -width / 2, height / 2 - distance + width * 2 + height
 				end
 				local particle = overlay.particles[textureIndex]
-				local size = sizes[group] * scale
+				local size = ACSHINE_SIZES[group] * scale
 				particle:SetWidth(size)
 				particle:SetHeight(size)
 				particle:ClearAllPoints()

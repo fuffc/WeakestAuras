@@ -49,22 +49,27 @@ local activeIds = {}
 -- sourceKey against them (see GenericTrigger.Delete).
 local lastCompiled = {}
 
--- The display being compiled, and the ids whose compile could not resolve a
--- spell or item name. A name resolves to an id baked into the generated source,
--- so an unresolved one leaves that trigger dead until something recompiles it --
--- which is the entire reason the addon recompiles on spell/item cache traffic
--- (OptionsFrame.lua's debounced sweep). Nothing else about a compile depends on
--- the caches, so once every name has an id that sweep has nothing left to fix.
+-- The display being compiled, and per display the spell or item names its
+-- compile could not resolve, each with the resolver that failed it. A name
+-- resolves to an id baked into the generated source, so an unresolved one
+-- leaves that trigger dead until something recompiles it -- which is the entire
+-- reason the addon recompiles on spell/item cache traffic (OptionsFrame.lua's
+-- debounced sweep). Nothing else about a compile depends on the caches.
 local compilingId
-local unresolvedIds = {}
+local unresolvedIds = {} -- id -> { [name] = resolver }
 
 -- Keyed by the name that failed, so a display waiting on two of them says both.
 -- Never printed: an item cache is cold at every login, so the common case is a
 -- name that resolves a moment later and the recompile sweep clears it -- a chat
 -- line would fire on every login and mean nothing.
-local function noteUnresolved(input)
+local function noteUnresolved(input, resolve)
 	if not compilingId then return end
-	unresolvedIds[compilingId] = true
+	local names = unresolvedIds[compilingId]
+	if not names then
+		names = {}
+		unresolvedIds[compilingId] = names
+	end
+	names[input] = resolve
 	WA.ReportForAura(compilingId, "unresolved:" .. tostring(input), "warning",
 		"[" .. tostring(compilingId) .. "] \"" .. tostring(input)
 			.. "\" is not a spell or item this client can name yet, so the trigger using it stays dark.")
@@ -75,6 +80,31 @@ end
 function WA.HasUnresolvedNames()
 	for _ in pairs(unresolvedIds) do return true end
 	return false
+end
+
+-- Recompiles the displays waiting on a name that resolves now, and nothing
+-- else. A name that never resolves -- another class's spell, an item never
+-- carried -- is the common case on a multi-class profile, and recompiling every
+-- display on each cache event for it was the addon's largest source of garbage.
+-- Outside a compile the resolvers note nothing, so the retry is side-effect free.
+function WA.RecompileResolvedNames()
+	local ready
+	for id, names in pairs(unresolvedIds) do
+		local data = WeakestAurasDB.displays[id]
+		if not data then
+			unresolvedIds[id] = nil
+		else
+			for input, resolve in pairs(names) do
+				if resolve(input) then
+					ready = ready or {}
+					table.insert(ready, data)
+					break
+				end
+			end
+		end
+	end
+	if ready then WA.AddMany(ready) end
+	return ready ~= nil
 end
 
 -- Internal (WA-generated) event names never handed to Frame:RegisterEvent -- a
@@ -236,6 +266,38 @@ local function parseCustomEventList(str)
 	end
 	if cleuAll then subeventFilter = nil end
 	return eventList, unitFilters, watched, subeventFilter
+end
+
+-- The unit filters a built-in prototype gets for free when its UNIT_* events
+-- all name the one unit it reads (its `subjectUnit`): upstream's
+-- RegisterUnitEvent. Without them every UNIT_HEALTH in a raid runs every Health
+-- trigger, and ClassicAPI fires each one once per token -- raidN, partyN,
+-- target, nameplateN, markN all at once. Only tokens ClassicAPI does fire
+-- events under are filtered; a derived token (targettarget, mouseover) fires
+-- none, so its trigger keeps refreshing on any unit's event as before.
+local subjectUnitFilters
+do
+	local FIRING_TOKENS = { player = true, pet = true, target = true, focus = true }
+	local function firesUnitEvents(token)
+		return FIRING_TOKENS[token] or string.find(token, "^party[1-4]$")
+			or string.find(token, "^raid%d+$") or string.find(token, "^nameplate%d+$")
+			or string.find(token, "^mark[1-8]$")
+	end
+	function subjectUnitFilters(eventList, token)
+		if type(token) ~= "string" then return nil end
+		token = string.lower(token)
+		if not firesUnitEvents(token) then return nil end
+		local set = { [token] = true }
+		local filters
+		for i = 1, #eventList do
+			local event = eventList[i]
+			if string.sub(event, 1, 5) == "UNIT_" then
+				filters = filters or {}
+				filters[event] = set
+			end
+		end
+		return filters
+	end
 end
 
 local function isClientEvent(name)
@@ -596,7 +658,7 @@ function WA.ResolveSpellID(input)
 	if bookId then return bookId end
 	local info = C_Spell.GetSpellInfo(input)
 	if info and info.spellID then return info.spellID end
-	noteUnresolved(input)
+	noteUnresolved(input, WA.ResolveSpellID)
 	return nil
 end
 
@@ -617,7 +679,7 @@ end
 
 do -- scoped; see the local-ceiling note in the file header
 
-local spellSlotByName, spellSlotById
+local spellSlotByName, spellSlotById, exactSlotById
 
 local function buildSpellSlotIndex()
 	spellSlotByName, spellSlotById = {}, {}
@@ -633,7 +695,7 @@ local function buildSpellSlotIndex()
 end
 
 function WA.InvalidateSpellSlots()
-	spellSlotByName, spellSlotById = nil, nil
+	spellSlotByName, spellSlotById, exactSlotById = nil, nil, nil
 end
 
 -- Slot numbers shift as the book grows, so every cached one stops meaning
@@ -676,6 +738,20 @@ function WA.SpellSlotByID(spellId)
 	local slot = name and spellSlotByName[name]
 	spellSlotById[spellId] = slot or false
 	return slot
+end
+
+-- The slot holding exactly this spellID -- this rank, not the name's highest --
+-- or nil when that rank has no button in the player's book.
+function WA.ExactSpellSlot(spellId)
+	if not spellId or spellId == 0 then return nil end
+	if not exactSlotById then exactSlotById = {} end
+	local hit = exactSlotById[spellId]
+	if hit == nil then
+		local slot, book = FindSpellBookSlotByID(spellId)
+		hit = (slot and book == (BOOKTYPE_SPELL or "spell")) and slot or false
+		exactSlotById[spellId] = hit
+	end
+	return hit or nil
 end
 
 -- (start, duration) off a spellbook slot, or nil. pcall'd: a slot that has gone
@@ -780,7 +856,7 @@ itemNameRetryFrame:SetScript("OnEvent", function()
 		itemNameMissAt[retry[i]] = nil
 		if WA.ItemIDByName(retry[i]) then resolved = true end
 	end
-	if resolved and WA.AddAllDisplays then WA.AddAllDisplays() end
+	if resolved then WA.RecompileResolvedNames() end
 end)
 
 end -- item-name cache
@@ -800,7 +876,7 @@ function WA.ResolveItemID(input)
 		if id2 then return id2 end
 	end
 	local byName = WA.ItemIDByName(input)
-	if byName == nil then noteUnresolved(input) end
+	if byName == nil then noteUnresolved(input, WA.ResolveItemID) end
 	return byName
 end
 
@@ -1949,6 +2025,7 @@ PROTOTYPES["health"] = {
 		return appendUnitChangeEvents(trigger,
 			appendMultiUnitEvents(trigger, { "UNIT_HEALTH", "UNIT_MAXHEALTH" }), "player")
 	end,
+	subjectUnit = function(trigger) return singleUnitToken(trigger, "player") end,
 	force_events = true,
 	statesParameter = "unit",
 	icon = "Interface\\Icons\\INV_Potion_54",
@@ -2001,6 +2078,7 @@ PROTOTYPES["power"] = {
 			appendMultiUnitEvents(trigger, { "UNIT_MANA", "UNIT_RAGE", "UNIT_ENERGY", "UNIT_FOCUS",
 				"UNIT_MAXMANA", "UNIT_MAXRAGE", "UNIT_MAXENERGY", "UNIT_DISPLAYPOWER" }), "player")
 	end,
+	subjectUnit = function(trigger) return singleUnitToken(trigger, "player") end,
 	force_events = true,
 	statesParameter = "unit",
 	icon = "Interface\\Icons\\Spell_Nature_Lightning",
@@ -2572,6 +2650,7 @@ PROTOTYPES["cast"] = {
 				"UNIT_SPELLCAST_CHANNEL_STOP", "UNIT_SPELLCAST_DELAYED",
 				"UNIT_SPELLCAST_CHANNEL_UPDATE" }), "player")
 	end,
+	subjectUnit = function(trigger) return singleUnitToken(trigger, "player") end,
 	force_events = true,
 	statesParameter = "unit",
 	icon = "Interface\\Icons\\Spell_Nature_WispSplode",
@@ -3576,6 +3655,7 @@ PROTOTYPES["unitcharacteristics"] = {
 		return appendUnitChangeEvents(trigger,
 			appendMultiUnitEvents(trigger, { "UNIT_LEVEL", "UNIT_HEALTH", "PLAYER_ENTERING_WORLD" }), "target")
 	end,
+	subjectUnit = function(trigger) return singleUnitToken(trigger, "target") end,
 	force_events = true,
 	statesParameter = "unit",
 	icon = "Interface\\Icons\\INV_Misc_QuestionMark",
@@ -3834,6 +3914,7 @@ PROTOTYPES["charstats"] = {
 			"UNIT_ATTACK_SPEED", "UNIT_DAMAGE", "UNIT_DEFENSE", "UNIT_RESISTANCES", "UNIT_AURA",
 			"PLAYER_DAMAGE_DONE_MODS", "UNIT_INVENTORY_CHANGED", "PLAYER_ENTERING_WORLD" }
 	end,
+	subjectUnit = function() return "player" end,
 	force_events = true,
 	icon = "Interface\\Icons\\INV_Misc_GroupLooking",
 	iconFunc = function() return "Interface\\Icons\\INV_Misc_GroupLooking" end,
@@ -4542,8 +4623,19 @@ end
 -- What this read depends on is the *identity* handed to it -- a spellID with no
 -- Spell.dbc row answers nil, and a rank other than the one actually cast has no
 -- cooldown of its own. That resolution is WA.ResolveSpellID's job, not this one's.
+--
+-- The spellID form builds a four-field table per call, though, and this runs for
+-- every watched key on each cooldown and usability event and again inside every
+-- trigger run. So a spell whose exact rank has a button is read through that
+-- slot -- the same query, answered positionally -- and the table form is left
+-- for what the book does not hold: a talent passive, a recipe, an unlearned rank.
 local spellCdWatch = newCooldownWatcher({
 	pollRaw = function(spellId)
+		local slot = WA.ExactSpellSlot(spellId)
+		if slot then
+			local ok, start, duration, enabled = pcall(GetSpellCooldown, slot, BOOKTYPE_SPELL or "spell")
+			if ok and start then return start, duration, enabled ~= 0 and enabled ~= false end
+		end
 		local cdInfo = C_Spell.GetSpellCooldown(spellId)
 		if not cdInfo then return nil, nil, nil end
 		return cdInfo.startTime, cdInfo.duration, cdInfo.isEnabled
@@ -4564,6 +4656,7 @@ function WA.SpellCdInfo(spellId, showgcd) return spellCdWatch.Info(spellId, show
 -- claim the spell is permanently off cooldown.
 function WA.SpellCdKnown(spellId)
 	if not spellId or spellId == 0 then return false end
+	if WA.ExactSpellSlot(spellId) then return true end
 	return C_Spell.GetSpellCooldown(spellId) ~= nil
 end
 
@@ -5522,6 +5615,12 @@ local function scheduleAutoHide(ti, cloneId)
 	ti.hideTimers[cloneId] = timer
 end
 
+-- The state is a parameter rather than an upvalue so one function serves every
+-- call: a closure per passing event was the commonest garbage in dispatch.
+local function setC(state, k, v)
+	if state[k] ~= v then state[k] = v; state.changed = true end
+end
+
 -- ActivateEvent-lite (§4.3): after a passing test, normalize the state's
 -- progress/name/icon. Stores already wrote the raw matched fields; this fills
 -- the display-shaped fields regions read. `optionsEvent` marks the options
@@ -5531,36 +5630,32 @@ local function activateEvent(state, ti, cloneId, optionsEvent)
 	local proto = ti.proto
 	if not state.show then state.show = true; state.changed = true end
 
-	local function setC(k, v)
-		if state[k] ~= v then state[k] = v; state.changed = true end
-	end
-
 	if ti.autoHide then
 		-- Its progress is the countdown to its own hide timer, not anything the
 		-- prototype stores, and every re-fire restarts both together.
-		setC("progressType", "timed")
-		setC("duration", ti.duration)
-		setC("expirationTime", GetTime() + ti.duration)
+		setC(state, "progressType", "timed")
+		setC(state, "duration", ti.duration)
+		setC(state, "expirationTime", GetTime() + ti.duration)
 		if not optionsEvent then scheduleAutoHide(ti, cloneId) end
 	elseif ti.customDurationFunc then
-		local ok, values = WA.RunAuraFuncPacked(ti.id, ti.id .. ": duration function",
+		local ok, v1, v2, isStatic, inverse = WA.RunAuraFunc4(ti.id, ti.id .. ": duration function",
 			ti.customDurationFunc, ti.trigger)
-		local first = ok and tonumber(values[1]) or 0
-		local second = ok and tonumber(values[2]) or 0
-		setC("inverse", ok and values[4] or nil)
-		if ok and values[3] then
-			setC("progressType", "static")
-			setC("value", first)
-			setC("total", second)
-			setC("duration", nil)
-			setC("expirationTime", nil)
+		local first = ok and tonumber(v1) or 0
+		local second = ok and tonumber(v2) or 0
+		setC(state, "inverse", ok and inverse or nil)
+		if ok and isStatic then
+			setC(state, "progressType", "static")
+			setC(state, "value", first)
+			setC(state, "total", second)
+			setC(state, "duration", nil)
+			setC(state, "expirationTime", nil)
 		else
 			if second <= first then second = first end
-			setC("progressType", "timed")
-			setC("duration", first)
-			setC("expirationTime", second)
-			setC("value", nil)
-			setC("total", nil)
+			setC(state, "progressType", "timed")
+			setC(state, "duration", first)
+			setC(state, "expirationTime", second)
+			setC(state, "value", nil)
+			setC(state, "total", nil)
 		end
 	else
 		-- ti.* overrides let a per-trigger prototype (the custom trigger) pick its
@@ -5570,13 +5665,13 @@ local function activateEvent(state, ti, cloneId, optionsEvent)
 		local progressValue = ti.progressValue or proto.progressValue
 		local progressTotal = ti.progressTotal or proto.progressTotal
 		if progressType == "timed" then
-			setC("progressType", "timed")
+			setC(state, "progressType", "timed")
 		elseif progressType == "static" then
-			setC("progressType", nil)
-			setC("value", state[progressValue] or 0)
-			setC("total", state[progressTotal] or 0)
+			setC(state, "progressType", nil)
+			setC(state, "value", state[progressValue] or 0)
+			setC(state, "total", state[progressTotal] or 0)
 		else
-			setC("progressType", nil)
+			setC(state, "progressType", nil)
 		end
 	end
 
@@ -5585,17 +5680,17 @@ local function activateEvent(state, ti, cloneId, optionsEvent)
 	-- reading UnitName each tick) has already written state; only fall back to the
 	-- constant when it didn't -- which also keeps a target-unit's display name live
 	-- instead of frozen at the target present when the aura was compiled.
-	if ti.name ~= nil and state.name == nil then setC("name", ti.name) end
-	if ti.icon ~= nil and state.icon == nil then setC("icon", ti.icon) end
+	if ti.name ~= nil and state.name == nil then setC(state, "name", ti.name) end
+	if ti.icon ~= nil and state.icon == nil then setC(state, "icon", ti.icon) end
 	if ti.customNameFunc then
 		local ok, value = WA.RunAuraFunc(ti.id, ti.id .. ": name function",
 			ti.customNameFunc, ti.trigger)
-		if ok then setC("name", value) end
+		if ok then setC(state, "name", value) end
 	end
 	if ti.customIconFunc then
 		local ok, value = WA.RunAuraFunc(ti.id, ti.id .. ": icon function",
 			ti.customIconFunc, ti.trigger)
-		if ok then setC("icon", value) end
+		if ok then setC(state, "icon", value) end
 	end
 end
 
@@ -5622,20 +5717,20 @@ end
 
 -- Every current member re-read, and every state whose member is gone dropped.
 local function runMultiUnitFullPass(ti, states, event)
-	local seen = {}
+	local seen = WA.AcquireScratch()
 	local dirty = false
 	WA.ForEachMultiUnit(ti.multiUnit, function(unit, cloneId)
 		seen[cloneId] = true
 		if runMultiUnitMember(ti, states, event, unit, cloneId) then dirty = true end
 	end)
-	local stale = {}
+	-- Clearing a field mid-traversal is the one table edit `pairs` permits.
 	for cloneId in pairs(states) do
-		if cloneId ~= "" and not seen[cloneId] then table.insert(stale, cloneId) end
+		if cloneId ~= "" and not seen[cloneId] then
+			states[cloneId] = nil
+			dirty = true
+		end
 	end
-	for i = 1, #stale do
-		states[stale[i]] = nil
-		dirty = true
-	end
+	WA.ReleaseScratch(seen)
 	return dirty
 end
 
@@ -5782,7 +5877,7 @@ local function runTsuTrigger(ti, event, a1, a2, a3, a4, a5, a6, a7, a8, a9)
 		end
 	end
 	WA.ReportForAura(ti.id, "shownil:" .. ti.triggernum, showWasNil and "warning" or nil,
-		"[" .. ti.id .. "] a custom trigger leaves `show` unset on a state, which reads as hidden.")
+		showWasNil and ("[" .. ti.id .. "] a custom trigger leaves `show` unset on a state, which reads as hidden.") or nil)
 
 	WA.StartStopStateTimers(ti.id, ti.triggernum, states)
 	return dirty
@@ -5891,9 +5986,8 @@ end
 -- One registered name's subscribers, delivered under that name. `event` is the
 -- name the trigger listed, which is also what passesUnitFilter keys its
 -- per-event unit filters by.
--- `dirty` is created lazily on the first hit and passed back, because most
--- scans change nothing -- FRAME_UPDATE arrives once a frame, and a table per
--- no-op scan was steady churn on a collector that stops the world.
+-- `dirty` is taken from the scratch pool on the first hit and passed back,
+-- because most scans change nothing -- FRAME_UPDATE arrives once a frame.
 local function scanRegistered(event, dirty, a1, a2, a3, a4, a5, a6, a7, a8, a9)
 	local byId = loaded_events[event]
 	if not byId then return dirty end
@@ -5903,7 +5997,7 @@ local function scanRegistered(event, dirty, a1, a2, a3, a4, a5, a6, a7, a8, a9)
 				and passesSubeventFilter(ti, event, a2)
 				and (event ~= "FRAME_UPDATE" or checkOnUpdateThrottle(ti)) then
 				if runTriggerFunc(ti, event, a1, a2, a3, a4, a5, a6, a7, a8, a9) then
-					dirty = dirty or {}
+					dirty = dirty or WA.AcquireScratch()
 					dirty[id] = true
 					WA.NotifyWatchedTriggers(id, triggernum)
 				end
@@ -5911,6 +6005,10 @@ local function scanRegistered(event, dirty, a1, a2, a3, a4, a5, a6, a7, a8, a9)
 		end
 	end
 	return dirty
+end
+
+local function updateDirty(dirty)
+	for id in pairs(dirty) do WA.UpdatedTriggerState(id) end
 end
 
 -- The producer entry point watchers and the event frame both call (§4.3):
@@ -5927,7 +6025,8 @@ function WA.ScanEvents(event, a1, a2, a3, a4, a5, a6, a7, a8, a9)
 		end
 	end
 	if dirty then
-		for id in pairs(dirty) do WA.UpdatedTriggerState(id) end
+		WA.RunRelayoutBatch(updateDirty, dirty)
+		WA.ReleaseScratch(dirty)
 	end
 end
 
@@ -6100,6 +6199,9 @@ function GenericTrigger.Add(data)
 					ti.autoHide = true
 					ti.duration = tonumber(trigger.duration) or 1
 				end
+				if proto.subjectUnit and not ti.multiUnit then
+					ti.unitFilters = subjectUnitFilters(ti.eventList, proto.subjectUnit(trigger))
+				end
 				-- A prototype listening to the combat log names the subevents it
 				-- wants, and dispatch drops the rest before the compiled test runs
 				-- -- the same filter a custom trigger's CLEU:SUBEVENT sets.
@@ -6229,7 +6331,7 @@ function GenericTrigger.Rename(oldId, newId)
 	events[oldId] = nil
 	lastCompiled[oldId] = nil
 	if unresolvedIds[oldId] then
-		unresolvedIds[newId] = true
+		unresolvedIds[newId] = unresolvedIds[oldId]
 		unresolvedIds[oldId] = nil
 	end
 	if activeIds[oldId] then

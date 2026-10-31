@@ -283,6 +283,14 @@ WA.loadPrototype = {
 	},
 }
 
+-- Each entry's use_<name> key, built once: a scan evaluates every entry of every
+-- display, and the concatenation was a fresh string each time.
+local useKeys = setmetatable({}, { __index = function(t, arg)
+	local key = "use_" .. arg.name
+	t[arg] = key
+	return key
+end })
+
 -- All enabled constraints AND together (§11); `never` short-circuits to
 -- unloaded. skipOptional drops the moment-dependent entries, leaving only what
 -- the character decides. An empty data.load loads unconditionally, preserving
@@ -303,7 +311,7 @@ local function evalLoad(data, skipOptional)
 			if arg.isActive then
 				active = arg.isActive(L) and true or false
 			else
-				active = L["use_" .. arg.name] and true or false
+				active = L[useKeys[arg]] and true or false
 			end
 			if active and not arg.eval(L) then
 				return false
@@ -357,12 +365,12 @@ local loadFrame = CreateFrame("Frame")
 for i = 1, #LOAD_EVENTS do
 	pcall(loadFrame.RegisterEvent, loadFrame, LOAD_EVENTS[i])
 end
--- UNIT_AURA fires for every visible unit's aura changes (very chatty in a
--- raid), but only the player's own auras (the mount buff) matter to any load
--- constraint here -- filtered separately so it doesn't force a full re-scan
--- of every display on every other unit's buff tick.
+-- UNIT_AURA and UNIT_FLAGS fire for every visible unit, once per token (very
+-- chatty in a raid, and UNIT_FLAGS bursts as a whole raid enters combat), but
+-- only the player's own -- the mount buff, the taxi flag -- matter to any load
+-- constraint here, so nobody else's forces a full re-scan of every display.
 loadFrame:RegisterEvent("UNIT_AURA")
 loadFrame:SetScript("OnEvent", function()
-	if event == "UNIT_AURA" and arg1 ~= "player" then return end
+	if (event == "UNIT_AURA" or event == "UNIT_FLAGS") and arg1 ~= "player" then return end
 	WA.ScanForLoads()
 end)

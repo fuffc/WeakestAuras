@@ -5229,9 +5229,9 @@ initFrame:RegisterEvent("ADDON_LOADED")
 -- The client-side spell cache that name->ID resolution reads (C_Spell.GetSpellInfo
 -- by name, via WA.ResolveSpellID) is still cold at ADDON_LOADED, so any trigger
 -- keyed by spell name compiles to a 0 id / never starts its watcher on a fresh
--- login (only re-typing the name or a later /reload fixes it). Recompile once the
--- spellbook populates and on later talent/spell changes -- same two events
--- DoiteAuras rebuilds its own spell caches on.
+-- login (only re-typing the name or a later /reload fixes it). Recompile what is
+-- waiting on a name once the spellbook populates and on later talent/spell
+-- changes -- same two events DoiteAuras rebuilds its own spell caches on.
 initFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
 initFrame:RegisterEvent("SPELLS_CHANGED")
 -- Item data arrives asynchronously for the same reason: GetItemInfo (via
@@ -5244,7 +5244,7 @@ local didInit = false
 local recompilePending = false
 local function doRecompile()
 	recompilePending = false
-	if didInit then WeakestAuras.AddAllDisplays() end
+	if didInit then WeakestAuras.RecompileResolvedNames() end
 end
 initFrame:SetScript("OnEvent", function()
 	if event == "ADDON_LOADED" then
@@ -5263,15 +5263,14 @@ initFrame:SetScript("OnEvent", function()
 	end
 	-- Debounced: the login burst of PLAYER_ENTERING_WORLD + SPELLS_CHANGED, and the
 	-- run of GET_ITEM_INFO_RECEIVED a bagful of uncached items produces, coalesce
-	-- into a single recompile.
+	-- into a single sweep.
 	if not didInit or recompilePending then return end
-	-- Only while some trigger still holds a name the client cannot resolve. This
-	-- sweep exists for nothing else, and GET_ITEM_INFO_RECEIVED keeps arriving all
-	-- session -- every bag change, mouseover, loot and linked item -- so an
-	-- ungated sweep recompiles every aura indefinitely. A recompile discards the
-	-- states its triggers produced, which a status or aura trigger re-derives on
-	-- the next pass but a Trigger State Updater cannot: its clones came from
-	-- events that have already happened.
+	-- Only while some trigger still holds a name the client cannot resolve, and
+	-- the sweep recompiles only the displays whose name now resolves.
+	-- GET_ITEM_INFO_RECEIVED and SPELLS_CHANGED keep arriving all session, and a
+	-- recompile discards the states its triggers produced, which a status or aura
+	-- trigger re-derives on the next pass but a Trigger State Updater cannot: its
+	-- clones came from events that have already happened.
 	if WeakestAuras.HasUnresolvedNames and not WeakestAuras.HasUnresolvedNames() then
 		return
 	end

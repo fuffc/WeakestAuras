@@ -450,6 +450,21 @@ function WA.RunAuraFunc(who, errTag, fn, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10
 	return ok, res
 end
 
+-- The same sandwich returning up to four results and no error text, for the
+-- callers that read a fixed few on every dispatch or frame -- a custom
+-- duration, an animation curve -- where RunAuraFuncPacked's closure and array
+-- were garbage each time.
+function WA.RunAuraFunc4(who, errTag, fn, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11)
+	if type(who) == "table" then
+		WA.ActivateAuraEnvForRegion(who)
+	else
+		WA.ActivateAuraEnv(who)
+	end
+	local ok, r1, r2, r3, r4 = WA.safecall4(errTag, fn, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11)
+	WA.DeactivateAuraEnv()
+	return ok, r1, r2, r3, r4
+end
+
 -- The same sandwich with the function's whole return list packed into an array,
 -- for a caller that wants N values (custom text, whose every return is a %c).
 -- safecall keeps only the first value, so the packing happens in a closure.

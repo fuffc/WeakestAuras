@@ -461,13 +461,15 @@ function WA.StartStopStateTimers(id, triggernum, states)
 		end
 	end
 
-	local toRemove = {}
+	-- Built only when a record is orphaned: this runs on every TSU dispatch.
+	local toRemove
 	for cloneId in pairs(triggerTimers) do
 		if not states[cloneId] then
+			toRemove = toRemove or {}
 			table.insert(toRemove, cloneId)
 		end
 	end
-	for i = 1, #toRemove do
+	for i = 1, (toRemove and #toRemove or 0) do
 		local cloneId = toRemove[i]
 		cancelTimerRecord(triggerTimers[cloneId], cloneId)
 		triggerTimers[cloneId] = nil

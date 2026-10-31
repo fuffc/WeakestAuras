@@ -178,14 +178,7 @@ end
 local animations, updating, lastUpdate = {}, false, GetTime()
 local animationFrame = CreateFrame("Frame")
 local function callFunction(region, tag, fn, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11)
-	local values
-	WA.ActivateAuraEnvForRegion(region)
-	local ok = WA.safecall(tag, function()
-		values = { fn(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11) }
-	end)
-	WA.DeactivateAuraEnv()
-	if not ok then return false end
-	return true, unpack(values)
+	return WA.RunAuraFunc4(region, tag, fn, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11)
 end
 local function clear(anim)
 	local r = anim.region
@@ -245,8 +238,10 @@ local function run(key, anim, elapsed, time)
 	if anim.scaleFunc and anim.region.Scale then local ok, x, y = callFunction(anim.region, anim.auraUID, anim.scaleFunc, p, 1, 1, anim.scaleX, anim.scaleY); if ok then anim.region:Scale(x, y) end end
 	if anim.rotateFunc and anim.region.SetAnimRotation then local ok, v = callFunction(anim.region, anim.auraUID, anim.rotateFunc, p, anim.region:GetBaseRotation(), anim.rotate); if ok then anim.region:SetAnimRotation(v) end end
 	if anim.colorFunc and anim.region.ColorAnim then local r, g, b, a = anim.region:GetColor(); local ok, nr, ng, nb, na = callFunction(anim.region, anim.auraUID, anim.colorFunc, p, r or 1, g or 1, b or 1, a or 1, anim.colorR, anim.colorG, anim.colorB, anim.colorA); if ok then anim.region:ColorAnim(nr, ng, nb, na) end end
+	-- A loop restarts in place: re-entering WA.Animate would rebuild this same
+	-- table from the same source and start values, once per cycle.
 	if finish then
-		if anim.loop then WA.Animate(anim.namespace, anim.auraUID, anim.type, anim.anim, anim.region, anim.inverse, anim.onFinished, true, anim.region.cloneId) else clear(anim); animations[key] = nil; if anim.onFinished then anim.onFinished() end end
+		if anim.loop then anim.progress = 0; anim.iteration = nil else clear(anim); animations[key] = nil; if anim.onFinished then anim.onFinished() end end
 	end
 end
 local function update()

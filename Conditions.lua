@@ -31,7 +31,9 @@ local compiled = {}
 local activated = {}
 -- scheduled[uid.."\0"..cloneId] = the one pending exact-recheck C_Timer for a
 -- timer/elapsedTimer check crossing its threshold (§10 ScheduleConditionCheck).
-local scheduled = {}
+-- scheduledFlip/scheduledRegion record what that timer was armed for, so a run
+-- that arrives at the same threshold keeps it instead of re-arming.
+local scheduled, scheduledFlip, scheduledRegion = {}, {}, {}
 
 -- ---------------------------------------------------------------------------
 -- Global conditions (trigger == -1): a shared pseudo-state re-checked on the
@@ -324,20 +326,35 @@ end
 
 local runFor -- forward decl: scheduleRecheck's timer closure re-enters it.
 
+local function cancelRecheck(key)
+	local timer = scheduled[key]
+	if timer then timer:Cancel() end
+	scheduled[key], scheduledFlip[key], scheduledRegion[key] = nil, nil, nil
+end
+
 local function scheduleRecheck(region, uid, cloneId, nextFlip, now)
-	local key = uid .. "\0" .. cloneId
-	local existing = scheduled[key]
-	if existing then existing:Cancel(); scheduled[key] = nil end
-	if nextFlip and region.toShow then
-		-- Small epsilon so the boundary has actually passed when we re-evaluate
-		-- (a strict "<" wouldn't flip at exactly the threshold instant).
-		local delay = (nextFlip - now) + 0.05
-		if delay < 0.05 then delay = 0.05 end
-		scheduled[key] = C_Timer.NewTimer(delay, function()
-			scheduled[key] = nil
-			if region.toShow then runFor(region, uid, false) end
-		end)
+	-- Cached on the frame: this runs on every state change of every region with
+	-- conditions, and the concatenation was a fresh string each time.
+	local key = region.conditionKey
+	if region.conditionKeyUid ~= uid or region.conditionKeyClone ~= cloneId then
+		key = uid .. "\0" .. cloneId
+		region.conditionKey, region.conditionKeyUid, region.conditionKeyClone = key, uid, cloneId
 	end
+	if not (nextFlip and region.toShow) then
+		if scheduled[key] then cancelRecheck(key) end
+		return
+	end
+	if scheduled[key] and scheduledFlip[key] == nextFlip and scheduledRegion[key] == region then return end
+	cancelRecheck(key)
+	-- Small epsilon so the boundary has actually passed when we re-evaluate
+	-- (a strict "<" wouldn't flip at exactly the threshold instant).
+	local delay = (nextFlip - now) + 0.05
+	if delay < 0.05 then delay = 0.05 end
+	scheduled[key] = C_Timer.NewTimer(delay, function()
+		scheduled[key], scheduledFlip[key], scheduledRegion[key] = nil, nil, nil
+		if region.toShow then runFor(region, uid, false) end
+	end)
+	scheduledFlip[key], scheduledRegion[key] = nextFlip, region
 end
 
 runFor = function(region, uid, hideRegion)
@@ -358,7 +375,10 @@ runFor = function(region, uid, hideRegion)
 	local prev = getActivated(uid, cloneId)
 
 	-- Phase 1: evaluate every condition, collecting the earliest timer flip.
-	local newActive = {}
+	-- The three working sets are pooled scratch: this runs on every state change
+	-- of every region with conditions. A custom check can re-enter dispatch, so
+	-- each run takes its own tables rather than sharing file-level ones.
+	local newActive = WA.AcquireScratch()
 	local nextFlip
 	for i = 1, nConds do
 		local active, flip
@@ -375,9 +395,10 @@ runFor = function(region, uid, hideRegion)
 	-- properties' base values. Phase 3 (activation): active conditions write
 	-- their change values, later conditions overwriting earlier -- so a
 	-- contested property goes to the last matching condition, and a property no
-	-- active condition touches is restored. propertyChanges holds one entry per
-	-- touched property; applied once each afterwards (no mid-run flicker, §10).
-	local propertyChanges = {}
+	-- active condition touches is restored. changeEntry/changeValue hold one
+	-- entry per touched property; applied once each afterwards (no mid-run
+	-- flicker, §10).
+	local changeEntry, changeValue = WA.AcquireScratch(), WA.AcquireScratch()
 	for i = 1, nConds do
 		if prev[i] and not newActive[i] then
 			local changes = conditions[i].changes or {}
@@ -385,7 +406,7 @@ runFor = function(region, uid, hideRegion)
 				local prop = changes[c].property
 				local pentry = prop and entry.properties[prop]
 				if pentry and not pentry.action then
-					propertyChanges[prop] = { entry = pentry, value = getBase(data, pentry) }
+					changeEntry[prop], changeValue[prop] = pentry, getBase(data, pentry)
 				elseif pentry and pentry.action == "SoundPlay"
 					and type(changes[c].value) == "table"
 					and changes[c].value.sound_type == "Loop" then
@@ -421,16 +442,19 @@ runFor = function(region, uid, hideRegion)
 						end
 					end
 				elseif pentry then
-					propertyChanges[prop] = { entry = pentry, value = changes[c].value }
+					changeEntry[prop], changeValue[prop] = pentry, changes[c].value
 				end
 			end
 		end
 	end
-	for _, pc in pairs(propertyChanges) do
-		applyProperty(region, pc.entry, pc.value)
+	for prop, pentry in pairs(changeEntry) do
+		applyProperty(region, pentry, changeValue[prop])
 	end
 
 	for i = 1, nConds do prev[i] = newActive[i] end
+	WA.ReleaseScratch(newActive)
+	WA.ReleaseScratch(changeEntry)
+	WA.ReleaseScratch(changeValue)
 	scheduleRecheck(region, uid, cloneId, hideRegion and nil or nextFlip, now)
 end
 
@@ -449,9 +473,7 @@ function WA.ReleaseConditionsForClone(uid, cloneId)
 	if not uid then return end
 	local byClone = activated[uid]
 	if byClone then byClone[cloneId] = nil end
-	local key = uid .. "\0" .. cloneId
-	local timer = scheduled[key]
-	if timer then timer:Cancel(); scheduled[key] = nil end
+	cancelRecheck(uid .. "\0" .. cloneId)
 end
 
 function WA.LoadConditions(data)
@@ -481,12 +503,9 @@ function WA.UnloadConditions(data)
 	compiled[uid] = nil
 	activated[uid] = nil
 	setCustomCheckEvents(uid, {})
-	for key, timer in pairs(scheduled) do
+	for key in pairs(scheduled) do
 		local sep = string.find(key, "\0", 1, true)
-		if sep and string.sub(key, 1, sep - 1) == uid then
-			timer:Cancel()
-			scheduled[key] = nil
-		end
+		if sep and string.sub(key, 1, sep - 1) == uid then cancelRecheck(key) end
 	end
 end
 
@@ -509,16 +528,18 @@ end
 -- tracking which auras actually use a global condition (§10 dynamic events).
 -- ---------------------------------------------------------------------------
 
+local function rerunShown(region, id)
+	if region.toShow then
+		local data = WeakestAurasDB.displays[id]
+		if data and data.uid then WA.RunConditions(region, data.uid, false) end
+	end
+end
+
 local globalFrame = CreateFrame("Frame")
 for i = 1, #GLOBAL_EVENTS do globalFrame:RegisterEvent(GLOBAL_EVENTS[i]) end
 globalFrame:SetScript("OnEvent", function()
 	if not WA.ForEachRegion then return end
-	WA.ForEachRegion(function(region, id)
-		if region.toShow then
-			local data = WeakestAurasDB.displays[id]
-			if data and data.uid then WA.RunConditions(region, data.uid, false) end
-		end
-	end)
+	WA.ForEachRegion(rerunShown)
 end)
 
 -- ---------------------------------------------------------------------------

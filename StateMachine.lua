@@ -287,11 +287,16 @@ local function CollapseStaleClones(id, allstates)
 	local data = WeakestAurasDB.displays[id]
 	local base = entry.byClone[""]
 	if base and not allstates[""] then collapseFrame(base, data) end
-	local stale = {}
+	-- Built only when there is something to release: this runs on every shown
+	-- update, and almost none of them have a stale clone.
+	local stale
 	for cloneId in pairs(entry.byClone) do
-		if cloneId ~= "" and not allstates[cloneId] then table.insert(stale, cloneId) end
+		if cloneId ~= "" and not allstates[cloneId] then
+			stale = stale or {}
+			table.insert(stale, cloneId)
+		end
 	end
-	for i = 1, #stale do
+	for i = 1, (stale and #stale or 0) do
 		local cloneId = stale[i]
 		releaseClone(entry, cloneId, entry.byClone[cloneId], data)
 	end
@@ -311,6 +316,13 @@ function WA.ForEachClone(id, fn)
 	local entry = regions[id]
 	if not entry then return end
 	for cloneId, frame in pairs(entry.byClone) do fn(frame, cloneId) end
+end
+
+-- The cloneId -> frame map itself, read-only, for a hot path that walks it with
+-- pairs instead of handing ForEachClone a fresh closure per call.
+function WA.CloneFrames(id)
+	local entry = regions[id]
+	return entry and entry.byClone
 end
 
 -- The live on-screen frame for a display (default the base "" clone). Ensures

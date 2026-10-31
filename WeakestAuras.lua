@@ -334,41 +334,45 @@ function WeakestAuras.UnitCloneId(unit)
 	return guid or unit
 end
 
+local NAMEPLATE_TOKENS, RAID_TOKENS, PARTY_TOKENS = {}, {}, {}
+for i = 1, 40 do
+	NAMEPLATE_TOKENS[i] = "nameplate" .. i
+	RAID_TOKENS[i] = "raid" .. i
+end
+for i = 1, 4 do PARTY_TOKENS[i] = "party" .. i end
+
+local function emitMultiUnit(unit, seen, fn)
+	if UnitExists(unit) then
+		local cloneId = WeakestAuras.UnitCloneId(unit)
+		if cloneId ~= nil and not seen[cloneId] then
+			seen[cloneId] = true
+			fn(unit, cloneId)
+		end
+	end
+end
+
 -- Calls fn(unit, cloneId) for every usable token in an upstream multi-unit
 -- family. Group/party include the player outside raids; raid tokens already
 -- include the player. Nameplate slots may contain holes, so all 40 confirmed
 -- ClassicAPI slots are checked instead of stopping at the first empty one.
+-- The aura scan walks a family five times a second, so the tokens are built
+-- once and the duplicate set is pooled scratch.
 function WeakestAuras.ForEachMultiUnit(unitType, fn)
 	if type(fn) ~= "function" then return end
-	local seen = {}
-	local function emit(unit)
-		if UnitExists(unit) then
-			local cloneId = WeakestAuras.UnitCloneId(unit)
-			if cloneId ~= nil and not seen[cloneId] then
-				seen[cloneId] = true
-				fn(unit, cloneId)
-			end
-		end
-	end
-
-	if unitType == "nameplate" then
-		for i = 1, 40 do emit("nameplate" .. i) end
-		return
-	end
-
+	local seen = WeakestAuras.AcquireScratch()
 	local raid = GetNumRaidMembers()
-	if unitType == "raid" or (unitType == "group" and raid > 0) then
+	if unitType == "nameplate" then
+		for i = 1, 40 do emitMultiUnit(NAMEPLATE_TOKENS[i], seen, fn) end
+	elseif unitType == "raid" or (unitType == "group" and raid > 0) then
 		if raid > 40 then raid = 40 end
-		for i = 1, raid do emit("raid" .. i) end
-		return
-	end
-
-	if unitType == "party" or unitType == "group" then
-		emit("player")
+		for i = 1, raid do emitMultiUnit(RAID_TOKENS[i], seen, fn) end
+	elseif unitType == "party" or unitType == "group" then
+		emitMultiUnit("player", seen, fn)
 		local party = GetNumPartyMembers()
 		if party > 4 then party = 4 end
-		for i = 1, party do emit("party" .. i) end
+		for i = 1, party do emitMultiUnit(PARTY_TOKENS[i], seen, fn) end
 	end
+	WeakestAuras.ReleaseScratch(seen)
 end
 
 -- Whether a family currently iterates `unit`, by the same membership rules

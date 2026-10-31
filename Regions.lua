@@ -159,10 +159,10 @@ local function applyGroupBounds(region, data)
 	local kids = data.controlledChildren or {}
 	for i = 1, #kids do
 		local cd = WeakestAurasDB.displays[kids[i]]
-		if cd and WA.regionPrototype.IsGroupAnchored(cd) then
-			WA.ForEachClone(cd.id, function(frame)
-				frame:SetOffset(WA.regionPrototype.GroupChildOffset(region, cd))
-			end)
+		local frames = cd and WA.regionPrototype.IsGroupAnchored(cd) and WA.CloneFrames(cd.id)
+		if frames then
+			local x, y = WA.regionPrototype.GroupChildOffset(region, cd)
+			for _, frame in pairs(frames) do frame:SetOffset(x, y) end
 		end
 	end
 end
@@ -308,37 +308,49 @@ end
 -- controlledChildren order, cloneSeq (stamped on the frame at acquisition)
 -- breaks ties within one display, base clone first.
 --
--- Built once: this runs on every state update of every child, and each
--- SortAscending is six closures and two tables.
+-- Built once: this runs on every relayout, and each SortAscending is six
+-- closures and two tables.
 local baseOrder = WA.ComposeSorts(WA.SortAscending({ "dataIndex" }), WA.SortAscending({ "cloneSeq" }))
 
-local function activeChildren(data)
-	local list = {}
+-- The list is the group's own and each entry is its child frame's own, both
+-- refilled per layout rather than rebuilt: a relayout follows every state
+-- change of every child, and the tables were most of what one cost. Upstream
+-- keeps its regionData per child across layouts too, so code written against
+-- it does not expect a fresh one.
+local function activeChildren(region, data)
+	local list = region.layoutList
+	if not list then
+		list = {}
+		region.layoutList = list
+	end
+	for i = #list, 1, -1 do list[i] = nil end
+	local parent = WA.PeekRegion(data.id, "")
 	local kids = data.controlledChildren or {}
 	for i = 1, #kids do
 		local childId = kids[i]
-		local dataIndex = i
 		local cd = WeakestAurasDB.displays[childId]
-		if cd then
-			WA.ForEachClone(childId, function(frame, cloneId)
+		local clones = cd and WA.CloneFrames(childId)
+		if clones then
+			for cloneId, frame in pairs(clones) do
 				if frame.toShow or frame.animatingFinish then
-					local w = cd.width or (frame:GetWidth() or 0)
-					local h = cd.height or (frame:GetHeight() or 0)
-					local entry = {
-						region = frame, data = cd, id = childId, cloneId = cloneId,
-						dataIndex = dataIndex, cloneSeq = frame.cloneSeq or 0,
-						width = w, height = h,
-					}
-					-- WA2's regionData.dimensions is whichever table carries the
-					-- child's size; ours already is one, so pointing the field at
-					-- the entry gives an imported customGrow its
-					-- `regionData.dimensions.width` without a table per child per
-					-- layout.
-					entry.dimensions = entry
-					entry.parent = WA.PeekRegion and WA.PeekRegion(data.id, "") or nil
-					table.insert(list, entry)
+					local entry = frame.layoutEntry
+					if not entry then
+						entry = {}
+						-- WA2's regionData.dimensions is whichever table carries the
+						-- child's size; ours already is one, so pointing the field at
+						-- the entry gives an imported customGrow its
+						-- `regionData.dimensions.width` without a second table.
+						entry.dimensions = entry
+						frame.layoutEntry = entry
+					end
+					entry.region, entry.data, entry.id, entry.cloneId = frame, cd, childId, cloneId
+					entry.dataIndex, entry.cloneSeq = i, frame.cloneSeq or 0
+					entry.width = cd.width or (frame:GetWidth() or 0)
+					entry.height = cd.height or (frame:GetHeight() or 0)
+					entry.parent = parent
+					list[#list + 1] = entry
 				end
-			end)
+			end
 		end
 	end
 	stableSort(list, baseOrder)
@@ -529,9 +541,19 @@ end
 -- anchors. Partition order follows the first entry of each run, so the layout
 -- does not inherit the iteration order of a hash -- the same reason
 -- activeChildren sorts before anything reads it.
+local function groupRun(region, list)
+	local runs = region.layoutRuns
+	if not runs then
+		runs = { {} }
+		region.layoutRuns = runs
+	end
+	runs[1].entries = list
+	return runs
+end
+
 local function anchorPartitions(region, data, list)
 	local total = #list
-	if not data.useAnchorPerUnit then return { { entries = list } } end
+	if not data.useAnchorPerUnit then return groupRun(region, list) end
 
 	local buckets, order = {}, {}
 	local function bucketFor(frame)
@@ -547,7 +569,7 @@ local function anchorPartitions(region, data, list)
 	local mode = data.anchorPerUnit or "NAMEPLATE"
 	if mode == "CUSTOM" then
 		local frames = customAnchorFrames(region, data, list)
-		if not frames then return { { entries = list } } end
+		if not frames then return groupRun(region, list) end
 		-- The custom anchorer hands back a frame-keyed hash, so the runs come out
 		-- in whatever order `pairs` feels like. rankRuns is what makes a custom
 		-- anchor that assigns one clone to two frames lay out the same way twice
@@ -570,6 +592,24 @@ local function anchorPartitions(region, data, list)
 	return order
 end
 
+local function centerSpan(list, from, to, on)
+	local low, high
+	for i = from, to do
+		local c = list[i]
+		local half = c[on.dim] / 2
+		if not low or c[on.axis] - half < low then low = c[on.axis] - half end
+		if not high or c[on.axis] + half > high then high = c[on.axis] + half end
+	end
+	if not low then return end
+	local shift = (low + high) / 2
+	for i = from, to do
+		local c = list[i]
+		c[on.axis] = c[on.axis] - shift
+	end
+end
+
+local gridX, gridY = { axis = "x", dim = "width" }, { axis = "y", dim = "height" }
+
 -- Two-axis grower: `gridType` is a fill direction then a wrap direction -- "RD"
 -- fills rightward and wraps down, "UL" upward then left -- with an H or V in
 -- the first letter centering each finished row on the anchor and in the second
@@ -587,32 +627,15 @@ local function growGrid(data, list, n)
 	local perLine = tonumber(data.gridWidth) or 5
 	if perLine < 1 then perLine = 1 end
 
-	local primary = { axis = "x", dim = "width", space = data.columnSpace or 0,
-		mul = string.find(gridType, "L", 1, true) and -1 or 1 }
-	local secondary = { axis = "y", dim = "height", space = data.rowSpace or 0,
-		mul = string.find(gridType, "D", 1, true) and -1 or 1 }
+	gridX.space, gridX.mul = data.columnSpace or 0, string.find(gridType, "L", 1, true) and -1 or 1
+	gridY.space, gridY.mul = data.rowSpace or 0, string.find(gridType, "D", 1, true) and -1 or 1
+	local primary, secondary = gridX, gridY
 	if not string.find(gridType, "^[RLH]") then
 		primary, secondary = secondary, primary
 	end
 	local first, second = string.sub(gridType, 1, 1), string.sub(gridType, 2, 2)
 	local centerRows = (first == "H" or first == "V")
 	local centerBlock = (second == "H" or second == "V")
-
-	local function centerSpan(from, to, on)
-		local low, high
-		for i = from, to do
-			local c = list[i]
-			local half = c[on.dim] / 2
-			if not low or c[on.axis] - half < low then low = c[on.axis] - half end
-			if not high or c[on.axis] + half > high then high = c[on.axis] + half end
-		end
-		if not low then return end
-		local shift = (low + high) / 2
-		for i = from, to do
-			local c = list[i]
-			c[on.axis] = c[on.axis] - shift
-		end
-	end
 
 	-- Every child of one line sits at the same secondary coordinate, so a line of
 	-- mixed heights aligns on its leading edge; the line's own tallest child is
@@ -625,7 +648,7 @@ local function growGrid(data, list, n)
 		c[secondary.axis] = sCursor + secondary.mul * sDim / 2
 		if sDim > tallest then tallest = sDim end
 		if math.fmod(i, perLine) == 0 then
-			if centerRows then centerSpan(lineStart, i, primary) end
+			if centerRows then centerSpan(list, lineStart, i, primary) end
 			pCursor, lineStart = 0, i + 1
 			sCursor = sCursor + (secondary.space + tallest) * secondary.mul
 			tallest = 0
@@ -633,8 +656,8 @@ local function growGrid(data, list, n)
 			pCursor = pCursor + (primary.space + pDim) * primary.mul
 		end
 	end
-	if centerRows and lineStart <= n then centerSpan(lineStart, n, primary) end
-	if centerBlock then centerSpan(1, n, secondary) end
+	if centerRows and lineStart <= n then centerSpan(list, lineStart, n, primary) end
+	if centerBlock then centerSpan(list, 1, n, secondary) end
 end
 
 -- Polar grower: children ride a ring of `radius` from the anchor, starting at
@@ -684,6 +707,27 @@ local function growCircle(data, list, n)
 	end
 end
 
+-- Cross-axis alignment for the vertical grows (UP/DOWN/VERTICAL): line up the
+-- children's left/right edges (LEFT/RIGHT) or centers (CENTER) on x = 0.
+-- Only affects mixed-width children; identical widths land the same either
+-- way. The horizontal grows keep children centered on y (align n/a there).
+local function crossX(align, w)
+	if align == "LEFT" then return w / 2
+	elseif align == "RIGHT" then return -w / 2
+	else return 0 end
+end
+
+-- Perpendicular stagger offset for child i (1-based) of an n-run. Our
+-- grower is CENTER-origin where upstream's is corner-origin, and our align
+-- vocabulary is LEFT/CENTER/RIGHT only (upstream's is direction-dependent),
+-- so the vertical grows (UP/DOWN/VERTICAL) stagger on x via crossX using
+-- staggerCoefficient(align, stagger), while the horizontal grows (LEFT/
+-- RIGHT/HORIZONTAL) stagger on y with a flat 0.5 (run centred), since
+-- local align says nothing about that axis there.
+local function perpOffset(i, n, stagger, staggerCoeff)
+	return (i - 1) * stagger - (n - 1) * stagger * staggerCoeff
+end
+
 -- Axis-aligned grower: assigns each visible child of one run a position relative
 -- to that run's anchor, stacking successive children by their own dimension +
 -- spacing (WA2's DynamicGroup.lua growers, minus animation). HORIZONTAL/VERTICAL
@@ -713,30 +757,10 @@ local function growRun(data, list)
 	local n = #list
 	local blx, bly, trx, try
 
-	-- Cross-axis alignment for the vertical grows (UP/DOWN/VERTICAL): line up the
-	-- children's left/right edges (LEFT/RIGHT) or centers (CENTER) on x = 0.
-	-- Only affects mixed-width children; identical widths land the same either
-	-- way. The horizontal grows keep children centered on y (align n/a there).
 	local align = data.align or "CENTER"
-	local function crossX(w)
-		if align == "LEFT" then return w / 2
-		elseif align == "RIGHT" then return -w / 2
-		else return 0 end
-	end
-
-	-- Perpendicular stagger offset for child i (1-based) of an n-run. Our
-	-- grower is CENTER-origin where upstream's is corner-origin, and our align
-	-- vocabulary is LEFT/CENTER/RIGHT only (upstream's is direction-dependent),
-	-- so the vertical grows (UP/DOWN/VERTICAL) stagger on x via crossX using
-	-- staggerCoefficient(align, stagger), while the horizontal grows (LEFT/
-	-- RIGHT/HORIZONTAL) stagger on y with a flat 0.5 (run centred), since
-	-- local align says nothing about that axis there.
 	local stagger = data.stagger or 0
 	local vertical = (grow == "UP" or grow == "DOWN" or grow == "VERTICAL")
 	local staggerCoeff = vertical and staggerCoefficient(align, stagger) or 0.5
-	local function perpOffset(i)
-		return (i - 1) * stagger - (n - 1) * stagger * staggerCoeff
-	end
 
 	if grow == "GRID" then
 		growGrid(data, list, n)
@@ -754,9 +778,9 @@ local function growRun(data, list)
 			local dim = (grow == "HORIZONTAL") and c.width or c.height
 			local center = cursor + dim / 2
 			if grow == "HORIZONTAL" then
-				c.x, c.y = center, perpOffset(i)
+				c.x, c.y = center, perpOffset(i, n, stagger, staggerCoeff)
 			else
-				c.x, c.y = crossX(c.width) + perpOffset(i), -center
+				c.x, c.y = crossX(align, c.width) + perpOffset(i, n, stagger, staggerCoeff), -center
 			end
 			cursor = cursor + dim + space
 		end
@@ -764,14 +788,15 @@ local function growRun(data, list)
 		local cursor = 0
 		for i = 1, n do
 			local c = list[i]
+			local perp = perpOffset(i, n, stagger, staggerCoeff)
 			if grow == "LEFT" then
-				c.x = cursor - c.width / 2; c.y = perpOffset(i); cursor = cursor - c.width - space
+				c.x = cursor - c.width / 2; c.y = perp; cursor = cursor - c.width - space
 			elseif grow == "RIGHT" then
-				c.x = cursor + c.width / 2; c.y = perpOffset(i); cursor = cursor + c.width + space
+				c.x = cursor + c.width / 2; c.y = perp; cursor = cursor + c.width + space
 			elseif grow == "UP" then
-				c.x = crossX(c.width) + perpOffset(i); c.y = cursor + c.height / 2; cursor = cursor + c.height + space
+				c.x = crossX(align, c.width) + perp; c.y = cursor + c.height / 2; cursor = cursor + c.height + space
 			else -- DOWN
-				c.x = crossX(c.width) + perpOffset(i); c.y = cursor - c.height / 2; cursor = cursor - c.height - space
+				c.x = crossX(align, c.width) + perp; c.y = cursor - c.height / 2; cursor = cursor - c.height - space
 			end
 		end
 	end
@@ -921,7 +946,7 @@ end
 -- the group's own point, which is what a border around a set of nameplates
 -- would have to mean anyway.
 local function growChildren(region, data)
-	local list = activeChildren(data)
+	local list = activeChildren(region, data)
 	if not region.sortFuncBuilt then
 		region.sortFunc, region.sortBeginPass = createSortFunc(data)
 		region.sortFuncBuilt = true
@@ -933,7 +958,12 @@ local function growChildren(region, data)
 	-- the grower both.
 	if data.grow == "CUSTOM" then return growCustom(region, data, list) end
 
-	local placed = {}
+	local placed = region.layoutPlaced
+	if not placed then
+		placed = {}
+		region.layoutPlaced = placed
+	end
+	for i = #placed, 1, -1 do placed[i] = nil end
 	local blx, bly, trx, try = 0, 0, 0, 0
 	local runs = anchorPartitions(region, data, list)
 	for r = 1, #runs do
@@ -1116,11 +1146,7 @@ function WA.RelayoutUnitAnchoredGroups()
 	end
 end
 
--- Refresh a group after a child's position/size/visibility/membership changed:
--- static groups just recompute the box, dynamic groups re-run the whole layout.
--- No-op until the group frame exists. The single relayout entry point the state
--- machine and reparent primitives call.
-function WA.RelayoutGroup(groupId)
+local function relayoutNow(groupId)
 	local data = WeakestAurasDB.displays[groupId]
 	if not data or not WA.IsGroup(data) then return end
 	local region = WA.PeekRegion(groupId, "")
@@ -1130,6 +1156,41 @@ function WA.RelayoutGroup(groupId)
 	else
 		applyGroupBounds(region, data)
 	end
+end
+
+-- A dispatch that updates several displays at once runs inside a batch, and
+-- each group they belong to relays out once when it closes rather than once per
+-- child -- upstream's Pause/ResumeAllDynamicGroups around a scan. Closing
+-- happens before the dispatch returns, so nothing renders in between.
+local relayoutDepth, relayoutPending = 0, {}
+
+-- Refresh a group after a child's position/size/visibility/membership changed:
+-- static groups just recompute the box, dynamic groups re-run the whole layout.
+-- No-op until the group frame exists. The single relayout entry point the state
+-- machine and reparent primitives call.
+function WA.RelayoutGroup(groupId)
+	if relayoutDepth > 0 then
+		relayoutPending[groupId] = true
+		return
+	end
+	relayoutNow(groupId)
+end
+
+-- Runs fn(arg) as one batch. The depth is unwound even when fn throws: a batch
+-- left open would defer every later relayout for the rest of the session.
+function WA.RunRelayoutBatch(fn, arg)
+	relayoutDepth = relayoutDepth + 1
+	local ok, err = pcall(fn, arg)
+	relayoutDepth = relayoutDepth - 1
+	if relayoutDepth == 0 then
+		local id = next(relayoutPending)
+		while id do
+			relayoutPending[id] = nil
+			relayoutNow(id)
+			id = next(relayoutPending)
+		end
+	end
+	if not ok then error(err, 0) end
 end
 
 -- group and dynamicgroup share one container implementation: a frame positioned
@@ -2998,6 +3059,15 @@ local function smoothOnUpdate()
 	fillBar(this)
 end
 
+-- The timed path's OnUpdate, shared by the progress bar and the progress
+-- texture: the fill recomputed from the clock every frame.
+local function countdownOnUpdate()
+	if not this:IsShown() then this:SetScript("OnUpdate", nil); return end
+	local remain = this.expirationTime - GetTime()
+	this:SetProgress(remain / this.duration)
+	if remain <= 0 then this:SetScript("OnUpdate", nil) end
+end
+
 -- Lays the icon and the bar out so they share the region's box without
 -- overlapping: the icon takes a square off one end of the *fill* axis, the bar
 	-- takes the rest (WA2's AuraBar orientHorizontal/orientVertical). icon_side's
@@ -3653,12 +3723,7 @@ WA.RegisterRegionType("progressbar", {
 				return
 			end
 			if self.duration and self.duration > 0 then
-				self:SetScript("OnUpdate", function()
-					if not this:IsShown() then this:SetScript("OnUpdate", nil); return end
-					local remain = this.expirationTime - GetTime()
-					this:SetProgress(remain / this.duration)
-					if remain <= 0 then this:SetScript("OnUpdate", nil) end
-				end)
+				self:SetScript("OnUpdate", countdownOnUpdate)
 			else
 				self:SetProgress(1)
 				self:SetScript("OnUpdate", nil)
@@ -4467,12 +4532,7 @@ WA.RegisterRegionType("progresstexture", {
 				return
 			end
 			if self.duration and self.duration > 0 then
-				self:SetScript("OnUpdate", function()
-					if not this:IsShown() then this:SetScript("OnUpdate", nil); return end
-					local remain = this.expirationTime - GetTime()
-					this:SetProgress(remain / this.duration)
-					if remain <= 0 then this:SetScript("OnUpdate", nil) end
-				end)
+				self:SetScript("OnUpdate", countdownOnUpdate)
 			else
 				self:SetProgress(1)
 				self:SetScript("OnUpdate", nil)
